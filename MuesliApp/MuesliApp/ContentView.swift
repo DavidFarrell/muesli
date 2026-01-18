@@ -306,10 +306,27 @@ final class AppModel: ObservableObject {
     private func handleBackendJSONLine(_ line: String) {
         if let data = line.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let type = obj["type"] as? String,
-           type == "error" || type == "status" {
-            let message = (obj["message"] as? String) ?? line
-            appendBackendLog("[\(type)] \(message)", toTail: true)
+           let type = obj["type"] as? String {
+            if type == "error" {
+                let message = (obj["message"] as? String) ?? line
+                appendBackendLog("[error] \(message)", toTail: true)
+            } else if type == "status" {
+                var parts: [String] = []
+                if let message = obj["message"] as? String {
+                    parts.append(message)
+                }
+                if let stream = obj["stream"] as? String {
+                    parts.append("stream=\(stream)")
+                }
+                if let turns = obj["turns"] as? Int {
+                    parts.append("turns=\(turns)")
+                }
+                if let duration = obj["duration"] as? Double {
+                    parts.append(String(format: "duration=%.2fs", duration))
+                }
+                let text = parts.isEmpty ? line : parts.joined(separator: " ")
+                appendBackendLog("[status] \(text)", toTail: true)
+            }
         }
         transcriptModel.ingest(jsonLine: line)
     }
@@ -926,6 +943,11 @@ struct SessionView: View {
     @State private var showSpeakers = false
     @State private var autoScroll = true
     @State private var showDebug = false
+    private let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df
+    }()
 
     var body: some View {
         VStack(spacing: 12) {
@@ -985,6 +1007,15 @@ struct SessionView: View {
                                 Text("Mic format: \(model.debugMicFormat)")
                                 Text("Mic errors: \(model.debugMicErrors)")
                                 Text("Mic last error: \(model.debugMicErrorMessage)")
+                                Divider()
+                                Text("Transcript segments: \(model.transcriptModel.segments.count)")
+                                if let last = model.transcriptModel.lastTranscriptAt {
+                                    Text("Last transcript: \(timeFormatter.string(from: last))")
+                                }
+                                if !model.transcriptModel.lastTranscriptText.isEmpty {
+                                    let snippet = model.transcriptModel.lastTranscriptText.prefix(120)
+                                    Text("Last text: \(snippet)")
+                                }
                                 Divider()
                                 Text("Backend folder: \(model.backendFolderPath)")
                                 Text("Backend log: \(model.backendLogPath ?? "-")")
@@ -1323,6 +1354,8 @@ struct TranscriptSegment: Identifiable {
 final class TranscriptModel: ObservableObject {
     @Published var segments: [TranscriptSegment] = []
     @Published var speakerNames: [String: String] = [:]
+    @Published var lastTranscriptAt: Date?
+    @Published var lastTranscriptText: String = ""
 
     func displayName(for speakerID: String) -> String {
         speakerNames[speakerID] ?? speakerID
@@ -1356,6 +1389,10 @@ final class TranscriptModel: ObservableObject {
             )
             segments.removeAll { $0.isPartial }
             segments.append(segment)
+            lastTranscriptAt = Date()
+            if !text.isEmpty {
+                lastTranscriptText = text
+            }
 
         case "partial":
             let speakerID = (obj["speaker_id"] as? String) ?? "unknown"
@@ -1374,6 +1411,10 @@ final class TranscriptModel: ObservableObject {
                 segments[idx] = segment
             } else {
                 segments.append(segment)
+            }
+            lastTranscriptAt = Date()
+            if !text.isEmpty {
+                lastTranscriptText = text
             }
 
         case "speakers":

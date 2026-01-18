@@ -61,18 +61,24 @@ def read_exact(f: BinaryIO, n: int) -> bytes:
 
 def emit_jsonl(obj: dict, lock: Optional[threading.Lock] = None) -> None:
     line = json.dumps(obj, ensure_ascii=False) + "\n"
-    if lock:
-        with lock:
+    try:
+        if lock:
+            with lock:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        else:
             sys.stdout.write(line)
             sys.stdout.flush()
-    else:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    except Exception:
+        return
 
 
 def log(msg: str, verbose: bool) -> None:
     if verbose:
-        print(msg, file=sys.stderr)
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            return
 
 
 def open_stream_writer(path: Path, sample_rate: int, channels: int) -> StreamWriter:
