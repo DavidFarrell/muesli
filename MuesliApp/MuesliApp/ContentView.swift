@@ -11,6 +11,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import AppKit
 import AudioToolbox
+import Security
 
 // MARK: - App Model
 
@@ -34,6 +35,25 @@ struct MeetingSession {
     let startedAt: Date
 }
 
+enum BackendPythonError: Error {
+    case venvOutside
+    case venvMissing
+    case venvNotExecutable
+
+    var message: String {
+        switch self {
+        case .venvOutside:
+            return "Backend venv points outside the backend folder. Recreate it with " +
+                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+        case .venvMissing:
+            return "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+        case .venvNotExecutable:
+            return "Backend venv python exists but is not executable. Recreate it with " +
+                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     private let captureSampleRate = 48000
@@ -43,6 +63,8 @@ final class AppModel: ObservableObject {
     @Published var isCapturing = false
     @Published var captureMode: CaptureMode = .video
     @Published var sourceKind: SourceKind = .display
+    @Published var transcribeSystem = true
+    @Published var transcribeMic = true
 
     @Published var meetingTitle: String = AppModel.defaultMeetingTitle()
     @Published var currentSession: MeetingSession?
@@ -65,26 +87,56 @@ final class AppModel: ObservableObject {
             }
         }
     }
+    @Published var backendLogTail: [String] = []
 
     let transcriptModel = TranscriptModel()
 
     private let captureEngine = CaptureEngine()
     private let screenshotScheduler = ScreenshotScheduler()
+    private let backendLogTailLimit = 200
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
+    private var backendLogHandle: FileHandle?
+    private var backendLogURL: URL?
+    private var backendAccessURL: URL?
+    private let backendBookmarkKey = "MuesliBackendBookmark"
+    private let defaultBackendProjectRoot = URL(fileURLWithPath: "/Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only")
+    private var transcriptCancellable: AnyCancellable?
 
-    var backendCommand: [String] = [
-        "/usr/bin/python3",
-        "/Users/david/git/ai-sandbox/projects/muesli/backend/muesli_backend_demo.py"
-    ]
+    @Published var backendFolderURL: URL?
+    @Published var backendFolderError: String?
+
+    var backendFolderPath: String {
+        backendFolderURL?.path ?? "(not selected)"
+    }
+    var backendPythonCandidatePath: String? {
+        backendFolderURL?.appendingPathComponent(".venv/bin/python").path
+    }
+    var backendPythonExists: Bool {
+        guard let path = backendPythonCandidatePath else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+    var appSupportPath: String {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path ?? "-"
+    }
+    var isSandboxed: Bool {
+        guard let task = SecTaskCreateFromSelf(nil) else { return false }
+        let entitlement = SecTaskCopyValueForEntitlement(task, "com.apple.security.app-sandbox" as CFString, nil)
+        return (entitlement as? Bool) == true
+    }
 
     init() {
         captureEngine.onLevelsUpdated = { [weak self] in
             self?.objectWillChange.send()
         }
+        transcriptCancellable = transcriptModel.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         refreshPermissions()
         loadInputDevices()
+        loadBackendBookmark()
+        validateBackendFolder()
         Task { await loadShareableContent() }
     }
 
@@ -102,8 +154,10 @@ final class AppModel: ObservableObject {
     var debugMicErrorMessage: String { captureEngine.debugMicErrorMessage }
     var debugAudioErrors: Int { captureEngine.debugAudioErrors }
     var debugMicErrors: Int { captureEngine.debugMicErrors }
+    var backendLogPath: String? { backendLogURL?.path }
     var debugSummary: String {
-        """
+        let tail = backendLogTail.suffix(50).joined(separator: "\n")
+        return """
         System buffers: \(debugSystemBuffers) frames: \(debugSystemFrames)
         System PTS: \(String(format: "%.3f", debugSystemPTS))
         System format: \(debugSystemFormat)
@@ -114,7 +168,150 @@ final class AppModel: ObservableObject {
         Mic format: \(debugMicFormat)
         Mic errors: \(debugMicErrors)
         Mic last error: \(debugMicErrorMessage)
+        App Support: \(appSupportPath)
+        Backend folder: \(backendFolderPath)
+        Backend log: \(backendLogPath ?? "-")
+        Backend python: \(backendPythonCandidatePath ?? "-") exists=\(backendPythonExists)
+        Sandboxed: \(isSandboxed)
+        Backend log tail:
+        \(tail)
         """
+    }
+
+    private func resolveBackendPython(for root: URL) -> Result<String, BackendPythonError> {
+        let venvPythonURL = root.appendingPathComponent(".venv/bin/python")
+        if FileManager.default.fileExists(atPath: venvPythonURL.path) {
+            #if DEBUG
+            return .success(venvPythonURL.path)
+            #else
+            if FileManager.default.isExecutableFile(atPath: venvPythonURL.path) {
+                return .success(venvPythonURL.path)
+            }
+            return .failure(.venvNotExecutable)
+            #endif
+        }
+        return .failure(.venvMissing)
+    }
+
+    private func loadBackendBookmark() {
+        backendFolderError = nil
+        guard let data = UserDefaults.standard.data(forKey: backendBookmarkKey) else { return }
+        var stale = false
+        if let url = try? URL(
+            resolvingBookmarkData: data,
+            options: [.withSecurityScope],
+            bookmarkDataIsStale: &stale
+        ) {
+            backendFolderURL = url
+            if stale, let refreshed = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                UserDefaults.standard.set(refreshed, forKey: backendBookmarkKey)
+            }
+        }
+    }
+
+    private func validateBackendFolder() {
+        guard let url = backendFolderURL else {
+            backendFolderError = "Select the backend folder."
+            return
+        }
+        let pythonPath = url.appendingPathComponent(".venv/bin/python").path
+        #if DEBUG
+        if FileManager.default.fileExists(atPath: pythonPath) {
+            backendFolderError = nil
+            return
+        }
+        backendFolderError = "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+        #else
+        if FileManager.default.isExecutableFile(atPath: pythonPath) {
+            backendFolderError = nil
+            return
+        }
+        if FileManager.default.fileExists(atPath: pythonPath) {
+            backendFolderError = "Backend venv python is not executable. Recreate it with /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+            return
+        }
+        backendFolderError = "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+        #endif
+    }
+
+    @MainActor
+    func chooseBackendFolder() {
+        backendFolderError = nil
+        shareableContentError = nil
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = defaultBackendProjectRoot.deletingLastPathComponent()
+        panel.message = "Select the fast_mac_transcribe_diarise_local_models_only folder."
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                let data = try url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+                UserDefaults.standard.set(data, forKey: backendBookmarkKey)
+                backendFolderURL = url
+                validateBackendFolder()
+            } catch {
+                backendFolderError = "Failed to save backend folder bookmark: \(error)"
+            }
+        }
+    }
+
+    private func startBackendAccess(for url: URL) -> Bool {
+        guard backendAccessURL == nil else { return true }
+        if url.startAccessingSecurityScopedResource() {
+            backendAccessURL = url
+            return true
+        }
+        return false
+    }
+
+    private func stopBackendAccess() {
+        if let url = backendAccessURL {
+            url.stopAccessingSecurityScopedResource()
+        }
+        backendAccessURL = nil
+    }
+
+    private func resetBackendLog(in folderURL: URL) {
+        backendLogTail.removeAll()
+        let logURL = folderURL.appendingPathComponent("backend.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        backendLogURL = logURL
+        backendLogHandle = try? FileHandle(forWritingTo: logURL)
+    }
+
+    private func closeBackendLog() {
+        if let handle = backendLogHandle {
+            try? handle.close()
+        }
+        backendLogHandle = nil
+    }
+
+    private func appendBackendLog(_ line: String, toTail: Bool) {
+        let trimmed = line.trimmingCharacters(in: .newlines)
+        if let data = (trimmed + "\n").data(using: .utf8) {
+            backendLogHandle?.write(data)
+        }
+        guard toTail else { return }
+        backendLogTail.append(trimmed)
+        if backendLogTail.count > backendLogTailLimit {
+            backendLogTail.removeFirst(backendLogTail.count - backendLogTailLimit)
+        }
+    }
+
+    private func handleBackendJSONLine(_ line: String) {
+        if let data = line.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let type = obj["type"] as? String,
+           type == "error" || type == "status" {
+            let message = (obj["message"] as? String) ?? line
+            appendBackendLog("[\(type)] \(message)", toTail: true)
+        }
+        transcriptModel.ingest(jsonLine: line)
     }
 
     var selectedDisplay: SCDisplay? {
@@ -198,12 +395,24 @@ final class AppModel: ObservableObject {
 
     func startMeeting() async {
         refreshPermissions()
+        backendFolderError = nil
+        shareableContentError = nil
         if shouldShowOnboarding {
             showPermissionsSheet = true
             return
         }
 
         guard !isCapturing else { return }
+
+        guard transcribeSystem || transcribeMic else {
+            shareableContentError = "Select at least one transcription source."
+            return
+        }
+
+        guard let backendProjectRoot = backendFolderURL else {
+            shareableContentError = "Select the backend folder before starting."
+            return
+        }
 
         let filter: SCContentFilter
         switch sourceKind {
@@ -236,22 +445,103 @@ final class AppModel: ObservableObject {
         do {
             let audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
             try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+            resetBackendLog(in: folderURL)
 
             if selectedInputDeviceID != 0 {
                 _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
             }
 
-            let backend = try BackendProcess(command: backendCommand, workingDirectory: audioDir)
-            backend.onJSONLine = { [weak self] line in
-                Task { @MainActor in
-                    self?.transcriptModel.ingest(jsonLine: line)
-                }
+            guard startBackendAccess(for: backendProjectRoot) else {
+                shareableContentError = "Backend folder access denied. Re-select the folder."
+                closeBackendLog()
+                currentSession = nil
+                return
             }
-            try backend.start()
-            self.backend = backend
 
-            let writer = FramedWriter(stdinHandle: backend.stdin)
-            self.writer = writer
+            let writer: FramedWriter
+            switch resolveBackendPython(for: backendProjectRoot) {
+            case .success(let backendPython):
+                if !FileManager.default.fileExists(atPath: backendPython) {
+                    let message = "Backend python not found at \(backendPython)."
+                    shareableContentError = message
+                    backendFolderError = message
+                    closeBackendLog()
+                    stopBackendAccess()
+                    currentSession = nil
+                    return
+                }
+                let transcribeStream: String
+                if transcribeSystem && transcribeMic {
+                    transcribeStream = "both"
+                } else if transcribeSystem {
+                    transcribeStream = "system"
+                } else {
+                    transcribeStream = "mic"
+                }
+
+                var command = [
+                    backendPython,
+                    "-m",
+                    "diarise_transcribe.muesli_backend",
+                    "--emit-meters",
+                    "--transcribe-stream",
+                    transcribeStream,
+                    "--output-dir",
+                    audioDir.path
+                ]
+                #if DEBUG
+                command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
+                #endif
+                let baseEnv = ProcessInfo.processInfo.environment
+                let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                let mergedPath: String
+                if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
+                    mergedPath = "\(defaultPath):\(existingPath)"
+                } else {
+                    mergedPath = defaultPath
+                }
+                let backendEnv = [
+                    "PYTHONPATH": backendProjectRoot.appendingPathComponent("src").path,
+                    "PATH": mergedPath
+                ]
+                let backend = try BackendProcess(
+                    command: command,
+                    workingDirectory: backendProjectRoot,
+                    environment: backendEnv
+                )
+                appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
+                appendBackendLog("PATH: \(mergedPath)", toTail: true)
+                appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
+                backend.onExit = { [weak self] status in
+                    Task { @MainActor in
+                        self?.appendBackendLog("Backend exited with status \(status)", toTail: true)
+                    }
+                }
+                backend.onStdoutLine = { [weak self] line in
+                    Task { @MainActor in
+                        self?.handleBackendJSONLine(line)
+                    }
+                }
+                backend.onStderrLine = { [weak self] line in
+                    Task { @MainActor in
+                        self?.appendBackendLog("[stderr] \(line)", toTail: true)
+                    }
+                }
+                try backend.start()
+                self.backend = backend
+                let createdWriter = FramedWriter(stdinHandle: backend.stdin)
+                self.writer = createdWriter
+                writer = createdWriter
+
+            case .failure(let error):
+                shareableContentError = error.message
+                backendFolderError = error.message
+                appendBackendLog("Backend start blocked: \(error.message)", toTail: true)
+                closeBackendLog()
+                stopBackendAccess()
+                currentSession = nil
+                return
+            }
 
             let meta: [String: Any] = [
                 "protocol_version": 1,
@@ -263,6 +553,7 @@ final class AppModel: ObservableObject {
             ]
             let metaData = try JSONSerialization.data(withJSONObject: meta)
             writer.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
+            appendBackendLog("Sent meeting_start", toTail: true)
 
             let recordURL: URL?
             if captureMode == .video {
@@ -302,7 +593,13 @@ final class AppModel: ObservableObject {
 
             isCapturing = true
         } catch {
-            shareableContentError = "Failed to start backend or capture: \(error)"
+            let pythonPath = backendPythonCandidatePath ?? "(unknown)"
+            let nsError = error as NSError
+            let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
+            shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
+            appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
+            closeBackendLog()
+            stopBackendAccess()
             await stopMeeting()
         }
     }
@@ -318,6 +615,8 @@ final class AppModel: ObservableObject {
 
         backend?.stop()
         backend = nil
+        closeBackendLog()
+        stopBackendAccess()
 
         isCapturing = false
         currentSession = nil
@@ -548,6 +847,58 @@ struct NewMeetingView: View {
                 .padding(8)
             }
 
+            GroupBox("Backend") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.backendFolderPath)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    if let pythonPath = model.backendPythonCandidatePath {
+                        Text("Python: \(pythonPath)")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text("App Support: \(model.appSupportPath)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text("Sandboxed: \(model.isSandboxed ? "Yes" : "No")")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if let err = model.backendFolderError {
+                        Text(err)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+
+                    Button("Select backend folder") {
+                        model.chooseBackendFolder()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Text("Select the fast_mac_transcribe_diarise_local_models_only folder.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+            }
+
+            GroupBox("Transcription sources") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("System audio", isOn: $model.transcribeSystem)
+                        .disabled(!model.transcribeMic)
+                    Toggle("Microphone", isOn: $model.transcribeMic)
+                        .disabled(!model.transcribeSystem)
+                    Text("At least one source must be selected.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+            }
+
             HStack {
                 Spacer()
                 Button("Start meeting") {
@@ -574,6 +925,7 @@ struct SessionView: View {
     @EnvironmentObject var model: AppModel
     @State private var showSpeakers = false
     @State private var autoScroll = true
+    @State private var showDebug = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -595,6 +947,7 @@ struct SessionView: View {
                     GroupBox("Controls") {
                         VStack(alignment: .leading, spacing: 10) {
                             Toggle("Auto-scroll transcript", isOn: $autoScroll)
+                            Toggle("Show debug panel", isOn: $showDebug)
                             HStack {
                                 Button("Speakers") { showSpeakers = true }
                                 Button("Permissions") { model.showPermissionsSheet = true }
@@ -608,33 +961,45 @@ struct SessionView: View {
                         .padding(8)
                     }
 
-                    GroupBox("Debug") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Button("Copy debug") {
-                                    let pasteboard = NSPasteboard.general
-                                    pasteboard.clearContents()
-                                    pasteboard.setString(model.debugSummary, forType: .string)
-                                }
-                                .buttonStyle(.bordered)
+                    if showDebug {
+                        GroupBox("Debug") {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Button("Copy debug") {
+                                        let pasteboard = NSPasteboard.general
+                                        pasteboard.clearContents()
+                                        pasteboard.setString(model.debugSummary, forType: .string)
+                                    }
+                                    .buttonStyle(.bordered)
 
-                                Spacer()
+                                    Spacer()
+                                }
+                                Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
+                                Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
+                                Text("System format: \(model.debugSystemFormat)")
+                                Text("System errors: \(model.debugAudioErrors)")
+                                Text("System last error: \(model.debugSystemErrorMessage)")
+                                Divider()
+                                Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
+                                Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
+                                Text("Mic format: \(model.debugMicFormat)")
+                                Text("Mic errors: \(model.debugMicErrors)")
+                                Text("Mic last error: \(model.debugMicErrorMessage)")
+                                Divider()
+                                Text("Backend folder: \(model.backendFolderPath)")
+                                Text("Backend log: \(model.backendLogPath ?? "-")")
+                                if !model.backendLogTail.isEmpty {
+                                    ScrollView {
+                                        Text(model.backendLogTail.joined(separator: "\n"))
+                                            .textSelection(.enabled)
+                                    }
+                                    .frame(maxHeight: 120)
+                                }
                             }
-                            Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
-                            Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
-                            Text("System format: \(model.debugSystemFormat)")
-                            Text("System errors: \(model.debugAudioErrors)")
-                            Text("System last error: \(model.debugSystemErrorMessage)")
-                            Divider()
-                            Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
-                            Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
-                            Text("Mic format: \(model.debugMicFormat)")
-                            Text("Mic errors: \(model.debugMicErrors)")
-                            Text("Mic last error: \(model.debugMicErrorMessage)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(8)
                         }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(8)
                     }
 
                     Spacer()
@@ -706,6 +1071,15 @@ struct TranscriptRow: View {
                     showRename = true
                 }
                 .buttonStyle(.link)
+
+                if segment.stream != "unknown" {
+                    Text(segment.stream.capitalized)
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
+                        .cornerRadius(6)
+                }
 
                 Text(String(format: "t=%.2fs", segment.t0))
                     .font(.caption)
@@ -938,6 +1312,7 @@ struct Permissions {
 struct TranscriptSegment: Identifiable {
     let id = UUID()
     let speakerID: String
+    let stream: String
     let t0: Double
     let t1: Double?
     let text: String
@@ -967,11 +1342,13 @@ final class TranscriptModel: ObservableObject {
         switch type {
         case "segment":
             let speakerID = (obj["speaker_id"] as? String) ?? "unknown"
+            let stream = (obj["stream"] as? String) ?? "unknown"
             let t0 = (obj["t0"] as? Double) ?? 0
             let t1 = obj["t1"] as? Double
             let text = (obj["text"] as? String) ?? ""
             let segment = TranscriptSegment(
                 speakerID: speakerID,
+                stream: stream,
                 t0: t0,
                 t1: t1,
                 text: text,
@@ -982,10 +1359,12 @@ final class TranscriptModel: ObservableObject {
 
         case "partial":
             let speakerID = (obj["speaker_id"] as? String) ?? "unknown"
+            let stream = (obj["stream"] as? String) ?? "unknown"
             let t0 = (obj["t0"] as? Double) ?? 0
             let text = (obj["text"] as? String) ?? ""
             let segment = TranscriptSegment(
                 speakerID: speakerID,
+                stream: stream,
                 t0: t0,
                 t1: nil,
                 text: text,
@@ -1021,14 +1400,19 @@ final class BackendProcess {
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
     private let workingDirectory: URL?
+    private let environment: [String: String]?
 
     private var buffer = Data()
+    private var stderrBuffer = Data()
 
     var onJSONLine: ((String) -> Void)?
+    var onStdoutLine: ((String) -> Void)?
+    var onStderrLine: ((String) -> Void)?
+    var onExit: ((Int32) -> Void)?
 
     var stdin: FileHandle { stdinPipe.fileHandleForWriting }
 
-    init(command: [String], workingDirectory: URL? = nil) throws {
+    init(command: [String], workingDirectory: URL? = nil, environment: [String: String]? = nil) throws {
         guard !command.isEmpty else {
             throw NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "Empty command"])
         }
@@ -1036,6 +1420,7 @@ final class BackendProcess {
         process.executableURL = URL(fileURLWithPath: command[0])
         process.arguments = Array(command.dropFirst())
         self.workingDirectory = workingDirectory
+        self.environment = environment
 
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
@@ -1054,7 +1439,26 @@ final class BackendProcess {
                     let lineData = self.buffer.subdata(in: 0..<range.lowerBound)
                     self.buffer.removeSubrange(0..<range.upperBound)
                     if let line = String(data: lineData, encoding: .utf8) {
+                        self.onStdoutLine?(line)
                         self.onJSONLine?(line)
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            let chunk = handle.availableData
+            if chunk.isEmpty { return }
+            self.stderrBuffer.append(chunk)
+
+            while true {
+                if let range = self.stderrBuffer.firstRange(of: Data([0x0A])) {
+                    let lineData = self.stderrBuffer.subdata(in: 0..<range.lowerBound)
+                    self.stderrBuffer.removeSubrange(0..<range.upperBound)
+                    if let line = String(data: lineData, encoding: .utf8) {
+                        self.onStderrLine?(line)
                     }
                 } else {
                     break
@@ -1065,12 +1469,24 @@ final class BackendProcess {
         if let workingDirectory {
             process.currentDirectoryURL = workingDirectory
         }
+        if let environment {
+            var env = ProcessInfo.processInfo.environment
+            for (key, value) in environment {
+                env[key] = value
+            }
+            process.environment = env
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            self?.onExit?(proc.terminationStatus)
+        }
 
         try process.run()
     }
 
     func stop() {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
         stdinPipe.fileHandleForWriting.closeFile()
 
         if process.isRunning {
@@ -1182,28 +1598,72 @@ final class AudioSampleExtractor {
         }
 
         var mono = [Float](repeating: 0, count: frames)
+        let isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+        let channelsPerFrame = Int(asbd.mChannelsPerFrame)
 
         for b in 0..<bufferCount {
             guard let mData = dataPointer[b].mData else { continue }
             let byteSize = Int(dataPointer[b].mDataByteSize)
 
             if isFloat && bitsPerChannel == 32 {
-                let count = min(frames, byteSize / MemoryLayout<Float>.size)
-                let floats = mData.bindMemory(to: Float.self, capacity: count)
-                for i in 0..<count {
-                    mono[i] += floats[i]
+                let sampleCount = byteSize / MemoryLayout<Float>.size
+                let floats = mData.bindMemory(to: Float.self, capacity: sampleCount)
+                if isInterleaved && channelsPerFrame > 1 {
+                    let framesAvailable = sampleCount / channelsPerFrame
+                    let count = min(frames, framesAvailable)
+                    for i in 0..<count {
+                        var sum: Float = 0
+                        let base = i * channelsPerFrame
+                        for ch in 0..<channelsPerFrame {
+                            sum += floats[base + ch]
+                        }
+                        mono[i] += sum / Float(channelsPerFrame)
+                    }
+                } else {
+                    let count = min(frames, sampleCount)
+                    for i in 0..<count {
+                        mono[i] += floats[i]
+                    }
                 }
             } else if isSignedInt && bitsPerChannel == 16 {
-                let count = min(frames, byteSize / MemoryLayout<Int16>.size)
-                let ints = mData.bindMemory(to: Int16.self, capacity: count)
-                for i in 0..<count {
-                    mono[i] += Float(ints[i]) / 32768.0
+                let sampleCount = byteSize / MemoryLayout<Int16>.size
+                let ints = mData.bindMemory(to: Int16.self, capacity: sampleCount)
+                if isInterleaved && channelsPerFrame > 1 {
+                    let framesAvailable = sampleCount / channelsPerFrame
+                    let count = min(frames, framesAvailable)
+                    for i in 0..<count {
+                        var sum: Float = 0
+                        let base = i * channelsPerFrame
+                        for ch in 0..<channelsPerFrame {
+                            sum += Float(ints[base + ch]) / 32768.0
+                        }
+                        mono[i] += sum / Float(channelsPerFrame)
+                    }
+                } else {
+                    let count = min(frames, sampleCount)
+                    for i in 0..<count {
+                        mono[i] += Float(ints[i]) / 32768.0
+                    }
                 }
             } else if isSignedInt && bitsPerChannel == 32 {
-                let count = min(frames, byteSize / MemoryLayout<Int32>.size)
-                let ints = mData.bindMemory(to: Int32.self, capacity: count)
-                for i in 0..<count {
-                    mono[i] += Float(ints[i]) / 2147483648.0
+                let sampleCount = byteSize / MemoryLayout<Int32>.size
+                let ints = mData.bindMemory(to: Int32.self, capacity: sampleCount)
+                if isInterleaved && channelsPerFrame > 1 {
+                    let framesAvailable = sampleCount / channelsPerFrame
+                    let count = min(frames, framesAvailable)
+                    for i in 0..<count {
+                        var sum: Float = 0
+                        let base = i * channelsPerFrame
+                        for ch in 0..<channelsPerFrame {
+                            sum += Float(ints[base + ch]) / 2147483648.0
+                        }
+                        mono[i] += sum / Float(channelsPerFrame)
+                    }
+                } else {
+                    let count = min(frames, sampleCount)
+                    for i in 0..<count {
+                        mono[i] += Float(ints[i]) / 2147483648.0
+                    }
                 }
             } else {
                 throw AudioExtractError.unsupportedFormat

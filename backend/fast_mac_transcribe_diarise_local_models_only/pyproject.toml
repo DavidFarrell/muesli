@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "diarise-transcribe"
+version = "0.1.0"
+description = "Accelerated offline transcription + speaker diarisation on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "David"}
+]
+keywords = ["transcription", "diarisation", "asr", "mlx", "coreml", "apple-silicon"]
+
+dependencies = [
+    "parakeet-mlx>=0.2.0",
+    "numpy>=1.26.0",
+    "soundfile>=0.12.0",
+    "librosa>=0.10.0",
+    "huggingface-hub>=0.20.0",
+    "coremltools>=7.0",
+    "senko @ git+https://github.com/narcotic-sh/senko.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=24.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+diarise-transcribe = "diarise_transcribe.cli:main"
+muesli-backend = "diarise_transcribe.muesli_backend:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/diarise_transcribe"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
