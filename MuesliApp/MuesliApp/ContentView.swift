@@ -36,7 +36,7 @@ struct MeetingSession {
 
 @MainActor
 final class AppModel: ObservableObject {
-    private let captureSampleRate = 16000
+    private let captureSampleRate = 48000
     private let captureChannels = 1
 
     @Published var showPermissionsSheet = false
@@ -98,8 +98,24 @@ final class AppModel: ObservableObject {
     var debugMicPTS: Double { captureEngine.debugMicPTS }
     var debugSystemFormat: String { captureEngine.debugSystemFormat }
     var debugMicFormat: String { captureEngine.debugMicFormat }
+    var debugSystemErrorMessage: String { captureEngine.debugSystemErrorMessage }
+    var debugMicErrorMessage: String { captureEngine.debugMicErrorMessage }
     var debugAudioErrors: Int { captureEngine.debugAudioErrors }
     var debugMicErrors: Int { captureEngine.debugMicErrors }
+    var debugSummary: String {
+        """
+        System buffers: \(debugSystemBuffers) frames: \(debugSystemFrames)
+        System PTS: \(String(format: "%.3f", debugSystemPTS))
+        System format: \(debugSystemFormat)
+        System errors: \(debugAudioErrors)
+        System last error: \(debugSystemErrorMessage)
+        Mic buffers: \(debugMicBuffers) frames: \(debugMicFrames)
+        Mic PTS: \(String(format: "%.3f", debugMicPTS))
+        Mic format: \(debugMicFormat)
+        Mic errors: \(debugMicErrors)
+        Mic last error: \(debugMicErrorMessage)
+        """
+    }
 
     var selectedDisplay: SCDisplay? {
         guard let id = selectedDisplayID else { return nil }
@@ -594,15 +610,27 @@ struct SessionView: View {
 
                     GroupBox("Debug") {
                         VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Button("Copy debug") {
+                                    let pasteboard = NSPasteboard.general
+                                    pasteboard.clearContents()
+                                    pasteboard.setString(model.debugSummary, forType: .string)
+                                }
+                                .buttonStyle(.bordered)
+
+                                Spacer()
+                            }
                             Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
                             Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
                             Text("System format: \(model.debugSystemFormat)")
                             Text("System errors: \(model.debugAudioErrors)")
+                            Text("System last error: \(model.debugSystemErrorMessage)")
                             Divider()
                             Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
                             Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
                             Text("Mic format: \(model.debugMicFormat)")
                             Text("Mic errors: \(model.debugMicErrors)")
+                            Text("Mic last error: \(model.debugMicErrorMessage)")
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1171,6 +1199,12 @@ final class AudioSampleExtractor {
                 for i in 0..<count {
                     mono[i] += Float(ints[i]) / 32768.0
                 }
+            } else if isSignedInt && bitsPerChannel == 32 {
+                let count = min(frames, byteSize / MemoryLayout<Int32>.size)
+                let ints = mData.bindMemory(to: Int32.self, capacity: count)
+                for i in 0..<count {
+                    mono[i] += Float(ints[i]) / 2147483648.0
+                }
             } else {
                 throw AudioExtractError.unsupportedFormat
             }
@@ -1196,7 +1230,7 @@ final class AudioSampleExtractor {
 
 @MainActor
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let sampleRate = 16000
+    private let sampleRate = 48000
     private let channelCount = 1
 
     private var stream: SCStream?
@@ -1219,6 +1253,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     var debugMicPTS: Double = 0
     var debugSystemFormat: String = "-"
     var debugMicFormat: String = "-"
+    var debugSystemErrorMessage: String = "-"
+    var debugMicErrorMessage: String = "-"
     var debugAudioErrors: Int = 0
     var debugMicErrors: Int = 0
 
@@ -1330,11 +1366,17 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
                 writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: pcm.data)
             }
         } catch {
+            let formatInfo = formatString(from: sampleBuffer) ?? "-"
+            let errorMessage = describeError(error)
             DispatchQueue.main.async {
                 if type == .audio {
                     self.debugAudioErrors += 1
+                    self.debugSystemFormat = formatInfo
+                    self.debugSystemErrorMessage = errorMessage
                 } else if #available(macOS 15.0, *), type == .microphone {
                     self.debugMicErrors += 1
+                    self.debugMicFormat = formatInfo
+                    self.debugMicErrorMessage = errorMessage
                 }
             }
             return
@@ -1374,7 +1416,33 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         let rate = Int(asbd.mSampleRate)
         let channels = asbd.mChannelsPerFrame
         let bits = asbd.mBitsPerChannel
-        return "sr=\(rate) ch=\(channels) bits=\(bits)"
+        let formatID = fourCC(asbd.mFormatID)
+        let flags = String(format: "0x%08X", asbd.mFormatFlags)
+        return "id=\(formatID) sr=\(rate) ch=\(channels) bits=\(bits) flags=\(flags)"
+    }
+
+    private func describeError(_ error: Error) -> String {
+        if let audioError = error as? AudioExtractError {
+            switch audioError {
+            case .missingFormat:
+                return "missing_format"
+            case .unsupportedFormat:
+                return "unsupported_format"
+            case .failedToGetBufferList(let status):
+                return "buffer_list_error=\(status)"
+            }
+        }
+        return String(describing: error)
+    }
+
+    private func fourCC(_ value: UInt32) -> String {
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8(value & 0xFF)
+        ]
+        return bytes.map { $0 >= 32 && $0 < 127 ? String(UnicodeScalar($0)) : "." }.joined()
     }
 }
 
