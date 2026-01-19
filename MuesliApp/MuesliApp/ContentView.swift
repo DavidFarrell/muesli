@@ -22,10 +22,15 @@ struct RootView: View {
         Group {
             if model.shouldShowOnboarding {
                 OnboardingView()
-            } else if model.isCapturing {
-                SessionView()
             } else {
-                NewMeetingView()
+                switch model.activeScreen {
+                case .start:
+                    NewMeetingView()
+                case .session:
+                    SessionView()
+                case .viewing(let item):
+                    MeetingViewer(meeting: item)
+                }
             }
         }
         .toolbar {
@@ -110,6 +115,9 @@ Muesli needs:
 
 struct NewMeetingView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showAllMeetings = false
+    @State private var pendingDelete: MeetingHistoryItem?
+    @State private var showDeleteConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -271,7 +279,50 @@ struct NewMeetingView: View {
                 .disabled(model.shouldShowOnboarding)
             }
 
-            Spacer()
+            GroupBox("Recent meetings") {
+                if model.meetingHistory.isEmpty {
+                    Text("No meetings yet.")
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 6)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(visibleMeetings) { item in
+                            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                Button {
+                                    model.openMeeting(item)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(item.title)
+                                            .font(.headline)
+                                            .lineLimit(1)
+                                        Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                Spacer()
+                                Button {
+                                    pendingDelete = item
+                                    showDeleteConfirm = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                            .padding(.vertical, 2)
+                        }
+
+                        if model.meetingHistory.count > maxVisibleMeetings {
+                            Button(showAllMeetings ? "Show less" : "Show more") {
+                                showAllMeetings.toggle()
+                            }
+                            .buttonStyle(.link)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            }
 
             if model.shouldShowOnboarding {
                 Text("Permissions are missing. Use the toolbar Permissions button or onboarding to grant them.")
@@ -279,6 +330,159 @@ struct NewMeetingView: View {
             }
         }
         .padding(24)
+        .alert("Delete meeting?", isPresented: $showDeleteConfirm) {
+            Button("Delete", role: .destructive) {
+                if let item = pendingDelete {
+                    model.deleteMeeting(item)
+                }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDelete = nil
+            }
+        } message: {
+            Text("This will move the meeting folder to the Trash.")
+        }
+    }
+
+    private var maxVisibleMeetings: Int { 8 }
+
+    private var visibleMeetings: [MeetingHistoryItem] {
+        if showAllMeetings {
+            return model.meetingHistory
+        }
+        return Array(model.meetingHistory.prefix(maxVisibleMeetings))
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        let hrs = total / 3600
+        let mins = (total % 3600) / 60
+        let secs = total % 60
+        if hrs > 0 {
+            return String(format: "%dh %dm", hrs, mins)
+        }
+        if mins > 0 {
+            return String(format: "%dm %ds", mins, secs)
+        }
+        return "\(secs)s"
+    }
+}
+
+// MARK: - Meeting Viewer
+
+struct MeetingViewer: View {
+    @EnvironmentObject var model: AppModel
+    let meeting: MeetingHistoryItem
+    @State private var showSpeakers = false
+    @State private var autoScroll = true
+    @State private var copyIconName = "doc.on.clipboard"
+
+    var body: some View {
+        VStack(spacing: 12) {
+            header
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 12) {
+                    GroupBox("Viewer") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Toggle("Auto-scroll transcript", isOn: $autoScroll)
+                            Button("Speakers") { showSpeakers = true }
+                        }
+                        .padding(8)
+                    }
+
+                    Spacer()
+                }
+                .frame(width: 260)
+
+                transcriptPane(autoScroll: autoScroll)
+            }
+        }
+        .padding(16)
+        .sheet(isPresented: $showSpeakers) {
+            SpeakersSheet()
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Button("Back") {
+                model.closeMeetingViewer()
+            }
+            .buttonStyle(.link)
+
+            VStack(alignment: .leading) {
+                Text(meeting.title)
+                    .font(.title2).bold()
+                Text("\(formatDuration(meeting.durationSeconds)) • \(meeting.segmentCount) segments")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            HStack(spacing: 12) {
+                Button {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(model.transcriptModel.asPlainText(), forType: .string)
+                    copyIconName = "checkmark.circle.fill"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        copyIconName = "doc.on.clipboard"
+                    }
+                } label: {
+                    Image(systemName: copyIconName)
+                }
+                .buttonStyle(.borderless)
+                .help("Copy transcript")
+
+                Button {
+                    model.exportTranscriptFiles(for: meeting)
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .buttonStyle(.borderless)
+                .help("Export transcript")
+            }
+        }
+    }
+
+    private func transcriptPane(autoScroll: Bool) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.transcriptModel.segments.filter { !$0.isPartial }) { segment in
+                        TranscriptRow(segment: segment)
+                            .id(segment.id)
+                    }
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+            }
+            .background(.thinMaterial)
+            .cornerRadius(12)
+            .onChange(of: model.transcriptModel.segments.count) { _ in
+                guard autoScroll, let last = model.transcriptModel.segments.last else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        let hrs = total / 3600
+        let mins = (total % 3600) / 60
+        let secs = total % 60
+        if hrs > 0 {
+            return String(format: "%dh %dm", hrs, mins)
+        }
+        if mins > 0 {
+            return String(format: "%dm %ds", mins, secs)
+        }
+        return "\(secs)s"
     }
 }
 

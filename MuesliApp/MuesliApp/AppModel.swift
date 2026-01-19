@@ -54,6 +54,12 @@ enum BackendPythonError: Error {
     }
 }
 
+enum AppScreen {
+    case start
+    case session
+    case viewing(MeetingHistoryItem)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     private let captureSampleRate = 16000
@@ -111,6 +117,8 @@ final class AppModel: ObservableObject {
 
     @Published var backendFolderURL: URL?
     @Published var backendFolderError: String?
+    @Published var meetingHistory: [MeetingHistoryItem] = []
+    @Published var activeScreen: AppScreen = .start
 
     var backendFolderPath: String {
         backendFolderURL?.path ?? "(not selected)"
@@ -143,6 +151,7 @@ final class AppModel: ObservableObject {
         loadBackendBookmark()
         validateBackendFolder()
         migrateLegacyMeetingsIfNeeded()
+        loadMeetingHistory()
         Task { await loadShareableContent() }
     }
 
@@ -557,6 +566,14 @@ final class AppModel: ObservableObject {
     }
 
     func startMeeting() async {
+        await startMeeting(resuming: nil, metadata: nil, timestampOffset: 0)
+    }
+
+    private func startMeeting(
+        resuming meeting: MeetingHistoryItem?,
+        metadata: MeetingMetadata?,
+        timestampOffset: Double
+    ) async {
         refreshPermissions()
         backendFolderError = nil
         shareableContentError = nil
@@ -596,23 +613,44 @@ final class AppModel: ObservableObject {
 
         let title = normaliseMeetingTitle(meetingTitle)
         let folderURL: URL
-        do {
-            folderURL = try createMeetingFolder(title: title)
-        } catch {
-            shareableContentError = "Failed to create meeting folder: \(error)"
-            return
+        let audioDir: URL
+        var sessionID = 1
+        if let meeting, let metadata {
+            do {
+                let prepared = try prepareResumeSession(for: meeting)
+                folderURL = meeting.folderURL
+                audioDir = prepared.audioFolderURL
+                sessionID = prepared.sessionID
+            } catch {
+                shareableContentError = "Failed to prepare resume session: \(error)"
+                return
+            }
+        } else {
+            do {
+                folderURL = try createMeetingFolder(title: title)
+                audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
+                try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+            } catch {
+                shareableContentError = "Failed to create meeting folder: \(error)"
+                return
+            }
         }
 
         let session = MeetingSession(title: title, folderURL: folderURL, startedAt: Date())
         currentSession = session
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        if timestampOffset > 0 {
+            transcriptModel.timestampOffset = timestampOffset
+        }
 
         do {
-            let audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
-            try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
             resetBackendLog(in: folderURL)
             resetTranscriptEventsLog(in: folderURL)
-            try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
+            if meeting == nil {
+                try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
+            } else if let metadata {
+                try appendResumeSessionMetadata(metadata, for: session, sessionID: sessionID, audioFolderName: audioDir.lastPathComponent)
+            }
 
             if selectedInputDeviceID != 0 {
                 _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
@@ -794,6 +832,7 @@ final class AppModel: ObservableObject {
             }
 
             isCapturing = true
+            activeScreen = .session
         } catch {
             let pythonPath = backendPythonCandidatePath ?? "(unknown)"
             let nsError = error as NSError
@@ -838,6 +877,7 @@ final class AppModel: ObservableObject {
         isFinalizing = false
         isCapturing = false
         currentSession = nil
+        activeScreen = .start
     }
 
     static func defaultMeetingTitle() -> String {
@@ -917,15 +957,42 @@ final class AppModel: ObservableObject {
         try writeMeetingMetadata(metadata, to: session.folderURL)
     }
 
-    private func finalizeMeetingMetadata(for session: MeetingSession) {
-        let finalizedSegments = transcriptModel.segments.filter { !$0.isPartial }
-        let lastTimestamp = finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
-        let segmentCount = finalizedSegments.count
-        let durationFromStart = Date().timeIntervalSince(session.startedAt)
-        let durationSeconds = max(lastTimestamp, durationFromStart)
+    private func appendResumeSessionMetadata(
+        _ metadata: MeetingMetadata,
+        for session: MeetingSession,
+        sessionID: Int,
+        audioFolderName: String
+    ) throws {
+        var updated = metadata
+        updated.status = .recording
+        updated.updatedAt = session.startedAt
+        let streams: [String: MeetingStreamInfo] = [
+            "system": MeetingStreamInfo(sampleRate: nil, channels: nil),
+            "mic": MeetingStreamInfo(sampleRate: nil, channels: nil)
+        ]
+        let newSession = MeetingSessionMetadata(
+            sessionID: sessionID,
+            startedAt: session.startedAt,
+            endedAt: nil,
+            audioFolder: audioFolderName,
+            streams: streams
+        )
+        updated.sessions.append(newSession)
+        try writeMeetingMetadata(updated, to: session.folderURL)
+    }
 
+    private func finalizeMeetingMetadata(for session: MeetingSession) {
         do {
             var metadata = try readMeetingMetadata(from: session.folderURL)
+            let finalizedSegments = transcriptModel.segments.filter { !$0.isPartial }
+            let lastTimestamp = max(
+                metadata.lastTimestamp,
+                finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
+            )
+            let segmentCount = max(metadata.segmentCount, finalizedSegments.count)
+            let durationFromStart = Date().timeIntervalSince(metadata.createdAt)
+            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, durationFromStart)
+
             metadata.updatedAt = Date()
             metadata.durationSeconds = durationSeconds
             metadata.lastTimestamp = lastTimestamp
@@ -997,6 +1064,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func prepareResumeSession(for meeting: MeetingHistoryItem) throws -> (metadata: MeetingMetadata, sessionID: Int, audioFolderURL: URL) {
+        let metadata = try readMeetingMetadata(from: meeting.folderURL)
+        let nextSessionID = (metadata.sessions.map(\.sessionID).max() ?? 0) + 1
+        let folderName = "audio-session-\(nextSessionID)"
+        let audioURL = meeting.folderURL.appendingPathComponent(folderName, isDirectory: true)
+        try FileManager.default.createDirectory(at: audioURL, withIntermediateDirectories: true)
+        return (metadata, nextSessionID, audioURL)
+    }
+
     private func migrateLegacyMeetingsIfNeeded() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Muesli", isDirectory: true)
@@ -1021,6 +1097,186 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func loadMeetingHistory() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Muesli", isDirectory: true)
+            .appendingPathComponent("Meetings", isDirectory: true)
+        guard let folders = try? FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            meetingHistory = []
+            return
+        }
+
+        var items: [MeetingHistoryItem] = []
+        for folderURL in folders {
+            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard resourceValues?.isDirectory == true else { continue }
+            if let item = buildMeetingHistoryItem(for: folderURL) {
+                items.append(item)
+            }
+        }
+        meetingHistory = items.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private func buildMeetingHistoryItem(for folderURL: URL) -> MeetingHistoryItem? {
+        if let metadata = try? readMeetingMetadata(from: folderURL) {
+            return MeetingHistoryItem(
+                id: folderURL.lastPathComponent,
+                folderURL: folderURL,
+                title: metadata.title,
+                createdAt: metadata.createdAt,
+                durationSeconds: metadata.durationSeconds,
+                segmentCount: metadata.segmentCount,
+                status: metadata.status
+            )
+        }
+
+        let createdAt = creationDate(for: folderURL) ?? Date()
+        let updatedAt = latestModificationDate(for: folderURL) ?? createdAt
+        let durationSeconds = max(0, updatedAt.timeIntervalSince(createdAt))
+        let title = legacyMeetingTitle(for: folderURL)
+        let segmentStats = parseSegmentStats(
+            from: folderURL.appendingPathComponent("transcript.jsonl"),
+            expectsTypeField: false
+        )
+
+        return MeetingHistoryItem(
+            id: folderURL.lastPathComponent,
+            folderURL: folderURL,
+            title: title,
+            createdAt: createdAt,
+            durationSeconds: durationSeconds,
+            segmentCount: segmentStats.count,
+            status: .completed
+        )
+    }
+
+    func deleteMeeting(_ item: MeetingHistoryItem) {
+        if isCapturing, let session = currentSession, session.folderURL == item.folderURL {
+            appendBackendLog("Delete blocked: meeting is currently recording.", toTail: true)
+            return
+        }
+        do {
+            var trashedURL: NSURL?
+            try FileManager.default.trashItem(at: item.folderURL, resultingItemURL: &trashedURL)
+            meetingHistory.removeAll { $0.id == item.id }
+            if case .viewing(let current) = activeScreen, current.id == item.id {
+                closeMeetingViewer()
+            }
+        } catch {
+            appendBackendLog("Failed to delete meeting \(item.id): \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func openMeeting(_ item: MeetingHistoryItem) {
+        loadTranscriptForViewer(from: item.folderURL)
+        activeScreen = .viewing(item)
+    }
+
+    func resumeMeeting(_ item: MeetingHistoryItem) {
+        do {
+            let metadata = try readMeetingMetadata(from: item.folderURL)
+            meetingTitle = item.title
+            Task { await startMeeting(resuming: item, metadata: metadata, timestampOffset: metadata.lastTimestamp) }
+        } catch {
+            appendBackendLog("Failed to resume meeting \(item.id): \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func closeMeetingViewer() {
+        activeScreen = .start
+        clearViewerTranscript()
+    }
+
+    func exportTranscriptFiles(for meeting: MeetingHistoryItem) {
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedFileTypes = ["txt"]
+        panel.nameFieldStringValue = "\(meeting.title)-transcript.txt"
+        panel.prompt = "Export"
+        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
+
+            let transcriptURL = meeting.folderURL.appendingPathComponent("transcript.jsonl")
+            if FileManager.default.fileExists(atPath: transcriptURL.path) {
+                if let jsonlData = try? Data(contentsOf: transcriptURL) {
+                    do {
+                        try jsonlData.write(to: jsonlURL)
+                    } catch {
+                        appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
+                    }
+                }
+            } else {
+                let jsonlString = transcriptModel.segments
+                    .filter { !$0.isPartial }
+                    .compactMap { seg -> String? in
+                        let payload: [String: Any] = [
+                            "speaker_id": seg.speakerID,
+                            "stream": seg.stream,
+                            "t0": seg.t0,
+                            "t1": seg.t1 ?? seg.t0,
+                            "text": seg.text
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: payload),
+                           let line = String(data: data, encoding: .utf8) {
+                            return line
+                        }
+                        return nil
+                    }
+                    .joined(separator: "\n")
+                if let jsonlData = jsonlString.data(using: .utf8) {
+                    do {
+                        try jsonlData.write(to: jsonlURL)
+                    } catch {
+                        appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
+                    }
+                }
+            }
+
+            let textString = transcriptModel.asPlainText()
+            if let textData = textString.data(using: .utf8) {
+                do {
+                    try textData.write(to: url)
+                } catch {
+                    appendBackendLog("Failed to export transcript text: \(error.localizedDescription)", toTail: true)
+                }
+            } else {
+                appendBackendLog("Failed to encode exported transcript text.", toTail: true)
+            }
+        }
+    }
+
+    private func loadTranscriptForViewer(from folderURL: URL) {
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
+        if FileManager.default.fileExists(atPath: transcriptURL.path) {
+            if let data = try? Data(contentsOf: transcriptURL),
+               let content = String(data: data, encoding: .utf8) {
+                for line in content.split(separator: "\n") {
+                    transcriptModel.ingest(jsonLine: String(line))
+                }
+            }
+        } else {
+            appendBackendLog("Transcript not found for viewer: \(transcriptURL.path)", toTail: true)
+        }
+
+        do {
+            let metadata = try readMeetingMetadata(from: folderURL)
+            transcriptModel.speakerNames = metadata.speakerNames
+        } catch {
+            appendBackendLog("Failed to load speaker names: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func clearViewerTranscript() {
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
     }
 
     private func buildLegacyMeetingMetadata(for folderURL: URL) -> MeetingMetadata? {

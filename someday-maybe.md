@@ -88,3 +88,17 @@ When not using headphones, the mic picks up audio from speakers, causing duplica
 - **User guidance** - Show a tip recommending headphones when both system and mic streams are active.
 
 For now, headphones are the simple workaround.
+
+### Speaker over-segmentation (one person = multiple speaker IDs)
+Diarization often splits a single person into multiple speaker IDs (e.g., 5 "speakers" for a 2-person meeting). Causes:
+- **Voice variation** - Different pitch/energy when asking questions vs. answering, or emotional shifts
+- **Audio artifacts** - Echo, background noise, varying mic distance
+- **Short utterances** - Brief interjections get assigned to new speaker IDs
+- **Clustering threshold too strict** - Model is too conservative about grouping similar voices
+
+Potential solutions:
+- **Set expected speaker count** - Pass `num_speakers=N` to pyannote to force clustering into N speakers. Could add a UI field for "Expected participants" before meeting starts.
+- **Raise clustering threshold** - Make the model more lenient about what counts as "same voice"
+- **Post-process merging** - After diarization, merge speaker IDs with similar voice embeddings automatically
+- **UI speaker merging** - Let user drag one speaker label onto another to combine them (SPEAKER_01 + SPEAKER_03 → both become "David")
+- **Prompt for speaker count** - Ask user "How many people in this meeting?" and use that to constrain diarization

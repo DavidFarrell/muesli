@@ -15,6 +15,7 @@ struct TranscriptSegment: Identifiable {
 
 @MainActor
 final class TranscriptModel: ObservableObject {
+    var timestampOffset: Double = 0
     @Published var segments: [TranscriptSegment] = []
     @Published var speakerNames: [String: String] = [:]
     @Published var lastTranscriptAt: Date?
@@ -32,6 +33,7 @@ final class TranscriptModel: ObservableObject {
         segments.removeAll()
         lastTranscriptAt = nil
         lastTranscriptText = ""
+        timestampOffset = 0
         if !keepSpeakerNames {
             speakerNames.removeAll()
         }
@@ -97,17 +99,19 @@ final class TranscriptModel: ObservableObject {
 
     func ingest(jsonLine: String) {
         guard let data = jsonLine.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = obj["type"] as? String else {
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
+
+        let type = obj["type"] as? String ?? "segment"
 
         switch type {
         case "segment":
             let speakerID = (obj["speaker_id"] as? String) ?? "unknown"
             let stream = (obj["stream"] as? String) ?? "unknown"
-            let t0 = (obj["t0"] as? Double) ?? 0
-            let t1 = obj["t1"] as? Double
+            let t0 = ((obj["t0"] as? Double) ?? 0) + timestampOffset
+            let t1Raw = obj["t1"] as? Double
+            let t1 = t1Raw.map { $0 + timestampOffset }
             let text = (obj["text"] as? String) ?? ""
             let segment = TranscriptSegment(
                 speakerID: speakerID,
@@ -128,7 +132,7 @@ final class TranscriptModel: ObservableObject {
         case "partial":
             let speakerID = (obj["speaker_id"] as? String) ?? "unknown"
             let stream = (obj["stream"] as? String) ?? "unknown"
-            let t0 = (obj["t0"] as? Double) ?? 0
+            let t0 = ((obj["t0"] as? Double) ?? 0) + timestampOffset
             let text = (obj["text"] as? String) ?? ""
             let segment = TranscriptSegment(
                 speakerID: speakerID,
