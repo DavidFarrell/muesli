@@ -171,3 +171,113 @@ Potential solutions:
 - **Post-process merging** - After diarization, merge speaker IDs with similar voice embeddings automatically
 - **UI speaker merging** - Let user drag one speaker label onto another to combine them (SPEAKER_01 + SPEAKER_03 → both become "David")
 - **Prompt for speaker count** - Ask user "How many people in this meeting?" and use that to constrain diarization
+
+---
+
+### Chat with Transcript
+
+**The Idea:** Add a "Chat with transcript" button in the Meeting Viewer (works for both live and completed meetings). When clicked:
+1. The transcript pane shrinks to ~half height
+2. A chat interface appears below it (ChatGPT-style input box + message history)
+3. User types questions, LLM answers using the transcript as context
+4. A "Refresh" button clears chat history and reloads the latest transcript
+
+**Why this is useful:**
+- During a live meeting: "What did they say about the deadline?" without scrolling
+- After a meeting: "Summarize the action items" or "What were Pete's main concerns?"
+- Quick way to extract information without reading the whole transcript
+- Natural language queries vs. Cmd+F text search
+
+**Design Considerations:**
+
+1. **LLM Backend Options:**
+   - **Ollama (local)** - Already have infrastructure for speaker identification. Could reuse `gemma3:27b` or use a faster text-only model like `llama3.1:8b` or `mistral:7b`
+   - **Cloud API** - OpenAI/Anthropic would give better quality but adds cost, latency, privacy concerns
+   - **Recommendation:** Start with local Ollama. Fast enough for chat, no API keys needed, transcript stays on device
+
+2. **Context Window Management:**
+   - Short meetings (<30 min): Send entire transcript as context
+   - Long meetings (>30 min): May exceed context window
+   - Options for long transcripts:
+     - Truncate to most recent N minutes
+     - Chunk and use simple retrieval (search for relevant sections)
+     - Summarize older portions, keep recent verbatim
+   - Could show warning: "Transcript too long, using last 30 minutes only"
+
+3. **Prompt Structure:**
+   ```
+   You are a helpful assistant analyzing a meeting transcript.
+
+   TRANSCRIPT:
+   [full transcript or relevant portion]
+
+   Answer questions about this meeting. Be concise and cite specific
+   quotes when relevant. If the answer isn't in the transcript, say so.
+
+   USER: [question]
+   ```
+
+4. **UI Layout (Split View):**
+   ```
+   ┌─────────────────────────────────────────────┐
+   │  Meeting: 2026-01-19 - Awin - Pete          │
+   ├─────────────────────────────────────────────┤
+   │                                             │
+   │  [Transcript pane - scrollable, ~50%]       │
+   │                                             │
+   ├─────────────────────────────────────────────┤
+   │  🤖: How can I help with this meeting?      │
+   │                                             │
+   │  You: What were the main topics discussed?  │
+   │                                             │
+   │  🤖: The meeting covered three main areas:  │
+   │      1. Magic Eye content auditing...       │
+   │      2. ...                                 │
+   │                                             │
+   │  ┌─────────────────────────────┐ [Refresh]  │
+   │  │ Ask about this meeting...   │ [Send]     │
+   │  └─────────────────────────────┘            │
+   └─────────────────────────────────────────────┘
+   ```
+
+5. **Live Meeting Considerations:**
+   - Transcript grows during the meeting
+   - "Refresh" button becomes more useful - reload latest transcript
+   - Could auto-refresh context every N messages
+   - Show indicator when context is stale: "Transcript updated 2 min ago"
+
+6. **Streaming Responses:**
+   - Ollama supports streaming via `/api/generate`
+   - Show tokens as they arrive for better UX
+   - User sees response building rather than waiting
+
+7. **Conversation History:**
+   - Keep chat history in memory (not persisted to disk)
+   - Include previous Q&A pairs in context for follow-up questions
+   - "Refresh" clears history and starts fresh
+   - Optional: "Save chat" to export Q&A as markdown
+
+8. **Suggested Questions:**
+   - Show starter prompts when chat opens:
+     - "Summarize this meeting"
+     - "List action items"
+     - "What questions were raised?"
+     - "What did [speaker] say about...?"
+
+**Implementation Phases:**
+
+1. **Phase 1: Basic chat** - Text input, send to Ollama with transcript, show response
+2. **Phase 2: Streaming** - Stream responses for better UX
+3. **Phase 3: Context management** - Handle long transcripts
+4. **Phase 4: Polish** - Suggested questions, save chat, auto-refresh for live
+
+**Potential Challenges:**
+- Model hallucination (making up things not in transcript)
+- Slow response times with large context
+- Managing conversation history alongside transcript context
+- UI complexity (resizable split view)
+
+**Alternative Simpler Version:**
+Instead of split view, could be a sheet/modal that pops up over the transcript. User can dismiss it, ask question, see answer, dismiss again. Less UI complexity but also less useful for back-and-forth conversation while referencing transcript.
+
+**Verdict:** Nice-to-have feature that would make the app significantly more useful. Start with Phase 1 (basic chat) to validate the UX before investing in streaming and context management.
