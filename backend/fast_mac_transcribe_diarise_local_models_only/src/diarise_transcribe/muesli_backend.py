@@ -239,8 +239,8 @@ class TranscriptEmitter:
     def __init__(self, stdout_lock: threading.Lock, finalize_lag: float) -> None:
         self._stdout_lock = stdout_lock
         self._finalize_lag = finalize_lag
-        self._last_emitted_t1 = 0.0
-        self._last_partial = None
+        self._last_emitted_t1_by_stream = {}
+        self._last_partial_by_stream = {}
         self._seen_speakers = set()
         self._lock = threading.Lock()
 
@@ -255,6 +255,10 @@ class TranscriptEmitter:
             return
 
         with self._lock:
+            stream_key = stream_name or "default"
+            last_emitted_t1 = self._last_emitted_t1_by_stream.get(stream_key, 0.0)
+            last_partial = self._last_partial_by_stream.get(stream_key)
+
             new_speakers = False
             for turn in merged.turns:
                 speaker_id = f"{stream_name}:{turn.speaker}" if stream_name else turn.speaker
@@ -268,7 +272,7 @@ class TranscriptEmitter:
 
             cutoff = current_duration if finalize else max(0.0, current_duration - self._finalize_lag)
             for turn in merged.turns:
-                if turn.end <= cutoff and turn.end > self._last_emitted_t1 + 0.02:
+                if turn.end <= cutoff and turn.end > last_emitted_t1 + 0.02:
                     speaker_id = f"{stream_name}:{turn.speaker}" if stream_name else turn.speaker
                     emit_jsonl({
                         "type": "segment",
@@ -279,13 +283,13 @@ class TranscriptEmitter:
                         "t1": turn.end,
                         "text": turn.text,
                     }, self._stdout_lock)
-                    self._last_emitted_t1 = max(self._last_emitted_t1, turn.end)
+                    last_emitted_t1 = max(last_emitted_t1, turn.end)
 
             if not finalize:
                 last_turn = merged.turns[-1]
                 if last_turn.end > cutoff:
                     partial = (last_turn.speaker, last_turn.start, last_turn.text)
-                    if partial != self._last_partial:
+                    if partial != last_partial:
                         speaker_id = f"{stream_name}:{last_turn.speaker}" if stream_name else last_turn.speaker
                         emit_jsonl({
                             "type": "partial",
@@ -294,7 +298,10 @@ class TranscriptEmitter:
                             "t0": last_turn.start,
                             "text": last_turn.text,
                         }, self._stdout_lock)
-                        self._last_partial = partial
+                        last_partial = partial
+
+            self._last_emitted_t1_by_stream[stream_key] = last_emitted_t1
+            self._last_partial_by_stream[stream_key] = last_partial
 
 
 class LiveProcessor:

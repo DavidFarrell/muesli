@@ -553,6 +553,7 @@ final class AppModel: ObservableObject {
 
         let session = MeetingSession(title: title, folderURL: folderURL, startedAt: Date())
         currentSession = session
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
 
         do {
             let audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
@@ -1485,6 +1486,15 @@ final class TranscriptModel: ObservableObject {
 
     func renameSpeaker(id: String, to name: String) {
         speakerNames[id] = name
+    }
+
+    func resetForNewMeeting(keepSpeakerNames: Bool) {
+        segments.removeAll()
+        lastTranscriptAt = nil
+        lastTranscriptText = ""
+        if !keepSpeakerNames {
+            speakerNames.removeAll()
+        }
     }
 
     func ingest(jsonLine: String) {
