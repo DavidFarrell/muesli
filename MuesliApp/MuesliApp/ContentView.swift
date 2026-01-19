@@ -104,6 +104,7 @@ final class AppModel: ObservableObject {
     private var transcriptEventsHandle: FileHandle?
     private var transcriptEventsURL: URL?
     private var backendAccessURL: URL?
+    private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let defaultBackendProjectRoot = URL(fileURLWithPath: "/Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only")
     private var transcriptCancellable: AnyCancellable?
@@ -684,11 +685,6 @@ final class AppModel: ObservableObject {
                         self?.appendBackendLog("Backend exited with status \(status)", toTail: true)
                     }
                 }
-                backend.onStdoutLine = { [weak self] line in
-                    Task { @MainActor in
-                        self?.handleBackendJSONLine(line)
-                    }
-                }
                 backend.onStderrLine = { [weak self] line in
                     Task { @MainActor in
                         self?.appendBackendLog("[stderr] \(line)", toTail: true)
@@ -696,6 +692,12 @@ final class AppModel: ObservableObject {
                 }
                 try backend.start()
                 self.backend = backend
+                stdoutTask?.cancel()
+                stdoutTask = Task { @MainActor in
+                    for await line in backend.stdoutLines {
+                        self.handleBackendJSONLine(line)
+                    }
+                }
                 let createdWriter = FramedWriter(stdinHandle: backend.stdin)
                 self.writer = createdWriter
                 writer = createdWriter
@@ -791,6 +793,8 @@ final class AppModel: ObservableObject {
             backend?.terminate()
         }
         backend?.cleanup()
+        stdoutTask?.cancel()
+        stdoutTask = nil
         backend = nil
         if let session = currentSession {
             saveTranscriptFiles(for: session)
@@ -1551,7 +1555,7 @@ struct Permissions {
 // MARK: - Transcript Model
 
 struct TranscriptSegment: Identifiable {
-    let id = UUID()
+    var id: String { "\(stream)_\(Int(round(t0 * 1000)))" }
     let speakerID: String
     let stream: String
     let t0: Double
@@ -1595,14 +1599,16 @@ final class TranscriptModel: ObservableObject {
             .joined(separator: "\n")
     }
 
-    private func insertSegment(_ newSegment: TranscriptSegment) {
+    private func mergeSegment(_ newSegment: TranscriptSegment, into existingSegments: [TranscriptSegment]) -> [TranscriptSegment] {
         let epsilon: Double = 0.05
         let newStart = newSegment.t0
         let newEnd = newSegment.t1 ?? newSegment.t0
         let newDuration = max(0, newEnd - newStart)
-        var shouldAppend = true
 
-        segments.removeAll { existing in
+        var shouldAppend = true
+        var updated = existingSegments
+
+        updated.removeAll { existing in
             guard existing.stream == newSegment.stream else { return false }
             let existingEnd = existing.t1 ?? existing.t0
             let existingDuration = max(0, existingEnd - existing.t0)
@@ -1630,9 +1636,14 @@ final class TranscriptModel: ObservableObject {
         }
 
         if shouldAppend {
-            segments.append(newSegment)
+            updated.append(newSegment)
         }
-        segments.sort { $0.t0 < $1.t0 }
+
+        return updated
+    }
+
+    private func sortedSegments(_ items: [TranscriptSegment]) -> [TranscriptSegment] {
+        items.sorted { $0.t0 < $1.t0 }
     }
 
     func ingest(jsonLine: String) {
@@ -1657,8 +1668,9 @@ final class TranscriptModel: ObservableObject {
                 text: text,
                 isPartial: false
             )
-            segments.removeAll { $0.isPartial }
-            insertSegment(segment)
+            var updated = segments.filter { !$0.isPartial }
+            updated = mergeSegment(segment, into: updated)
+            segments = sortedSegments(updated)
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text
@@ -1677,11 +1689,13 @@ final class TranscriptModel: ObservableObject {
                 text: text,
                 isPartial: true
             )
-            if let idx = segments.lastIndex(where: { $0.isPartial }) {
-                segments[idx] = segment
+            var updated = segments
+            if let idx = updated.lastIndex(where: { $0.isPartial && $0.stream == stream }) {
+                updated[idx] = segment
             } else {
-                segments.append(segment)
+                updated.append(segment)
             }
+            segments = sortedSegments(updated)
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text
@@ -1715,9 +1729,10 @@ final class BackendProcess {
 
     private var buffer = Data()
     private var stderrBuffer = Data()
+    private var stdoutContinuation: AsyncStream<String>.Continuation?
+    let stdoutLines: AsyncStream<String>
 
     var onJSONLine: ((String) -> Void)?
-    var onStdoutLine: ((String) -> Void)?
     var onStderrLine: ((String) -> Void)?
     var onExit: ((Int32) -> Void)?
 
@@ -1736,6 +1751,12 @@ final class BackendProcess {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        var continuation: AsyncStream<String>.Continuation?
+        self.stdoutLines = AsyncStream<String> { cont in
+            continuation = cont
+        }
+        self.stdoutContinuation = continuation
     }
 
     func start() throws {
@@ -1750,8 +1771,8 @@ final class BackendProcess {
                     let lineData = self.buffer.subdata(in: 0..<range.lowerBound)
                     self.buffer.removeSubrange(0..<range.upperBound)
                     if let line = String(data: lineData, encoding: .utf8) {
-                        self.onStdoutLine?(line)
                         self.onJSONLine?(line)
+                        self.stdoutContinuation?.yield(line)
                     }
                 } else {
                     break
@@ -1822,6 +1843,7 @@ final class BackendProcess {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
         stdinPipe.fileHandleForWriting.closeFile()
+        stdoutContinuation?.finish()
     }
 }
 
