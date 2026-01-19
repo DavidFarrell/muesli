@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
 
     @Published var meetingTitle: String = AppModel.defaultMeetingTitle()
     @Published var currentSession: MeetingSession?
+    @Published var tempTranscriptFolderPath: String?
 
     @Published var micPermission: PermissionState = .notDetermined
     @Published var screenPermissionGranted: Bool = false
@@ -176,6 +177,7 @@ final class AppModel: ObservableObject {
         Backend log: \(backendLogPath ?? "-")
         Backend python: \(backendPythonCandidatePath ?? "-") exists=\(backendPythonExists)
         Sandboxed: \(isSandboxed)
+        Transcript temp folder: \(tempTranscriptFolderPath ?? "-")
         Backend log tail:
         \(tail)
         """
@@ -380,7 +382,13 @@ final class AppModel: ObservableObject {
             textLines.append(line)
         }
 
-        if let jsonlData = jsonlLines.joined(separator: "\n").data(using: .utf8) {
+        let jsonlString = jsonlLines.joined(separator: "\n")
+        let textString = textLines.joined(separator: "\n")
+
+        let jsonlData = jsonlString.data(using: .utf8)
+        let textData = textString.data(using: .utf8)
+
+        if let jsonlData {
             do {
                 try jsonlData.write(to: jsonlURL)
             } catch {
@@ -390,7 +398,7 @@ final class AppModel: ObservableObject {
             appendBackendLog("Failed to encode transcript JSONL.", toTail: true)
         }
 
-        if let textData = textLines.joined(separator: "\n").data(using: .utf8) {
+        if let textData {
             do {
                 try textData.write(to: txtURL)
             } catch {
@@ -398,6 +406,22 @@ final class AppModel: ObservableObject {
             }
         } else {
             appendBackendLog("Failed to encode transcript text.", toTail: true)
+        }
+
+        let tempBase = FileManager.default.temporaryDirectory
+        let tempFolder = tempBase.appendingPathComponent("Muesli-\(session.title)-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+            if let jsonlData {
+                try jsonlData.write(to: tempFolder.appendingPathComponent("transcript.jsonl"))
+            }
+            if let textData {
+                try textData.write(to: tempFolder.appendingPathComponent("transcript.txt"))
+            }
+            tempTranscriptFolderPath = tempFolder.path
+            appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: true)
+        } catch {
+            appendBackendLog("Failed to save transcript temp copy: \(error.localizedDescription)", toTail: true)
         }
     }
 
@@ -484,6 +508,7 @@ final class AppModel: ObservableObject {
         refreshPermissions()
         backendFolderError = nil
         shareableContentError = nil
+        tempTranscriptFolderPath = nil
         if shouldShowOnboarding {
             showPermissionsSheet = true
             return
@@ -1113,6 +1138,9 @@ struct SessionView: View {
                                 Divider()
                                 Text("Backend folder: \(model.backendFolderPath)")
                                 Text("Backend log: \(model.backendLogPath ?? "-")")
+                                if let tempPath = model.tempTranscriptFolderPath {
+                                    Text("Transcript temp folder: \(tempPath)")
+                                }
                                 if !model.backendLogTail.isEmpty {
                                     ScrollView {
                                         Text(model.backendLogTail.joined(separator: "\n"))

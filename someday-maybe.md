@@ -31,6 +31,13 @@ Current behaviour is fine for debugging. If file size becomes an issue, add filt
 
 ---
 
+## From Todo Item 3 (Temp Transcript Artifacts)
+
+### Temp folder cleanup
+Temp folders (`Muesli-<title>-<uuid>`) accumulate in the system temp directory. Could explicitly clean up old Muesli temp folders on app launch or next meeting start. Low priority since OS cleans temp on reboot anyway.
+
+---
+
 ## General
 
 ### UI toast for errors
