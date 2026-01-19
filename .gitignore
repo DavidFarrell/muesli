@@ -10,3 +10,15 @@ __pycache__/
 xcuserdata/
 *.xcuserstate
 DerivedData/
+
+# Meeting data - NEVER commit transcripts or recordings
+Meetings/
+*.jsonl
+transcript*.txt
+transcript*.md
+meeting.json
+audio-session-*/
+*.wav
+*.m4a
+*.mp3
+*.aac
