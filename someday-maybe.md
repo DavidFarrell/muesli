@@ -190,19 +190,18 @@ Potential solutions:
 
 **Design Considerations:**
 
-1. **LLM Backend Options:**
-   - **Ollama (local)** - Already have infrastructure for speaker identification. Could reuse `gemma3:27b` or use a faster text-only model like `llama3.1:8b` or `mistral:7b`
-   - **Cloud API** - OpenAI/Anthropic would give better quality but adds cost, latency, privacy concerns
-   - **Recommendation:** Start with local Ollama. Fast enough for chat, no API keys needed, transcript stays on device
+1. **LLM Backend:**
+   - Use `gemma3:27b` via Ollama (same as speaker identification)
+   - Model is already loaded in memory, so no cold start penalty
+   - Large context window - can send full transcripts without truncation
+   - No need for a separate/lighter model
 
-2. **Context Window Management:**
-   - Short meetings (<30 min): Send entire transcript as context
-   - Long meetings (>30 min): May exceed context window
-   - Options for long transcripts:
-     - Truncate to most recent N minutes
-     - Chunk and use simple retrieval (search for relevant sections)
-     - Summarize older portions, keep recent verbatim
-   - Could show warning: "Transcript too long, using last 30 minutes only"
+2. **UI Approach: Separate Window (Preferred)**
+   - Opens as a new window rather than splitting the existing view
+   - User can position chat window alongside main app
+   - Doesn't interfere with transcript viewing or live recording
+   - Simpler implementation than split-view resizing
+   - Must NOT interrupt underlying transcription/recording process
 
 3. **Prompt Structure:**
    ```
@@ -217,15 +216,12 @@ Potential solutions:
    USER: [question]
    ```
 
-4. **UI Layout (Split View):**
+4. **Separate Window Layout:**
    ```
    ┌─────────────────────────────────────────────┐
-   │  Meeting: 2026-01-19 - Awin - Pete          │
+   │  Chat: 2026-01-19 - Awin - Pete    [Refresh]│
    ├─────────────────────────────────────────────┤
    │                                             │
-   │  [Transcript pane - scrollable, ~50%]       │
-   │                                             │
-   ├─────────────────────────────────────────────┤
    │  🤖: How can I help with this meeting?      │
    │                                             │
    │  You: What were the main topics discussed?  │
@@ -234,11 +230,15 @@ Potential solutions:
    │      1. Magic Eye content auditing...       │
    │      2. ...                                 │
    │                                             │
-   │  ┌─────────────────────────────┐ [Refresh]  │
-   │  │ Ask about this meeting...   │ [Send]     │
-   │  └─────────────────────────────┘            │
+   │  ┌─────────────────────────────────────┐    │
+   │  │ Ask about this meeting...           │    │
+   │  └─────────────────────────────────────┘    │
+   │                                    [Send]   │
    └─────────────────────────────────────────────┘
    ```
+   - Separate macOS window, can be positioned alongside main app
+   - Title bar shows meeting name
+   - "Refresh" in title bar to reload transcript + clear history
 
 5. **Live Meeting Considerations:**
    - Transcript grows during the meeting
@@ -266,18 +266,13 @@ Potential solutions:
 
 **Implementation Phases:**
 
-1. **Phase 1: Basic chat** - Text input, send to Ollama with transcript, show response
+1. **Phase 1: Basic chat window** - Separate window, text input, send to Ollama with transcript, show response
 2. **Phase 2: Streaming** - Stream responses for better UX
-3. **Phase 3: Context management** - Handle long transcripts
-4. **Phase 4: Polish** - Suggested questions, save chat, auto-refresh for live
+3. **Phase 3: Polish** - Suggested questions, save chat, auto-refresh indicator for live meetings
 
 **Potential Challenges:**
-- Model hallucination (making up things not in transcript)
-- Slow response times with large context
-- Managing conversation history alongside transcript context
-- UI complexity (resizable split view)
+- Model hallucination (making up things not in transcript) - mitigate with prompt instructions to only reference transcript content
+- Ensuring chat window doesn't block or interfere with live recording
+- Window management (positioning, remembering size/position)
 
-**Alternative Simpler Version:**
-Instead of split view, could be a sheet/modal that pops up over the transcript. User can dismiss it, ask question, see answer, dismiss again. Less UI complexity but also less useful for back-and-forth conversation while referencing transcript.
-
-**Verdict:** Nice-to-have feature that would make the app significantly more useful. Start with Phase 1 (basic chat) to validate the UX before investing in streaming and context management.
+**Verdict:** Nice-to-have feature that would make the app significantly more useful. Separate window approach keeps implementation simple while providing good UX.
