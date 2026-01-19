@@ -72,3 +72,19 @@ These seem reasonable but are somewhat arbitrary. If edge cases appear (valid se
 
 ### UI toast for errors
 Engineer suggested adding a published error state for visible UI notifications (toast/banner) when things like transcript saves fail. Currently errors only go to the debug panel.
+
+### Transcription delay indicator
+Show users the latency between speaking and transcript appearing (typically several seconds due to VAD buffering + model inference). Options:
+- Display "~Xs delay" badge near transcript
+- Show a "processing..." indicator when audio is being transcribed
+- Timestamp comparison between audio capture and segment arrival
+
+This would reassure users the app isn't broken when there's a pause before text appears.
+
+### Acoustic echo (mic picking up speakers)
+When not using headphones, the mic picks up audio from speakers, causing duplicate/echo text in the mic transcript. Options:
+- **Acoustic Echo Cancellation (AEC)** - macOS Voice Processing I/O has built-in AEC, but ScreenCaptureKit bypasses it. Could explore using AVAudioEngine with voice processing for mic input instead.
+- **Post-processing deduplication** - Detect mic segments that closely match recent system segments (fuzzy text match + timing overlap) and filter them out.
+- **User guidance** - Show a tip recommending headphones when both system and mic streams are active.
+
+For now, headphones are the simple workaround.

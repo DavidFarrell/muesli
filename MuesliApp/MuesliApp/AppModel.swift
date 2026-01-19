@@ -142,6 +142,7 @@ final class AppModel: ObservableObject {
         loadInputDevices()
         loadBackendBookmark()
         validateBackendFolder()
+        migrateLegacyMeetingsIfNeeded()
         Task { await loadShareableContent() }
     }
 
@@ -611,6 +612,7 @@ final class AppModel: ObservableObject {
             try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
             resetBackendLog(in: folderURL)
             resetTranscriptEventsLog(in: folderURL)
+            try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
 
             if selectedInputDeviceID != 0 {
                 _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
@@ -759,6 +761,13 @@ final class AppModel: ObservableObject {
             let metaData = try JSONSerialization.data(withJSONObject: meta)
             writer.sendSync(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
             appendBackendLog("Sent meeting_start", toTail: true)
+            updateMeetingMetadataStreams(
+                for: session,
+                systemSampleRate: systemSampleRate,
+                systemChannels: systemChannels,
+                micSampleRate: micSampleRate,
+                micChannels: micChannels
+            )
             captureEngine.setAudioOutputEnabled(true)
 
             if captureMode == .video {
@@ -821,6 +830,7 @@ final class AppModel: ObservableObject {
         backend = nil
         if let session = currentSession {
             saveTranscriptFiles(for: session)
+            finalizeMeetingMetadata(for: session)
         }
         closeBackendLog()
         closeTranscriptEventsLog()
@@ -856,15 +866,310 @@ final class AppModel: ObservableObject {
         }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-        let metaURL = folder.appendingPathComponent("meta.json")
-        let meta: [String: Any] = [
-            "title": title,
-            "folder_name": folder.lastPathComponent,
-            "created_at": ISO8601DateFormatter().string(from: Date())
-        ]
-        let data = try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted])
-        try data.write(to: metaURL)
-
         return folder
+    }
+
+    private func meetingMetadataURL(for folderURL: URL) -> URL {
+        folderURL.appendingPathComponent("meeting.json")
+    }
+
+    private func readMeetingMetadata(from folderURL: URL) throws -> MeetingMetadata {
+        let data = try Data(contentsOf: meetingMetadataURL(for: folderURL))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(MeetingMetadata.self, from: data)
+    }
+
+    private func writeMeetingMetadata(_ metadata: MeetingMetadata, to folderURL: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(metadata)
+        try data.write(to: meetingMetadataURL(for: folderURL), options: [.atomic])
+    }
+
+    private func createInitialMeetingMetadata(for session: MeetingSession, audioFolderName: String) throws {
+        let streams: [String: MeetingStreamInfo] = [
+            "system": MeetingStreamInfo(sampleRate: nil, channels: nil),
+            "mic": MeetingStreamInfo(sampleRate: nil, channels: nil)
+        ]
+        let now = session.startedAt
+        let metadata = MeetingMetadata(
+            version: 1,
+            title: session.folderURL.lastPathComponent,
+            createdAt: now,
+            updatedAt: now,
+            durationSeconds: 0,
+            lastTimestamp: 0,
+            status: .recording,
+            sessions: [
+                MeetingSessionMetadata(
+                    sessionID: 1,
+                    startedAt: now,
+                    endedAt: nil,
+                    audioFolder: audioFolderName,
+                    streams: streams
+                )
+            ],
+            segmentCount: 0,
+            speakerNames: [:]
+        )
+        try writeMeetingMetadata(metadata, to: session.folderURL)
+    }
+
+    private func finalizeMeetingMetadata(for session: MeetingSession) {
+        let finalizedSegments = transcriptModel.segments.filter { !$0.isPartial }
+        let lastTimestamp = finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
+        let segmentCount = finalizedSegments.count
+        let durationFromStart = Date().timeIntervalSince(session.startedAt)
+        let durationSeconds = max(lastTimestamp, durationFromStart)
+
+        do {
+            var metadata = try readMeetingMetadata(from: session.folderURL)
+            metadata.updatedAt = Date()
+            metadata.durationSeconds = durationSeconds
+            metadata.lastTimestamp = lastTimestamp
+            metadata.segmentCount = segmentCount
+            metadata.status = .completed
+            if let lastIndex = metadata.sessions.indices.last {
+                var lastSession = metadata.sessions[lastIndex]
+                if lastSession.endedAt == nil {
+                    lastSession = MeetingSessionMetadata(
+                        sessionID: lastSession.sessionID,
+                        startedAt: lastSession.startedAt,
+                        endedAt: Date(),
+                        audioFolder: lastSession.audioFolder,
+                        streams: lastSession.streams
+                    )
+                    metadata.sessions[lastIndex] = lastSession
+                }
+            }
+            try writeMeetingMetadata(metadata, to: session.folderURL)
+        } catch {
+            appendBackendLog("Failed to update meeting.json: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func renameSpeaker(id: String, to name: String) {
+        transcriptModel.renameSpeaker(id: id, to: name)
+        persistSpeakerNames()
+    }
+
+    private func persistSpeakerNames() {
+        guard let session = currentSession else { return }
+        do {
+            var metadata = try readMeetingMetadata(from: session.folderURL)
+            metadata.speakerNames = transcriptModel.speakerNames
+            metadata.updatedAt = Date()
+            try writeMeetingMetadata(metadata, to: session.folderURL)
+        } catch {
+            appendBackendLog("Failed to persist speaker names: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func updateMeetingMetadataStreams(
+        for session: MeetingSession,
+        systemSampleRate: Int,
+        systemChannels: Int,
+        micSampleRate: Int,
+        micChannels: Int
+    ) {
+        do {
+            var metadata = try readMeetingMetadata(from: session.folderURL)
+            if let lastIndex = metadata.sessions.indices.last {
+                let streams: [String: MeetingStreamInfo] = [
+                    "system": MeetingStreamInfo(sampleRate: systemSampleRate, channels: systemChannels),
+                    "mic": MeetingStreamInfo(sampleRate: micSampleRate, channels: micChannels)
+                ]
+                let lastSession = metadata.sessions[lastIndex]
+                metadata.sessions[lastIndex] = MeetingSessionMetadata(
+                    sessionID: lastSession.sessionID,
+                    startedAt: lastSession.startedAt,
+                    endedAt: lastSession.endedAt,
+                    audioFolder: lastSession.audioFolder,
+                    streams: streams
+                )
+                metadata.updatedAt = Date()
+                try writeMeetingMetadata(metadata, to: session.folderURL)
+            }
+        } catch {
+            appendBackendLog("Failed to update meeting stream formats: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func migrateLegacyMeetingsIfNeeded() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Muesli", isDirectory: true)
+            .appendingPathComponent("Meetings", isDirectory: true)
+        guard let folders = try? FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for folderURL in folders {
+            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard resourceValues?.isDirectory == true else { continue }
+            let metadataURL = meetingMetadataURL(for: folderURL)
+            guard !FileManager.default.fileExists(atPath: metadataURL.path) else { continue }
+
+            if let metadata = buildLegacyMeetingMetadata(for: folderURL) {
+                do {
+                    try writeMeetingMetadata(metadata, to: folderURL)
+                } catch {
+                    appendBackendLog("Failed to migrate meeting.json for \(folderURL.lastPathComponent): \(error.localizedDescription)", toTail: true)
+                }
+            }
+        }
+    }
+
+    private func buildLegacyMeetingMetadata(for folderURL: URL) -> MeetingMetadata? {
+        let title = legacyMeetingTitle(for: folderURL)
+        let createdAt = creationDate(for: folderURL) ?? Date()
+        let updatedAt = latestModificationDate(for: folderURL) ?? createdAt
+        let audioFolderName = findAudioFolderName(in: folderURL) ?? "audio"
+
+        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
+        let eventsURL = folderURL.appendingPathComponent("transcript_events.jsonl")
+
+        var segmentCount = 0
+        var lastTimestamp = 0.0
+        var speakerNames: [String: String] = [:]
+
+        if FileManager.default.fileExists(atPath: transcriptURL.path) {
+            let stats = parseSegmentStats(from: transcriptURL, expectsTypeField: false)
+            segmentCount = stats.count
+            lastTimestamp = stats.lastTimestamp
+        } else if FileManager.default.fileExists(atPath: eventsURL.path) {
+            let stats = parseSegmentStats(from: eventsURL, expectsTypeField: true)
+            segmentCount = stats.count
+            lastTimestamp = stats.lastTimestamp
+            speakerNames = stats.speakerNames
+        }
+
+        let durationSeconds = max(lastTimestamp, updatedAt.timeIntervalSince(createdAt))
+        let streams: [String: MeetingStreamInfo] = [
+            "system": MeetingStreamInfo(sampleRate: nil, channels: nil),
+            "mic": MeetingStreamInfo(sampleRate: nil, channels: nil)
+        ]
+
+        let session = MeetingSessionMetadata(
+            sessionID: 1,
+            startedAt: createdAt,
+            endedAt: updatedAt,
+            audioFolder: audioFolderName,
+            streams: streams
+        )
+
+        return MeetingMetadata(
+            version: 1,
+            title: title,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            durationSeconds: durationSeconds,
+            lastTimestamp: lastTimestamp,
+            status: .completed,
+            sessions: [session],
+            segmentCount: segmentCount,
+            speakerNames: speakerNames
+        )
+    }
+
+    private func legacyMeetingTitle(for folderURL: URL) -> String {
+        let metaURL = folderURL.appendingPathComponent("meta.json")
+        if let data = try? Data(contentsOf: metaURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let title = obj["title"] as? String,
+           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return title
+        }
+        return folderURL.lastPathComponent
+    }
+
+    private func creationDate(for url: URL) -> Date? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attrs?[.creationDate] as? Date
+    }
+
+    private func latestModificationDate(for folderURL: URL) -> Date? {
+        let candidates = [
+            folderURL.appendingPathComponent("transcript.jsonl"),
+            folderURL.appendingPathComponent("transcript.txt"),
+            folderURL.appendingPathComponent("transcript_events.jsonl"),
+            folderURL.appendingPathComponent("backend.log"),
+            folderURL.appendingPathComponent("recording.mp4")
+        ]
+        var latest: Date?
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            if let date = attrs?[.modificationDate] as? Date {
+                if latest == nil || date > latest! {
+                    latest = date
+                }
+            }
+        }
+        return latest
+    }
+
+    private func findAudioFolderName(in folderURL: URL) -> String? {
+        let audioURL = folderURL.appendingPathComponent("audio", isDirectory: true)
+        if FileManager.default.fileExists(atPath: audioURL.path) {
+            return "audio"
+        }
+
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: folderURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for entry in entries {
+                let values = try? entry.resourceValues(forKeys: [.isDirectoryKey])
+                if values?.isDirectory == true, entry.lastPathComponent.lowercased().hasPrefix("audio") {
+                    return entry.lastPathComponent
+                }
+            }
+        }
+        return nil
+    }
+
+    private func parseSegmentStats(from url: URL, expectsTypeField: Bool) -> (count: Int, lastTimestamp: Double, speakerNames: [String: String]) {
+        guard let data = try? Data(contentsOf: url),
+              let content = String(data: data, encoding: .utf8) else {
+            return (0, 0, [:])
+        }
+
+        var count = 0
+        var lastTimestamp = 0.0
+        var speakerNames: [String: String] = [:]
+
+        for line in content.split(separator: "\n") {
+            guard let lineData = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                continue
+            }
+
+            if expectsTypeField {
+                guard let type = obj["type"] as? String else { continue }
+                if type == "speakers", let known = obj["known"] as? [[String: Any]] {
+                    for entry in known {
+                        if let speakerID = entry["speaker_id"] as? String {
+                            let name = (entry["name"] as? String) ?? speakerID
+                            speakerNames[speakerID] = name
+                        }
+                    }
+                }
+                guard type == "segment" else { continue }
+            }
+
+            guard let t0 = obj["t0"] as? Double else { continue }
+            let t1 = obj["t1"] as? Double
+            count += 1
+            let end = t1 ?? t0
+            if end > lastTimestamp {
+                lastTimestamp = end
+            }
+        }
+
+        return (count, lastTimestamp, speakerNames)
     }
 }

@@ -523,7 +523,7 @@ struct TranscriptRow: View {
                     Button("Cancel") { showRename = false }
                     Button("Save") {
                         let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
-                        model.transcriptModel.renameSpeaker(id: segment.speakerID, to: trimmed)
+                        model.renameSpeaker(id: segment.speakerID, to: trimmed)
                         showRename = false
                     }
                     .keyboardShortcut(.defaultAction)
@@ -629,7 +629,7 @@ struct SpeakersSheet: View {
 
                         TextField("Name", text: Binding(
                             get: { model.transcriptModel.displayName(for: id) },
-                            set: { model.transcriptModel.renameSpeaker(id: id, to: $0) }
+                            set: { model.renameSpeaker(id: id, to: $0) }
                         ))
                     }
                 }

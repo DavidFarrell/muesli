@@ -8,15 +8,15 @@
 - [x] Add `MuesliApp/MuesliApp/MeetingData.swift` for metadata types.
 
 ## Phase 1 - Metadata Foundation
-- [ ] Create `meeting.json` on meeting start with initial metadata (status=recording, session 1).
-- [ ] Update `meeting.json` on stop: duration, last_timestamp, segment_count, status=completed, session end.
-- [ ] Persist speaker name edits to `meeting.json` immediately.
-- [ ] Record per-stream formats in session `streams` entry (system/mic sample rate/channels).
+- [x] Create `meeting.json` on meeting start with initial metadata (status=recording, session 1).
+- [x] Update `meeting.json` on stop: duration, last_timestamp, segment_count, status=completed, session end.
+- [x] Persist speaker name edits to `meeting.json` immediately.
+- [x] Record per-stream formats in session `streams` entry (system/mic sample rate/channels).
 
 ## Phase 1b - Migration for Existing Meetings
-- [ ] Scan meetings folder and detect missing `meeting.json`.
-- [ ] Generate metadata from transcript files + filesystem timestamps.
-- [ ] Write generated `meeting.json` for each legacy meeting.
+- [x] Scan meetings folder and detect missing `meeting.json`.
+- [x] Generate metadata from transcript files + filesystem timestamps.
+- [x] Write generated `meeting.json` for each legacy meeting.
 
 ## Phase 2 - History List (Start Screen)
 - [ ] Add `MeetingHistoryItem` model and scan `~/Library/Application Support/Muesli/Meetings` at launch.
