@@ -89,6 +89,75 @@ When not using headphones, the mic picks up audio from speakers, causing duplica
 
 For now, headphones are the simple workaround.
 
+### Ollama/Speaker ID Settings Page
+The speaker identification feature has hardcoded values (model name `gemma3:27b`, base URL `localhost:11434`). Would be nice to:
+- Load Ollama configuration from a config file or UserDefaults
+- Add a Settings page in the app UI
+- List available models from Ollama (`/api/tags`) and let user select
+- Allow changing the Ollama URL (for remote instances)
+- Persist user's model preference
+
+This would also be the natural place to add other transcription settings (whisper model selection, diarization options, etc).
+
+---
+
+### Post-Recording Re-Diarization (Batch vs Incremental Quality Gap)
+
+**The Problem:** The fast-transcribe skill produces noticeably better speaker diarization than Muesli's live transcription, despite using identical settings. Investigation revealed the cause is **incremental vs batch processing**, not hyperparameters.
+
+**Current Settings (identical in both systems):**
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `diar_backend` | `senko` | Pyannote segmentation-3.0 + CAM++ embeddings via CoreML |
+| `gap_threshold` | `0.8s` | Gap before starting new speaker turn |
+| `speaker_tolerance` | `0.25s` | Tolerance for word-to-speaker assignment |
+
+**Why Batch Processing Wins:**
+
+Senko uses **speaker embedding clustering** - it extracts voice fingerprints from audio segments and groups similar ones together. The quality depends heavily on how much audio the clustering algorithm can see:
+
+| Mode | Context | Clustering Quality |
+|------|---------|-------------------|
+| **Muesli live** | 30-second sliding window (`CONTEXT_SECONDS = 30.0`) | Limited samples per speaker, cluster boundaries shift between chunks, speaker IDs can drift |
+| **fast-transcribe batch** | Complete audio file | All voice patterns visible, globally optimal cluster separation, stable assignments |
+
+This is inherent to clustering algorithms - they need enough samples to reliably distinguish speakers. With only 30 seconds of audio, Senko might only have 2-3 utterances per speaker, making reliable clustering difficult.
+
+**Potential Solutions:**
+
+1. **Post-recording re-diarization** (recommended)
+   - After recording ends, run Senko on the complete WAV file
+   - Replace all speaker IDs with the batch-quality assignments
+   - Could be automatic or user-triggered ("Improve speaker labels" button)
+   - Downside: Requires keeping the full audio file until re-diarization completes
+
+2. **Larger context window**
+   - Increase `CONTEXT_SECONDS` from 30 to 60-90 seconds
+   - Trade-off: More memory usage, higher latency for speaker labels
+   - Diminishing returns - still not as good as full-file processing
+
+3. **On-demand mid-recording re-diarization** (half-baked idea)
+   - Add a button that, when clicked, takes all audio so far and runs batch diarization
+   - Could give "preview" of better speaker labels while recording continues
+   - Complexity: Would need to reconcile live labels with batch labels, handle ongoing audio
+   - Probably not worth the complexity
+
+4. **Speaker embedding persistence**
+   - Track voice embeddings across chunks
+   - When a new chunk assigns "SPEAKER_03", check if it matches any existing speaker's embedding
+   - Merge if similarity threshold met
+   - Complex to implement correctly
+
+**Recommendation:** Option 1 (post-recording re-diarization) gives the biggest quality improvement for the least complexity. Run it automatically when recording stops, before presenting final transcript.
+
+**Files involved:**
+- `muesli_backend.py` - `CONTEXT_SECONDS = 30.0` defines the live window
+- `senko_diarisation.py` - Wrapper around Senko library
+- `diarisation.py` - Sortformer implementation (alternative backend, same issue)
+
+---
+
 ### Speaker over-segmentation (one person = multiple speaker IDs)
 Diarization often splits a single person into multiple speaker IDs (e.g., 5 "speakers" for a 2-person meeting). Causes:
 - **Voice variation** - Different pitch/energy when asking questions vs. answering, or emotional shifts

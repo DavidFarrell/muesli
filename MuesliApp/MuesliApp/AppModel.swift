@@ -54,6 +54,14 @@ enum BackendPythonError: Error {
     }
 }
 
+enum SpeakerIdStatus: Equatable {
+    case unknown
+    case ready
+    case ollamaNotRunning
+    case modelMissing(String)
+    case error(String)
+}
+
 enum AppScreen {
     case start
     case session
@@ -121,6 +129,7 @@ final class AppModel: ObservableObject {
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
     @Published var activeScreen: AppScreen = .start
+    @Published var speakerIdStatus: SpeakerIdStatus = .unknown
 
     var backendFolderPath: String {
         backendFolderURL?.path ?? "(not selected)"
@@ -139,6 +148,20 @@ final class AppModel: ObservableObject {
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
         let entitlement = SecTaskCopyValueForEntitlement(task, "com.apple.security.app-sandbox" as CFString, nil)
         return (entitlement as? Bool) == true
+    }
+    var speakerIdStatusMessage: String? {
+        switch speakerIdStatus {
+        case .unknown:
+            return nil
+        case .ready:
+            return nil
+        case .ollamaNotRunning:
+            return "Ollama is not running. Start `ollama serve`."
+        case .modelMissing(let name):
+            return "Model missing: \(name). Run `ollama pull \(name)`."
+        case .error(let message):
+            return "Speaker ID error: \(message)"
+        }
     }
 
     init() {
@@ -565,6 +588,38 @@ final class AppModel: ObservableObject {
             screenPermissionGranted = true
         } catch {
             screenPermissionGranted = false
+        }
+    }
+
+    @MainActor
+    func refreshSpeakerIdStatus(modelName: String = "gemma3:27b") async {
+        let url = URL(string: "http://localhost:11434/api/tags")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                speakerIdStatus = .error("invalid response")
+                return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                speakerIdStatus = .error("status \(http.statusCode)")
+                return
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["models"] as? [[String: Any]] else {
+                speakerIdStatus = .error("invalid payload")
+                return
+            }
+            let hasModel = models.contains { ($0["name"] as? String) == modelName }
+            speakerIdStatus = hasModel ? .ready : .modelMissing(modelName)
+        } catch {
+            if let urlError = error as? URLError, urlError.code == .cannotConnectToHost {
+                speakerIdStatus = .ollamaNotRunning
+            } else {
+                speakerIdStatus = .error(error.localizedDescription)
+            }
         }
     }
 
@@ -1287,6 +1342,7 @@ final class AppModel: ObservableObject {
     func openMeeting(_ item: MeetingHistoryItem) {
         loadTranscriptForViewer(from: item.folderURL)
         activeScreen = .viewing(item)
+        Task { await refreshSpeakerIdStatus() }
     }
 
     func resumeMeeting(_ item: MeetingHistoryItem) {
