@@ -33,6 +33,7 @@ STREAM_MIC = 1
 HDR_STRUCT = struct.Struct("<BBqI")  # type, stream, pts_us, payload_len
 BYTES_PER_SAMPLE = 2  # int16
 RUN_PIPELINE_LOCK = threading.Lock()
+CONTEXT_SECONDS = 30.0
 
 
 @dataclass
@@ -163,16 +164,25 @@ def snapshot_stream(writer: StreamWriter, sample_rate: int, channels: int) -> St
     )
 
 
-def write_wav_from_pcm(snapshot: StreamSnapshot, temp_dir: Path) -> Optional[Path]:
-    if snapshot.size_bytes <= 0:
+def write_wav_chunk(
+    snapshot: StreamSnapshot,
+    temp_dir: Path,
+    start_byte: int = 0,
+) -> Optional[Path]:
+    if snapshot.size_bytes <= start_byte:
+        return None
+
+    bytes_per_frame = BYTES_PER_SAMPLE * snapshot.channels
+    start_byte = (start_byte // bytes_per_frame) * bytes_per_frame
+
+    remaining = snapshot.size_bytes - start_byte
+    remaining -= (remaining % bytes_per_frame)
+    if remaining <= 0:
         return None
 
     temp = tempfile.NamedTemporaryFile(suffix=".wav", prefix="muesli_live_", dir=temp_dir, delete=False)
     temp_path = Path(temp.name)
     temp.close()
-
-    bytes_per_frame = BYTES_PER_SAMPLE * snapshot.channels
-    remaining = snapshot.size_bytes - (snapshot.size_bytes % bytes_per_frame)
 
     with wave.open(str(temp_path), "wb") as wav_out:
         wav_out.setnchannels(snapshot.channels)
@@ -180,6 +190,7 @@ def write_wav_from_pcm(snapshot: StreamSnapshot, temp_dir: Path) -> Optional[Pat
         wav_out.setframerate(snapshot.sample_rate)
 
         with open(snapshot.pcm_path, "rb") as pcm:
+            pcm.seek(start_byte)
             while remaining > 0:
                 chunk = pcm.read(min(1024 * 1024, remaining))
                 if not chunk:
@@ -188,6 +199,10 @@ def write_wav_from_pcm(snapshot: StreamSnapshot, temp_dir: Path) -> Optional[Pat
                 remaining -= len(chunk)
 
     return temp_path
+
+
+def write_wav_from_pcm(snapshot: StreamSnapshot, temp_dir: Path) -> Optional[Path]:
+    return write_wav_chunk(snapshot, temp_dir, start_byte=0)
 
 
 def run_pipeline(
@@ -199,6 +214,7 @@ def run_pipeline(
     gap_threshold: float,
     speaker_tolerance: float,
     verbose: bool,
+    timestamp_offset: float = 0.0,
 ) -> "MergedTranscript":
     temp_wav = None
     delete_temp = False
@@ -215,6 +231,10 @@ def run_pipeline(
         log(f"Running ASR with {asr_model}...", verbose)
         asr = ASRModel(asr_model)
         transcript = asr.transcribe(temp_wav, language=language)
+        if timestamp_offset:
+            for word in transcript.words:
+                word.start += timestamp_offset
+                word.end += timestamp_offset
 
         if diar_backend == "senko":
             log("Running diarisation with Senko...", verbose)
@@ -225,6 +245,10 @@ def run_pipeline(
             log(f"Running diarisation with Sortformer {diar_model}...", verbose)
             diarizer = SortformerDiarizer(model_name=diar_model)
             segments = diarizer.diarise(temp_wav)
+        if timestamp_offset:
+            for seg in segments:
+                seg.start += timestamp_offset
+                seg.end += timestamp_offset
 
         merged = merge_transcript_with_diarisation(
             transcript,
@@ -343,6 +367,7 @@ class LiveProcessor:
 
         self._current_duration = 0.0
         self._last_processed_duration = 0.0
+        self._last_processed_byte = 0
         self._event = threading.Event()
         self._stop_event = threading.Event()
         self._finalize_requested = False
@@ -389,14 +414,24 @@ class LiveProcessor:
         if not snapshot or snapshot.size_bytes <= 0:
             return False
 
-        bytes_per_frame = BYTES_PER_SAMPLE * snapshot.channels
-        duration = snapshot.size_bytes / float(bytes_per_frame * snapshot.sample_rate)
+        bytes_per_sec = snapshot.sample_rate * snapshot.channels * BYTES_PER_SAMPLE
+        if bytes_per_sec <= 0:
+            return False
+        duration = snapshot.size_bytes / float(bytes_per_sec)
 
         if not finalize:
             if duration < self._live_min_seconds:
                 return False
-            if duration - self._last_processed_duration < self._live_interval:
+            new_bytes = snapshot.size_bytes - self._last_processed_byte
+            new_duration = new_bytes / float(bytes_per_sec)
+            if new_duration < self._live_interval:
                 return False
+            context_bytes = int(CONTEXT_SECONDS * bytes_per_sec)
+            read_start_byte = max(0, self._last_processed_byte - context_bytes)
+            timestamp_offset = read_start_byte / float(bytes_per_sec)
+        else:
+            read_start_byte = 0
+            timestamp_offset = 0.0
 
         emit_jsonl({
             "type": "status",
@@ -406,7 +441,7 @@ class LiveProcessor:
             "finalize": finalize,
         }, self._state.stdout_lock)
 
-        temp_wav = write_wav_from_pcm(snapshot, self._output_dir)
+        temp_wav = write_wav_chunk(snapshot, self._output_dir, start_byte=read_start_byte)
         if not temp_wav:
             return False
 
@@ -420,6 +455,7 @@ class LiveProcessor:
                     language=self._language,
                     gap_threshold=self._gap_threshold,
                     speaker_tolerance=self._speaker_tolerance,
+                    timestamp_offset=timestamp_offset,
                     verbose=self._verbose,
                 )
         except Exception as exc:
@@ -439,6 +475,7 @@ class LiveProcessor:
 
         self._emitter.emit_transcript(merged, duration, finalize=finalize, stream_name=self._stream_name)
         self._last_processed_duration = max(self._last_processed_duration, duration)
+        self._last_processed_byte = max(self._last_processed_byte, snapshot.size_bytes)
         return True
 
 
@@ -720,6 +757,7 @@ def main() -> int:
                         language=args.language,
                         gap_threshold=args.gap_threshold,
                         speaker_tolerance=args.speaker_tolerance,
+                        timestamp_offset=0.0,
                         verbose=args.verbose,
                     )
             except Exception as exc:
