@@ -361,8 +361,25 @@ final class AppModel: ObservableObject {
             textLines.append(line)
         }
 
-        try? jsonlLines.joined(separator: "\n").data(using: .utf8)?.write(to: jsonlURL)
-        try? textLines.joined(separator: "\n").data(using: .utf8)?.write(to: txtURL)
+        if let jsonlData = jsonlLines.joined(separator: "\n").data(using: .utf8) {
+            do {
+                try jsonlData.write(to: jsonlURL)
+            } catch {
+                appendBackendLog("Failed to save transcript JSONL: \(error.localizedDescription)", toTail: true)
+            }
+        } else {
+            appendBackendLog("Failed to encode transcript JSONL.", toTail: true)
+        }
+
+        if let textData = textLines.joined(separator: "\n").data(using: .utf8) {
+            do {
+                try textData.write(to: txtURL)
+            } catch {
+                appendBackendLog("Failed to save transcript text: \(error.localizedDescription)", toTail: true)
+            }
+        } else {
+            appendBackendLog("Failed to encode transcript text.", toTail: true)
+        }
     }
 
     var selectedDisplay: SCDisplay? {
@@ -659,14 +676,15 @@ final class AppModel: ObservableObject {
     func stopMeeting() async {
         guard isCapturing else { return }
 
+        isFinalizing = true
+
         screenshotScheduler.stop()
         await captureEngine.stopCapture()
 
-        writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
+        writer?.sendSync(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
+        writer?.closeStdinAfterDraining()
         writer = nil
 
-        isFinalizing = true
-        backend?.requestStop()
         let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
         if exitStatus == nil {
             appendBackendLog("Backend did not exit after stop; terminating.", toTail: true)
@@ -1630,22 +1648,38 @@ final class FramedWriter {
 
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
         writeQueue.async {
-            var header = Data()
-            header.append(type.rawValue)
-            header.append(stream.rawValue)
+            self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
+        }
+    }
 
-            var pts = ptsUs.littleEndian
-            header.append(Data(bytes: &pts, count: 8))
+    func sendSync(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
+        writeQueue.sync {
+            self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
+        }
+    }
 
-            var len = UInt32(payload.count).littleEndian
-            header.append(Data(bytes: &len, count: 4))
+    func closeStdinAfterDraining() {
+        writeQueue.sync {
+            try? self.handle.close()
+        }
+    }
 
-            do {
-                try self.handle.write(contentsOf: header)
-                try self.handle.write(contentsOf: payload)
-            } catch {
-                return
-            }
+    private func writeFrame(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
+        var header = Data()
+        header.append(type.rawValue)
+        header.append(stream.rawValue)
+
+        var pts = ptsUs.littleEndian
+        header.append(Data(bytes: &pts, count: 8))
+
+        var len = UInt32(payload.count).littleEndian
+        header.append(Data(bytes: &len, count: 4))
+
+        do {
+            try handle.write(contentsOf: header)
+            try handle.write(contentsOf: payload)
+        } catch {
+            return
         }
     }
 }
