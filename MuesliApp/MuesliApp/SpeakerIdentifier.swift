@@ -231,8 +231,9 @@ actor SpeakerIdentifier {
         let height = 8
         let colorSpace = CGColorSpaceCreateDeviceGray()
         var pixels = [UInt8](repeating: 0, count: width * height)
-        let hash: UInt64? = pixels.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return nil }
+        var didDraw = false
+        pixels.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
             guard let context = CGContext(
                 data: base,
                 width: width,
@@ -241,17 +242,18 @@ actor SpeakerIdentifier {
                 bytesPerRow: width,
                 space: colorSpace,
                 bitmapInfo: CGImageAlphaInfo.none.rawValue
-            ) else { return nil }
+            ) else { return }
             context.interpolationQuality = .low
             context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            let avg = pixels.reduce(0) { $0 + Int($1) } / pixels.count
-            var hash: UInt64 = 0
-            for (index, value) in pixels.enumerated() {
-                if Int(value) >= avg {
-                    hash |= 1 << UInt64(index)
-                }
+            didDraw = true
+        }
+        guard didDraw else { return nil }
+        let avg = pixels.reduce(0) { $0 + Int($1) } / pixels.count
+        var hash: UInt64 = 0
+        for (index, value) in pixels.enumerated() {
+            if Int(value) >= avg {
+                hash |= 1 << UInt64(index)
             }
-            return hash
         }
         return hash
     }

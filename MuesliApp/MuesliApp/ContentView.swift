@@ -507,6 +507,16 @@ struct MeetingViewer: View {
                 }
             )
         }
+        .sheet(isPresented: $showRenameSheet) {
+            RenameMeetingSheet(
+                title: $renameTitle,
+                onCancel: { showRenameSheet = false },
+                onSave: {
+                    model.renameMeeting(meeting, to: renameTitle)
+                    showRenameSheet = false
+                }
+            )
+        }
         .onDisappear {
             identificationTask?.cancel()
             identificationTask = nil
@@ -836,16 +846,6 @@ struct SessionView: View {
         .padding(16)
         .sheet(isPresented: $showSpeakers) {
             SpeakersSheet()
-        }
-        .sheet(isPresented: $showRenameSheet) {
-            RenameMeetingSheet(
-                title: $renameTitle,
-                onCancel: { showRenameSheet = false },
-                onSave: {
-                    model.renameMeeting(meeting, to: renameTitle)
-                    showRenameSheet = false
-                }
-            )
         }
     }
 

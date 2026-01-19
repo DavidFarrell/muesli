@@ -555,7 +555,7 @@ final class AppModel: ObservableObject {
                 onScreenWindowsOnly: true
             )
             displays = content.displays
-            windows = content.windows
+            windows = sortWindows(content.windows)
             screenPermissionGranted = true
             await captureThumbnails()
 
@@ -568,6 +568,24 @@ final class AppModel: ObservableObject {
         } catch {
             shareableContentError = String(describing: error)
             screenPermissionGranted = false
+        }
+    }
+
+    private func sortWindows(_ items: [SCWindow]) -> [SCWindow] {
+        items.sorted { lhs, rhs in
+            let lhsApp = lhs.owningApplication?.applicationName ?? ""
+            let rhsApp = rhs.owningApplication?.applicationName ?? ""
+            let appOrder = lhsApp.localizedCaseInsensitiveCompare(rhsApp)
+            if appOrder != .orderedSame {
+                return appOrder == .orderedAscending
+            }
+            let lhsTitle = lhs.title ?? ""
+            let rhsTitle = rhs.title ?? ""
+            let titleOrder = lhsTitle.localizedCaseInsensitiveCompare(rhsTitle)
+            if titleOrder != .orderedSame {
+                return titleOrder == .orderedAscending
+            }
+            return lhs.windowID < rhs.windowID
         }
     }
 
@@ -1006,6 +1024,12 @@ final class AppModel: ObservableObject {
         if let session = currentSession {
             saveTranscriptFiles(for: session)
             finalizeMeetingMetadata(for: session)
+            if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
+               let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
+                meetingHistory[idx] = updatedItem
+            } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
+                meetingHistory.insert(updatedItem, at: 0)
+            }
         }
         closeBackendLog()
         closeTranscriptEventsLog()
@@ -1164,11 +1188,30 @@ final class AppModel: ObservableObject {
 
     func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
         var didUpdate = false
+        let segmentIds = Set(transcriptModel.segments.map { $0.speakerID })
         for mapping in mappings {
+            let rawId = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmed = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            transcriptModel.renameSpeaker(id: mapping.speakerId, to: trimmed)
-            didUpdate = true
+            guard !rawId.isEmpty, !trimmed.isEmpty else { continue }
+
+            let suffix = ":\(rawId)"
+            var targets = Set<String>()
+            for key in transcriptModel.speakerNames.keys where key.hasSuffix(suffix) || key == rawId {
+                targets.insert(key)
+            }
+            for id in segmentIds where id.hasSuffix(suffix) || id == rawId {
+                targets.insert(id)
+            }
+            if transcriptModel.speakerNames[rawId] != nil {
+                targets.insert(rawId)
+            }
+            if targets.isEmpty {
+                targets.insert(rawId)
+            }
+            for target in targets {
+                transcriptModel.renameSpeaker(id: target, to: trimmed)
+                didUpdate = true
+            }
         }
         guard didUpdate else { return }
         persistSpeakerNames(to: meeting.folderURL)
