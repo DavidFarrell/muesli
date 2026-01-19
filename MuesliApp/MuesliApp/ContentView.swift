@@ -424,6 +424,15 @@ struct MeetingViewer: View {
 
             HStack(spacing: 12) {
                 Button {
+                    model.resumeMeeting(meeting)
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isCapturing || meeting.status == .recording)
+                .help("Resume this meeting")
+
+                Button {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(model.transcriptModel.asPlainText(), forType: .string)
