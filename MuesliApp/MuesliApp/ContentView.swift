@@ -586,7 +586,7 @@ struct MeetingViewer: View {
     private func transcriptPane(autoScroll: Bool) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
+                LazyVStack(spacing: 8) {
                     ForEach(model.transcriptModel.segments.filter { !$0.isPartial }) { segment in
                         TranscriptRow(segment: segment)
                             .id(segment.id)
@@ -869,7 +869,7 @@ struct SessionView: View {
         GroupBox {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(spacing: 10) {
                         ForEach(model.transcriptModel.segments) { seg in
                             TranscriptRow(segment: seg)
                                 .id(seg.id)
@@ -950,37 +950,48 @@ struct TranscriptRow: View {
     @State private var showRename = false
     @State private var proposedName = ""
 
+    private var isMic: Bool {
+        segment.stream == "mic"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Button(model.transcriptModel.displayName(for: segment.speakerID)) {
-                    proposedName = model.transcriptModel.displayName(for: segment.speakerID)
-                    showRename = true
+        HStack {
+            if isMic { Spacer(minLength: 60) }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Button(model.transcriptModel.displayName(for: segment.speakerID)) {
+                        proposedName = model.transcriptModel.displayName(for: segment.speakerID)
+                        showRename = true
+                    }
+                    .buttonStyle(.link)
+
+                    if segment.stream != "unknown" {
+                        Text(segment.stream.capitalized)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial)
+                            .cornerRadius(6)
+                    }
+
+                    Text(String(format: "t=%.2fs", segment.t0))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
                 }
-                .buttonStyle(.link)
 
-                if segment.stream != "unknown" {
-                    Text(segment.stream.capitalized)
-                        .font(.caption2)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.thinMaterial)
-                        .cornerRadius(6)
-                }
-
-                Text(String(format: "t=%.2fs", segment.t0))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
+                Text(segment.text)
+                    .textSelection(.enabled)
             }
+            .padding(10)
+            .background(isMic ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.1))
+            .cornerRadius(10)
+            .frame(maxWidth: .infinity, alignment: isMic ? .trailing : .leading)
 
-            Text(segment.text)
-                .textSelection(.enabled)
+            if !isMic { Spacer(minLength: 60) }
         }
-        .padding(10)
-        .background(.thinMaterial)
-        .cornerRadius(10)
         .sheet(isPresented: $showRename) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Rename speaker")
