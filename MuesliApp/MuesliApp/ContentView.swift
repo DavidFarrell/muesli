@@ -100,6 +100,8 @@ final class AppModel: ObservableObject {
     private var writer: FramedWriter?
     private var backendLogHandle: FileHandle?
     private var backendLogURL: URL?
+    private var transcriptEventsHandle: FileHandle?
+    private var transcriptEventsURL: URL?
     private var backendAccessURL: URL?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let defaultBackendProjectRoot = URL(fileURLWithPath: "/Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only")
@@ -292,6 +294,20 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
     }
 
+    private func resetTranscriptEventsLog(in folderURL: URL) {
+        let logURL = folderURL.appendingPathComponent("transcript_events.jsonl")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        transcriptEventsURL = logURL
+        transcriptEventsHandle = try? FileHandle(forWritingTo: logURL)
+    }
+
+    private func closeTranscriptEventsLog() {
+        if let handle = transcriptEventsHandle {
+            try? handle.close()
+        }
+        transcriptEventsHandle = nil
+    }
+
     private func appendBackendLog(_ line: String, toTail: Bool) {
         let trimmed = line.trimmingCharacters(in: .newlines)
         if let data = (trimmed + "\n").data(using: .utf8) {
@@ -305,6 +321,9 @@ final class AppModel: ObservableObject {
     }
 
     private func handleBackendJSONLine(_ line: String) {
+        if let data = (line + "\n").data(using: .utf8) {
+            transcriptEventsHandle?.write(data)
+        }
         if let data = line.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let type = obj["type"] as? String {
@@ -514,6 +533,7 @@ final class AppModel: ObservableObject {
             let audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
             try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
             resetBackendLog(in: folderURL)
+            resetTranscriptEventsLog(in: folderURL)
 
             if selectedInputDeviceID != 0 {
                 _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
@@ -522,6 +542,7 @@ final class AppModel: ObservableObject {
             guard startBackendAccess(for: backendProjectRoot) else {
                 shareableContentError = "Backend folder access denied. Re-select the folder."
                 closeBackendLog()
+                closeTranscriptEventsLog()
                 currentSession = nil
                 return
             }
@@ -534,6 +555,7 @@ final class AppModel: ObservableObject {
                     shareableContentError = message
                     backendFolderError = message
                     closeBackendLog()
+                    closeTranscriptEventsLog()
                     stopBackendAccess()
                     currentSession = nil
                     return
@@ -607,6 +629,7 @@ final class AppModel: ObservableObject {
                 backendFolderError = error.message
                 appendBackendLog("Backend start blocked: \(error.message)", toTail: true)
                 closeBackendLog()
+                closeTranscriptEventsLog()
                 stopBackendAccess()
                 currentSession = nil
                 return
@@ -668,6 +691,7 @@ final class AppModel: ObservableObject {
             shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             closeBackendLog()
+            closeTranscriptEventsLog()
             stopBackendAccess()
             await stopMeeting()
         }
@@ -696,6 +720,7 @@ final class AppModel: ObservableObject {
             saveTranscriptFiles(for: session)
         }
         closeBackendLog()
+        closeTranscriptEventsLog()
         stopBackendAccess()
         isFinalizing = false
         isCapturing = false
