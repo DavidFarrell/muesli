@@ -175,8 +175,17 @@ struct NewMeetingView: View {
                     if model.sourceKind == .display {
                         Picker("Display", selection: $model.selectedDisplayID) {
                             ForEach(model.displays, id: \.displayID) { display in
-                                Text("Display \(display.displayID)")
-                                    .tag(Optional(display.displayID))
+                                HStack(spacing: 10) {
+                                    if let cgImage = model.displayThumbnails[display.displayID] {
+                                        Image(decorative: cgImage, scale: 1.0)
+                                            .resizable()
+                                            .aspectRatio(contentMode: .fit)
+                                            .frame(width: 80, height: 45)
+                                            .cornerRadius(4)
+                                    }
+                                    Text("Display \(display.displayID)")
+                                }
+                                .tag(Optional(display.displayID))
                             }
                         }
                     } else {
@@ -184,9 +193,18 @@ struct NewMeetingView: View {
                             ForEach(model.windows, id: \.windowID) { window in
                                 let title = window.title ?? "(untitled)"
                                 let app = window.owningApplication?.applicationName ?? "(unknown app)"
-                                Text("\(app) - \(title)")
-                                    .lineLimit(1)
-                                    .tag(Optional(window.windowID))
+                                HStack(spacing: 10) {
+                                    if let cgImage = model.windowThumbnails[window.windowID] {
+                                        Image(decorative: cgImage, scale: 1.0)
+                                            .resizable()
+                                            .aspectRatio(contentMode: .fit)
+                                            .frame(width: 80, height: 45)
+                                            .cornerRadius(4)
+                                    }
+                                    Text("\(app) - \(title)")
+                                        .lineLimit(1)
+                                }
+                                .tag(Optional(window.windowID))
                             }
                         }
                     }

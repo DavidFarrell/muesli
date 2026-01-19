@@ -82,6 +82,8 @@ final class AppModel: ObservableObject {
 
     @Published var displays: [SCDisplay] = []
     @Published var windows: [SCWindow] = []
+    @Published var displayThumbnails: [CGDirectDisplayID: CGImage] = [:]
+    @Published var windowThumbnails: [CGWindowID: CGImage] = [:]
     @Published var isLoadingShareableContent = false
     @Published var shareableContentError: String?
 
@@ -532,6 +534,7 @@ final class AppModel: ObservableObject {
             displays = content.displays
             windows = content.windows
             screenPermissionGranted = true
+            await captureThumbnails()
 
             if selectedDisplayID == nil {
                 selectedDisplayID = displays.first?.displayID
@@ -563,6 +566,84 @@ final class AppModel: ObservableObject {
         } catch {
             screenPermissionGranted = false
         }
+    }
+
+    @MainActor
+    private func captureThumbnails() async {
+        displayThumbnails.removeAll()
+        windowThumbnails.removeAll()
+
+        let thumbnailSize = CGSize(width: 160, height: 90)
+
+        for display in displays {
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            if let image = await captureThumbnail(for: filter),
+               let thumbnail = resizeImage(image, to: thumbnailSize) {
+                displayThumbnails[display.displayID] = thumbnail
+            }
+        }
+
+        for window in windows {
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            if let image = await captureThumbnail(for: filter),
+               let thumbnail = resizeImage(image, to: thumbnailSize) {
+                windowThumbnails[window.windowID] = thumbnail
+            }
+        }
+    }
+
+    @MainActor
+    private func captureThumbnail(for filter: SCContentFilter) async -> CGImage? {
+        let config = SCStreamConfiguration()
+        config.showsCursor = false
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+
+        return await withCheckedContinuation { continuation in
+            SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
+                guard error == nil,
+                      let sampleBuffer,
+                      let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let ciImage = CIImage(cvImageBuffer: imageBuffer)
+                let context = CIContext()
+                let cgImage = context.createCGImage(ciImage, from: ciImage.extent)
+                continuation.resume(returning: cgImage)
+            }
+        }
+    }
+
+    private func resizeImage(_ image: CGImage, to maxSize: CGSize) -> CGImage? {
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        if width == 0 || height == 0 {
+            return nil
+        }
+
+        let widthRatio = maxSize.width / width
+        let heightRatio = maxSize.height / height
+        let ratio = min(widthRatio, heightRatio)
+
+        let newWidth = Int(width * ratio)
+        let newHeight = Int(height * ratio)
+
+        guard let context = CGContext(
+            data: nil,
+            width: newWidth,
+            height: newHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+
+        return context.makeImage()
     }
 
     func startMeeting() async {
