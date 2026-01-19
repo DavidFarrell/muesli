@@ -8,6 +8,6 @@
 - [x] Make meeting folder naming collision-proof (auto-suffix `-01`, `-02`, …).
 - [x] Add “Copy transcript” and “Export transcript.txt/jsonl” controls in the Session UI.
 - [x] Clarify audio scope for window capture (warn in UI or separate audio filter so system audio is always captured).
-- [ ] Reduce live ffmpeg dependency: capture at 16 kHz where possible and/or skip normalization when already 16 kHz mono.
+- [x] Reduce live ffmpeg dependency: capture at 16 kHz where possible and/or skip normalization when already 16 kHz mono.
 - [ ] Harden `AudioSampleExtractor` buffer list allocation for multi-buffer formats.
 - [x] Dedupe overlapping transcript segments on ingest to avoid duplicates/out-of-order exports.

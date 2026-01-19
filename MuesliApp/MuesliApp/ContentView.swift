@@ -56,7 +56,7 @@ enum BackendPythonError: Error {
 
 @MainActor
 final class AppModel: ObservableObject {
-    private let captureSampleRate = 48000
+    private let captureSampleRate = 16000
     private let captureChannels = 1
 
     @Published var showPermissionsSheet = false
@@ -713,18 +713,6 @@ final class AppModel: ObservableObject {
                 return
             }
 
-            let meta: [String: Any] = [
-                "protocol_version": 1,
-                "sample_format": "s16le",
-                "title": title,
-                "start_wall_time": ISO8601DateFormatter().string(from: session.startedAt),
-                "sample_rate": captureSampleRate,
-                "channels": captureChannels
-            ]
-            let metaData = try JSONSerialization.data(withJSONObject: meta)
-            writer.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
-            appendBackendLog("Sent meeting_start", toTail: true)
-
             let recordURL: URL?
             if captureMode == .video {
                 recordURL = folderURL.appendingPathComponent("recording.mp4")
@@ -737,6 +725,41 @@ final class AppModel: ObservableObject {
                 writer: writer,
                 recordTo: recordURL
             )
+
+            let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
+            let systemSampleRate = formats.systemSampleRate ?? captureSampleRate
+            let systemChannels = formats.systemChannels ?? captureChannels
+            let micSampleRate = formats.micSampleRate ?? captureSampleRate
+            let micChannels = formats.micChannels ?? captureChannels
+
+            if formats.systemSampleRate == nil {
+                appendBackendLog("System audio format not detected; using requested settings.", toTail: true)
+            } else if systemSampleRate != captureSampleRate || systemChannels != captureChannels {
+                appendBackendLog("System audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(systemSampleRate)Hz/\(systemChannels)ch.", toTail: true)
+            }
+
+            if formats.micSampleRate == nil {
+                appendBackendLog("Mic audio format not detected; using requested settings.", toTail: true)
+            } else if micSampleRate != captureSampleRate || micChannels != captureChannels {
+                appendBackendLog("Mic audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(micSampleRate)Hz/\(micChannels)ch.", toTail: true)
+            }
+
+            let meta: [String: Any] = [
+                "protocol_version": 1,
+                "sample_format": "s16le",
+                "title": title,
+                "start_wall_time": ISO8601DateFormatter().string(from: session.startedAt),
+                "sample_rate": captureSampleRate,
+                "channels": captureChannels,
+                "system_sample_rate": systemSampleRate,
+                "system_channels": systemChannels,
+                "mic_sample_rate": micSampleRate,
+                "mic_channels": micChannels
+            ]
+            let metaData = try JSONSerialization.data(withJSONObject: meta)
+            writer.sendSync(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
+            appendBackendLog("Sent meeting_start", toTail: true)
+            captureEngine.setAudioOutputEnabled(true)
 
             if captureMode == .video {
                 let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
@@ -1921,6 +1944,13 @@ struct PCMChunk {
     let frameCount: Int
 }
 
+struct PendingAudio {
+    let ptsUs: Int64
+    let payload: Data
+    let sampleRate: Int
+    let channels: Int
+}
+
 final class AudioSampleExtractor {
     func extractInt16Mono(from sampleBuffer: CMSampleBuffer) throws -> PCMChunk {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
@@ -2058,7 +2088,7 @@ final class AudioSampleExtractor {
 
 @MainActor
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let sampleRate = 48000
+    private let sampleRate = 16000
     private let channelCount = 1
 
     private var stream: SCStream?
@@ -2066,9 +2096,18 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private let recordingDelegate = RecordingDelegate()
 
     private let extractor = AudioSampleExtractor()
+    private let audioStateLock = NSLock()
 
     private(set) var meetingStartPTS: CMTime?
     private var writer: FramedWriter?
+    private var audioOutputEnabled = false
+    private var pendingSystemAudio: [PendingAudio] = []
+    private var pendingMicAudio: [PendingAudio] = []
+    private let maxPendingAudio = 200
+    private var systemSampleRate: Int?
+    private var systemChannelCount: Int?
+    private var micSampleRate: Int?
+    private var micChannelCount: Int?
 
     var systemLevel: Float = 0
     var micLevel: Float = 0
@@ -2093,6 +2132,16 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         writer: FramedWriter,
         recordTo url: URL?
     ) async throws {
+        audioStateLock.lock()
+        audioOutputEnabled = false
+        pendingSystemAudio.removeAll()
+        pendingMicAudio.removeAll()
+        systemSampleRate = nil
+        systemChannelCount = nil
+        micSampleRate = nil
+        micChannelCount = nil
+        audioStateLock.unlock()
+
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.sampleRate = sampleRate
@@ -2145,6 +2194,75 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         self.recordingOutput = nil
         self.writer = nil
         self.meetingStartPTS = nil
+        audioStateLock.lock()
+        audioOutputEnabled = false
+        pendingSystemAudio.removeAll()
+        pendingMicAudio.removeAll()
+        systemSampleRate = nil
+        systemChannelCount = nil
+        micSampleRate = nil
+        micChannelCount = nil
+        audioStateLock.unlock()
+    }
+
+    struct AudioFormats {
+        var systemSampleRate: Int?
+        var systemChannels: Int?
+        var micSampleRate: Int?
+        var micChannels: Int?
+
+        var isComplete: Bool {
+            systemSampleRate != nil && micSampleRate != nil
+        }
+    }
+
+    func waitForAudioFormats(timeoutSeconds: Double) async -> AudioFormats {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            audioStateLock.lock()
+            let formats = AudioFormats(
+                systemSampleRate: systemSampleRate,
+                systemChannels: systemChannelCount,
+                micSampleRate: micSampleRate,
+                micChannels: micChannelCount
+            )
+            audioStateLock.unlock()
+            if formats.isComplete {
+                return formats
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        audioStateLock.lock()
+        let formats = AudioFormats(
+            systemSampleRate: systemSampleRate,
+            systemChannels: systemChannelCount,
+            micSampleRate: micSampleRate,
+            micChannels: micChannelCount
+        )
+        audioStateLock.unlock()
+        return formats
+    }
+
+    func setAudioOutputEnabled(_ enabled: Bool) {
+        var systemPending: [PendingAudio] = []
+        var micPending: [PendingAudio] = []
+        audioStateLock.lock()
+        audioOutputEnabled = enabled
+        if enabled {
+            systemPending = pendingSystemAudio
+            micPending = pendingMicAudio
+            pendingSystemAudio.removeAll()
+            pendingMicAudio.removeAll()
+        }
+        audioStateLock.unlock()
+
+        guard enabled else { return }
+        for item in systemPending {
+            writer?.send(type: .audio, stream: .system, ptsUs: item.ptsUs, payload: item.payload)
+        }
+        for item in micPending {
+            writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -2188,7 +2306,58 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
             if type == .screen {
                 return
-            } else if type == .audio {
+            }
+
+            var detectedSampleRate: Int?
+            var detectedChannels: Int?
+            if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
+                let asbd = asbdPtr.pointee
+                detectedSampleRate = Int(asbd.mSampleRate)
+                detectedChannels = Int(asbd.mChannelsPerFrame)
+            }
+
+            audioStateLock.lock()
+            if type == .audio {
+                if systemSampleRate == nil, let detectedSampleRate {
+                    systemSampleRate = detectedSampleRate
+                    systemChannelCount = detectedChannels
+                }
+            } else if #available(macOS 15.0, *), type == .microphone {
+                if micSampleRate == nil, let detectedSampleRate {
+                    micSampleRate = detectedSampleRate
+                    micChannelCount = detectedChannels
+                }
+            }
+
+            let canWrite = audioOutputEnabled
+            if !canWrite {
+                if type == .audio {
+                    pendingSystemAudio.append(PendingAudio(
+                        ptsUs: ptsUs,
+                        payload: pcm.data,
+                        sampleRate: detectedSampleRate ?? sampleRate,
+                        channels: detectedChannels ?? channelCount
+                    ))
+                    if pendingSystemAudio.count > maxPendingAudio {
+                        pendingSystemAudio.removeFirst(pendingSystemAudio.count - maxPendingAudio)
+                    }
+                } else if #available(macOS 15.0, *), type == .microphone {
+                    pendingMicAudio.append(PendingAudio(
+                        ptsUs: ptsUs,
+                        payload: pcm.data,
+                        sampleRate: detectedSampleRate ?? sampleRate,
+                        channels: detectedChannels ?? channelCount
+                    ))
+                    if pendingMicAudio.count > maxPendingAudio {
+                        pendingMicAudio.removeFirst(pendingMicAudio.count - maxPendingAudio)
+                    }
+                }
+            }
+            audioStateLock.unlock()
+
+            guard canWrite else { return }
+            if type == .audio {
                 writer?.send(type: .audio, stream: .system, ptsUs: ptsUs, payload: pcm.data)
             } else if #available(macOS 15.0, *), type == .microphone {
                 writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: pcm.data)

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from .audio import check_ffmpeg, normalise_audio
+from .audio import check_ffmpeg, normalise_audio, is_wav_16k_mono
 from .asr import ASRModel, DEFAULT_MODEL
 from .diarisation import SortformerDiarizer, MODEL_CONFIGS
 from .merge import merge_transcript_with_diarisation
@@ -200,11 +200,16 @@ def run_pipeline(
     speaker_tolerance: float,
     verbose: bool,
 ) -> "MergedTranscript":
-    if not check_ffmpeg():
-        raise RuntimeError("ffmpeg is not installed or not in PATH")
-
-    log("Normalising audio to 16kHz mono WAV...", verbose)
-    temp_wav = normalise_audio(str(input_path))
+    temp_wav = None
+    delete_temp = False
+    if is_wav_16k_mono(str(input_path)):
+        temp_wav = str(input_path)
+    else:
+        if not check_ffmpeg():
+            raise RuntimeError("ffmpeg is not installed or not in PATH")
+        log("Normalising audio to 16kHz mono WAV...", verbose)
+        temp_wav = normalise_audio(str(input_path))
+        delete_temp = True
 
     try:
         log(f"Running ASR with {asr_model}...", verbose)
@@ -229,10 +234,11 @@ def run_pipeline(
         )
         return merged
     finally:
-        try:
-            Path(temp_wav).unlink(missing_ok=True)
-        except Exception:
-            pass
+        if delete_temp and temp_wav:
+            try:
+                Path(temp_wav).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 class TranscriptEmitter:
@@ -359,8 +365,12 @@ class LiveProcessor:
     def _snapshot(self) -> Optional[StreamSnapshot]:
         with self._state.lock:
             writer = self._state.get_stream(self._stream_name)
-            sample_rate = self._state.sample_rate
-            channels = self._state.channels
+            if self._stream_name == "system":
+                sample_rate = self._state.system_sample_rate
+                channels = self._state.system_channels
+            else:
+                sample_rate = self._state.mic_sample_rate
+                channels = self._state.mic_channels
         if not writer:
             return None
         return snapshot_stream(writer, sample_rate, channels)
@@ -440,6 +450,10 @@ class BackendState:
         self.mic_writer: Optional[StreamWriter] = None
         self.sample_rate: int = 48000
         self.channels: int = 1
+        self.system_sample_rate: int = 48000
+        self.system_channels: int = 1
+        self.mic_sample_rate: int = 48000
+        self.mic_channels: int = 1
 
     def get_stream(self, name: str) -> Optional[StreamWriter]:
         if name == "system":
@@ -594,8 +608,21 @@ def main() -> int:
                 state.sample_rate = int(meeting_meta.get("sample_rate", 48000))
                 state.channels = int(meeting_meta.get("channels", 1))
 
-                state.system_writer = open_stream_writer(output_dir / "system.wav", state.sample_rate, state.channels)
-                state.mic_writer = open_stream_writer(output_dir / "mic.wav", state.sample_rate, state.channels)
+                state.system_sample_rate = int(meeting_meta.get("system_sample_rate", state.sample_rate))
+                state.system_channels = int(meeting_meta.get("system_channels", state.channels))
+                state.mic_sample_rate = int(meeting_meta.get("mic_sample_rate", state.sample_rate))
+                state.mic_channels = int(meeting_meta.get("mic_channels", state.channels))
+
+                state.system_writer = open_stream_writer(
+                    output_dir / "system.wav",
+                    state.system_sample_rate,
+                    state.system_channels
+                )
+                state.mic_writer = open_stream_writer(
+                    output_dir / "mic.wav",
+                    state.mic_sample_rate,
+                    state.mic_channels
+                )
 
             emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_lock)
 
@@ -603,18 +630,30 @@ def main() -> int:
             t = pts_us / 1_000_000.0
             with state.lock:
                 if stream_id == STREAM_SYSTEM and state.system_writer:
-                    write_aligned_audio(state.system_writer, payload, pts_us, state.sample_rate, state.channels)
+                    write_aligned_audio(
+                        state.system_writer,
+                        payload,
+                        pts_us,
+                        state.system_sample_rate,
+                        state.system_channels
+                    )
                     if args.emit_meters:
                         emit_jsonl({"type": "meter", "stream": "system", "t": t, "rms": rms_int16(payload)}, stdout_lock)
                     if not args.no_live and "system" in live_processors:
-                        duration = state.system_writer.last_sample_index / float(state.sample_rate)
+                        duration = state.system_writer.last_sample_index / float(state.system_sample_rate)
                         live_processors["system"].notify_duration(duration)
                 elif stream_id == STREAM_MIC and state.mic_writer:
-                    write_aligned_audio(state.mic_writer, payload, pts_us, state.sample_rate, state.channels)
+                    write_aligned_audio(
+                        state.mic_writer,
+                        payload,
+                        pts_us,
+                        state.mic_sample_rate,
+                        state.mic_channels
+                    )
                     if args.emit_meters:
                         emit_jsonl({"type": "meter", "stream": "mic", "t": t, "rms": rms_int16(payload)}, stdout_lock)
                     if not args.no_live and "mic" in live_processors:
-                        duration = state.mic_writer.last_sample_index / float(state.sample_rate)
+                        duration = state.mic_writer.last_sample_index / float(state.mic_sample_rate)
                         live_processors["mic"].notify_duration(duration)
 
         elif msg_type == MSG_SCREENSHOT_EVENT:
@@ -659,7 +698,13 @@ def main() -> int:
             writer = writers.get(stream_name)
             if not writer or writer.bytes_written == 0:
                 continue
-            snapshot = snapshot_stream(writer, state.sample_rate, state.channels)
+            if stream_name == "system":
+                sample_rate = state.system_sample_rate
+                channels = state.system_channels
+            else:
+                sample_rate = state.mic_sample_rate
+                channels = state.mic_channels
+            snapshot = snapshot_stream(writer, sample_rate, channels)
             temp_wav = write_wav_from_pcm(snapshot, output_dir)
             if not temp_wav:
                 emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_lock)
@@ -683,7 +728,14 @@ def main() -> int:
             finally:
                 temp_wav.unlink(missing_ok=True)
 
-            duration = writer.last_sample_index / float(state.sample_rate)
+            if stream_name == "system":
+                sample_rate = state.system_sample_rate
+                channels = state.system_channels
+            else:
+                sample_rate = state.mic_sample_rate
+                channels = state.mic_channels
+
+            duration = writer.last_sample_index / float(sample_rate)
             emitter.emit_transcript(merged, duration, finalize=True, stream_name=stream_name)
 
     if not args.keep_wav:

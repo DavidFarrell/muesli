@@ -28,6 +28,19 @@ def check_ffmpeg() -> bool:
         return False
 
 
+def is_wav_16k_mono(path: str) -> bool:
+    """Return True if the WAV is already 16kHz mono PCM."""
+    try:
+        info = sf.info(path)
+    except Exception:
+        return False
+    if info.samplerate != 16000:
+        return False
+    if info.channels != 1:
+        return False
+    return True
+
+
 def normalise_audio(
     input_path: str,
     output_path: Optional[str] = None,
