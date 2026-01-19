@@ -1103,6 +1103,36 @@ final class AppModel: ObservableObject {
         persistSpeakerNames()
     }
 
+    func renameMeeting(_ item: MeetingHistoryItem, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        do {
+            var metadata = try readMeetingMetadata(from: item.folderURL)
+            metadata.title = trimmed
+            metadata.updatedAt = Date()
+            try writeMeetingMetadata(metadata, to: item.folderURL)
+
+            let updatedItem = MeetingHistoryItem(
+                id: item.id,
+                folderURL: item.folderURL,
+                title: trimmed,
+                createdAt: item.createdAt,
+                durationSeconds: item.durationSeconds,
+                segmentCount: item.segmentCount,
+                status: item.status
+            )
+            if let idx = meetingHistory.firstIndex(where: { $0.id == item.id }) {
+                meetingHistory[idx] = updatedItem
+            }
+            if case .viewing(let current) = activeScreen, current.id == item.id {
+                activeScreen = .viewing(updatedItem)
+            }
+        } catch {
+            appendBackendLog("Failed to rename meeting \(item.id): \(error.localizedDescription)", toTail: true)
+        }
+    }
+
     private func persistSpeakerNames() {
         guard let session = currentSession else { return }
         do {

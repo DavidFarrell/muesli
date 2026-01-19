@@ -118,6 +118,9 @@ struct NewMeetingView: View {
     @State private var showAllMeetings = false
     @State private var pendingDelete: MeetingHistoryItem?
     @State private var showDeleteConfirm = false
+    @State private var pendingRename: MeetingHistoryItem?
+    @State private var renameTitle = ""
+    @State private var showRenameSheet = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -329,6 +332,13 @@ struct NewMeetingView: View {
                                 .buttonStyle(.borderless)
                             }
                             .padding(.vertical, 2)
+                            .contextMenu {
+                                Button("Rename") {
+                                    pendingRename = item
+                                    renameTitle = item.title
+                                    showRenameSheet = true
+                                }
+                            }
                         }
 
                         if model.meetingHistory.count > maxVisibleMeetings {
@@ -360,6 +370,22 @@ struct NewMeetingView: View {
             }
         } message: {
             Text("This will move the meeting folder to the Trash.")
+        }
+        .sheet(isPresented: $showRenameSheet) {
+            RenameMeetingSheet(
+                title: $renameTitle,
+                onCancel: {
+                    pendingRename = nil
+                    showRenameSheet = false
+                },
+                onSave: {
+                    if let item = pendingRename {
+                        model.renameMeeting(item, to: renameTitle)
+                    }
+                    pendingRename = nil
+                    showRenameSheet = false
+                }
+            )
         }
     }
 
@@ -395,6 +421,8 @@ struct MeetingViewer: View {
     @State private var showSpeakers = false
     @State private var autoScroll = true
     @State private var copyIconName = "doc.on.clipboard"
+    @State private var showRenameSheet = false
+    @State private var renameTitle = ""
 
     var body: some View {
         VStack(spacing: 12) {
@@ -441,6 +469,14 @@ struct MeetingViewer: View {
             Spacer()
 
             HStack(spacing: 12) {
+                Button {
+                    renameTitle = meeting.title
+                    showRenameSheet = true
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                }
+                .buttonStyle(.bordered)
+
                 Button {
                     model.resumeMeeting(meeting)
                 } label: {
@@ -630,6 +666,16 @@ struct SessionView: View {
         .sheet(isPresented: $showSpeakers) {
             SpeakersSheet()
         }
+        .sheet(isPresented: $showRenameSheet) {
+            RenameMeetingSheet(
+                title: $renameTitle,
+                onCancel: { showRenameSheet = false },
+                onSave: {
+                    model.renameMeeting(meeting, to: renameTitle)
+                    showRenameSheet = false
+                }
+            )
+        }
     }
 
     private var header: some View {
@@ -697,6 +743,33 @@ struct SessionView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Rename Meeting Sheet
+
+struct RenameMeetingSheet: View {
+    @Binding var title: String
+    let onCancel: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Rename meeting")
+                .font(.headline)
+
+            TextField("Title", text: $title)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel() }
+                Button("Save") { onSave() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
     }
 }
 
