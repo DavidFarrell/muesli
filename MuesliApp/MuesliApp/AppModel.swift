@@ -1217,6 +1217,87 @@ final class AppModel: ObservableObject {
         persistSpeakerNames(to: meeting.folderURL)
     }
 
+    func runBatchRediarization(
+        for meeting: MeetingHistoryItem,
+        stream: BatchRediarizer.Stream,
+        progressHandler: @escaping (BatchRediarizer.Progress) -> Void
+    ) async throws -> BatchRediarizer.Result {
+        guard let backendProjectRoot = backendFolderURL else {
+            throw NSError(
+                domain: "Muesli",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Select the backend folder before reprocessing."]
+            )
+        }
+        guard startBackendAccess(for: backendProjectRoot) else {
+            throw NSError(
+                domain: "Muesli",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied. Re-select the folder."]
+            )
+        }
+        defer { stopBackendAccess() }
+
+        switch resolveBackendPython(for: backendProjectRoot) {
+        case .failure(let error):
+            throw NSError(
+                domain: "Muesli",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: error.message]
+            )
+        case .success(let backendPython):
+            let rediarizer = BatchRediarizer()
+            return try await rediarizer.run(
+                meetingDirectory: meeting.folderURL,
+                backendPython: backendPython,
+                backendRoot: backendProjectRoot,
+                stream: stream,
+                progressHandler: progressHandler
+            )
+        }
+    }
+
+    func applyBatchRediarization(_ result: BatchRediarizer.Result, for meeting: MeetingHistoryItem) {
+        let segments = result.turns.map { turn in
+            TranscriptSegment(
+                speakerID: turn.speakerId,
+                stream: turn.stream,
+                t0: turn.t0,
+                t1: turn.t1,
+                text: turn.text,
+                isPartial: false
+            )
+        }
+        let sorted = segments.sorted { $0.t0 < $1.t0 }
+
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        transcriptModel.segments = sorted
+        transcriptModel.speakerNames = [:]
+        if let last = sorted.last, !last.text.isEmpty {
+            transcriptModel.lastTranscriptText = last.text
+            transcriptModel.lastTranscriptAt = Date()
+        }
+
+        writeTranscriptFiles(for: meeting.folderURL, segments: sorted)
+        updateMeetingMetadataAfterRediarization(
+            folderURL: meeting.folderURL,
+            segmentCount: sorted.count,
+            lastTimestamp: sorted.map { $0.t1 ?? $0.t0 }.max() ?? 0,
+            durationSeconds: result.duration
+        )
+
+        if let updatedItem = buildMeetingHistoryItem(for: meeting.folderURL) {
+            if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
+                meetingHistory[idx] = updatedItem
+            } else {
+                meetingHistory.insert(updatedItem, at: 0)
+            }
+            if case .viewing(let current) = activeScreen, current.id == meeting.id {
+                activeScreen = .viewing(updatedItem)
+            }
+        }
+    }
+
     func renameMeeting(_ item: MeetingHistoryItem, to newTitle: String) {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -1255,6 +1336,56 @@ final class AppModel: ObservableObject {
             try writeMeetingMetadata(metadata, to: folderURL)
         } catch {
             appendBackendLog("Failed to persist speaker names: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func writeTranscriptFiles(for folderURL: URL, segments: [TranscriptSegment]) {
+        let jsonlURL = folderURL.appendingPathComponent("transcript.jsonl")
+        let txtURL = folderURL.appendingPathComponent("transcript.txt")
+
+        let jsonlLines = segments.map { seg -> String in
+            let payload: [String: Any] = [
+                "speaker_id": seg.speakerID,
+                "stream": seg.stream,
+                "t0": seg.t0,
+                "t1": seg.t1 ?? seg.t0,
+                "text": seg.text
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload),
+               let line = String(data: data, encoding: .utf8) {
+                return line
+            }
+            return ""
+        }.filter { !$0.isEmpty }
+
+        let jsonlString = jsonlLines.joined(separator: "\n")
+        let textString = transcriptModel.asPlainText()
+
+        if let jsonlData = jsonlString.data(using: .utf8) {
+            try? jsonlData.write(to: jsonlURL)
+        }
+        if let textData = textString.data(using: .utf8) {
+            try? textData.write(to: txtURL)
+        }
+    }
+
+    private func updateMeetingMetadataAfterRediarization(
+        folderURL: URL,
+        segmentCount: Int,
+        lastTimestamp: Double,
+        durationSeconds: Double
+    ) {
+        do {
+            var metadata = try readMeetingMetadata(from: folderURL)
+            metadata.updatedAt = Date()
+            metadata.segmentCount = segmentCount
+            metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
+            metadata.durationSeconds = max(metadata.durationSeconds, durationSeconds, lastTimestamp)
+            metadata.speakerNames = [:]
+            metadata.status = .completed
+            try writeMeetingMetadata(metadata, to: folderURL)
+        } catch {
+            appendBackendLog("Failed to update meeting.json after reprocess: \(error.localizedDescription)", toTail: true)
         }
     }
 

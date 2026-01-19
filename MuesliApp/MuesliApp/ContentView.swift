@@ -429,6 +429,13 @@ struct MeetingViewer: View {
     @State private var proposedMappings: [SpeakerIdentifier.SpeakerMapping] = []
     @State private var showMappingSheet = false
     @State private var identificationTask: Task<Void, Never>?
+    @State private var isRediarizing = false
+    @State private var rediarizeProgress: BatchRediarizer.Progress?
+    @State private var rediarizeError: String?
+    @State private var pendingRediarizeResult: BatchRediarizer.Result?
+    @State private var showRediarizeConfirm = false
+    @State private var rediarizeTask: Task<Void, Never>?
+    @State private var rediarizeStream: BatchRediarizer.Stream = .system
 
     var body: some View {
         VStack(spacing: 12) {
@@ -446,6 +453,53 @@ struct MeetingViewer: View {
 
                     GroupBox("Speaker ID") {
                         VStack(alignment: .leading, spacing: 10) {
+                            Text("Batch re-diarization")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            Button {
+                                rerunSpeakerSegmentation()
+                            } label: {
+                                Label("Rerun speaker segmentation", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!canRediarize)
+
+                            Picker("Stream", selection: $rediarizeStream) {
+                                Text("System").tag(BatchRediarizer.Stream.system)
+                                Text("Mic").tag(BatchRediarizer.Stream.mic)
+                                Text("System + Mic").tag(BatchRediarizer.Stream.both)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+
+                            if isRediarizing {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text(rediarizeProgressText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Button("Cancel") {
+                                    cancelRediarization()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            if let rediarizeError {
+                                Text(rediarizeError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+
+                            Divider()
+
+                            Text("Speaker naming")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
                             Button {
                                 identifySpeakers()
                             } label: {
@@ -507,6 +561,21 @@ struct MeetingViewer: View {
                 }
             )
         }
+        .alert("Replace transcript?", isPresented: $showRediarizeConfirm) {
+            Button("Replace", role: .destructive) {
+                if let result = pendingRediarizeResult {
+                    model.applyBatchRediarization(result, for: meeting)
+                }
+                pendingRediarizeResult = nil
+                showRediarizeConfirm = false
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRediarizeResult = nil
+                showRediarizeConfirm = false
+            }
+        } message: {
+            Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace transcript?")
+        }
         .sheet(isPresented: $showRenameSheet) {
             RenameMeetingSheet(
                 title: $renameTitle,
@@ -520,6 +589,8 @@ struct MeetingViewer: View {
         .onDisappear {
             identificationTask?.cancel()
             identificationTask = nil
+            rediarizeTask?.cancel()
+            rediarizeTask = nil
         }
     }
 
@@ -621,7 +692,7 @@ struct MeetingViewer: View {
     }
 
     private var canIdentifySpeakers: Bool {
-        if isIdentifyingSpeakers {
+        if isIdentifyingSpeakers || isRediarizing {
             return false
         }
         switch model.speakerIdStatus {
@@ -630,6 +701,19 @@ struct MeetingViewer: View {
         case .ollamaNotRunning, .modelMissing, .error:
             return false
         }
+    }
+
+    private var canRediarize: Bool {
+        if isRediarizing || isIdentifyingSpeakers {
+            return false
+        }
+        if meeting.status == .recording || model.isCapturing {
+            return false
+        }
+        guard model.backendFolderURL != nil, model.backendPythonExists else {
+            return false
+        }
+        return true
     }
 
     private var progressText: String {
@@ -643,6 +727,69 @@ struct MeetingViewer: View {
         case nil:
             return "Identifying..."
         }
+    }
+
+    private var rediarizeProgressText: String {
+        switch rediarizeProgress {
+        case .preparing:
+            return "Preparing audio..."
+        case .transcribing:
+            return "Transcribing audio..."
+        case .diarizing:
+            return "Identifying speakers..."
+        case .merging:
+            return "Finalizing..."
+        case .complete:
+            return "Complete"
+        case nil:
+            return "Re-processing..."
+        }
+    }
+
+    private func rerunSpeakerSegmentation() {
+        guard !isRediarizing else { return }
+
+        rediarizeError = nil
+        isRediarizing = true
+        rediarizeProgress = .preparing
+
+        rediarizeTask = Task {
+            do {
+                try Task.checkCancellation()
+                let result = try await model.runBatchRediarization(
+                    for: meeting,
+                    stream: rediarizeStream,
+                    progressHandler: { progress in
+                        Task { @MainActor in
+                            rediarizeProgress = progress
+                        }
+                    }
+                )
+                try Task.checkCancellation()
+                await MainActor.run {
+                    pendingRediarizeResult = result
+                    isRediarizing = false
+                    rediarizeProgress = nil
+                    showRediarizeConfirm = true
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    isRediarizing = false
+                    rediarizeProgress = nil
+                }
+            } catch {
+                await MainActor.run {
+                    isRediarizing = false
+                    rediarizeProgress = nil
+                    rediarizeError = "Reprocess failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func cancelRediarization() {
+        rediarizeTask?.cancel()
+        rediarizeTask = nil
     }
 
     private func identifySpeakers() {
