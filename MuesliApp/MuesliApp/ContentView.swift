@@ -1962,16 +1962,38 @@ final class AudioSampleExtractor {
         let asbd = asbdPtr.pointee
 
         var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList(
-            mNumberBuffers: 0,
-            mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
+        var bufferListSizeNeeded = 0
+        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &bufferListSizeNeeded,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil
         )
 
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        if status != noErr {
+            throw AudioExtractError.failedToGetBufferList(status)
+        }
+
+        if bufferListSizeNeeded <= 0 {
+            bufferListSizeNeeded = MemoryLayout<AudioBufferList>.size
+        }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: bufferListSizeNeeded,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBufferList.deallocate() }
+        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+        status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer,
             bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            bufferListOut: audioBufferList,
+            bufferListSize: bufferListSizeNeeded,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
             flags: 0,
@@ -1982,7 +2004,7 @@ final class AudioSampleExtractor {
             throw AudioExtractError.failedToGetBufferList(status)
         }
 
-        let dataPointer = UnsafeMutableAudioBufferListPointer(&audioBufferList)
+        let dataPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
         let pts = sampleBuffer.presentationTimeStamp
         let frames = CMSampleBufferGetNumSamples(sampleBuffer)
 

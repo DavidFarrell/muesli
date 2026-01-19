@@ -1,13 +1,26 @@
-# TODO (Next Steps)
+# TODO
 
-- [x] PRD-grade graceful stop: add `sendSync` for `meetingStop`, drain writer queue, then close stdin and wait for backend exit (timeout + terminate fallback).
-- [x] PRD-grade transcript persistence: append backend JSONL events to disk as they arrive (crash-safe), not only on stop.
-- [x] Write final transcript artifacts to a temp folder on stop (and surface the path in UI/logs), while keeping the meeting folder copy.
-- [x] Fix backend dual-stream emission by tracking `last_emitted_t1` and partials per stream in `TranscriptEmitter`.
-- [x] Reset transcript state on meeting start (clear segments and decide whether speaker names carry over).
-- [x] Make meeting folder naming collision-proof (auto-suffix `-01`, `-02`, …).
-- [x] Add “Copy transcript” and “Export transcript.txt/jsonl” controls in the Session UI.
-- [x] Clarify audio scope for window capture (warn in UI or separate audio filter so system audio is always captured).
-- [x] Reduce live ffmpeg dependency: capture at 16 kHz where possible and/or skip normalization when already 16 kHz mono.
-- [ ] Harden `AudioSampleExtractor` buffer list allocation for multi-buffer formats.
-- [x] Dedupe overlapping transcript segments on ingest to avoid duplicates/out-of-order exports.
+All items from the initial development sprint completed on 2026-01-19.
+
+See `engineer-notes/completed-2026-01-19/` for implementation notes.
+
+## Completed (2026-01-19)
+
+1. PRD-grade graceful stop with sync drain and timeout
+2. Crash-safe transcript persistence (streaming JSONL)
+3. Temp folder transcript artifacts
+4. Dual-stream emission fix (per-stream state)
+5. Reset transcript state on meeting start
+6. Collision-proof meeting folder naming
+7. Copy/Export transcript UI controls
+8. Window capture audio scope warning
+9. Per-stream sample rates + reduced ffmpeg dependency
+10. AudioSampleExtractor buffer list hardening
+11. Segment deduplication on ingest
+12. AsyncStream race condition fix + stable segment IDs
+
+---
+
+## Future Ideas
+
+See `someday-maybe.md` for low-priority polish items.
