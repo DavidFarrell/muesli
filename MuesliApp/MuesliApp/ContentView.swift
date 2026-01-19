@@ -61,6 +61,7 @@ final class AppModel: ObservableObject {
 
     @Published var showPermissionsSheet = false
     @Published var isCapturing = false
+    @Published var isFinalizing = false
     @Published var captureMode: CaptureMode = .video
     @Published var sourceKind: SourceKind = .display
     @Published var transcribeSystem = true
@@ -331,6 +332,39 @@ final class AppModel: ObservableObject {
         transcriptModel.ingest(jsonLine: line)
     }
 
+    private func saveTranscriptFiles(for session: MeetingSession) {
+        let finalized = transcriptModel.segments.filter { !$0.isPartial }
+        let jsonlURL = session.folderURL.appendingPathComponent("transcript.jsonl")
+        let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
+
+        var jsonlLines: [String] = []
+        var textLines: [String] = []
+        for seg in finalized {
+            let payload: [String: Any] = [
+                "speaker_id": seg.speakerID,
+                "stream": seg.stream,
+                "t0": seg.t0,
+                "t1": seg.t1 ?? seg.t0,
+                "text": seg.text
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload),
+               let line = String(data: data, encoding: .utf8) {
+                jsonlLines.append(line)
+            }
+            let t1 = seg.t1 ?? seg.t0
+            let line = String(format: "%@ [%@] %.2f-%.2f %@",
+                              seg.speakerID,
+                              seg.stream,
+                              seg.t0,
+                              t1,
+                              seg.text)
+            textLines.append(line)
+        }
+
+        try? jsonlLines.joined(separator: "\n").data(using: .utf8)?.write(to: jsonlURL)
+        try? textLines.joined(separator: "\n").data(using: .utf8)?.write(to: txtURL)
+    }
+
     var selectedDisplay: SCDisplay? {
         guard let id = selectedDisplayID else { return nil }
         return displays.first { $0.displayID == id }
@@ -506,6 +540,7 @@ final class AppModel: ObservableObject {
                     "--output-dir",
                     audioDir.path
                 ]
+                command.append("--keep-wav")
                 #if DEBUG
                 command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
                 #endif
@@ -630,11 +665,21 @@ final class AppModel: ObservableObject {
         writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer = nil
 
-        backend?.stop()
+        isFinalizing = true
+        backend?.requestStop()
+        let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
+        if exitStatus == nil {
+            appendBackendLog("Backend did not exit after stop; terminating.", toTail: true)
+            backend?.terminate()
+        }
+        backend?.cleanup()
         backend = nil
+        if let session = currentSession {
+            saveTranscriptFiles(for: session)
+        }
         closeBackendLog()
         stopBackendAccess()
-
+        isFinalizing = false
         isCapturing = false
         currentSession = nil
     }
@@ -974,10 +1019,16 @@ struct SessionView: View {
                                 Button("Speakers") { showSpeakers = true }
                                 Button("Permissions") { model.showPermissionsSheet = true }
                                 Spacer()
-                                Button("Stop") {
+                                Button(model.isFinalizing ? "Finalizing..." : "Stop") {
                                     Task { await model.stopMeeting() }
                                 }
                                 .buttonStyle(.borderedProminent)
+                                .disabled(model.isFinalizing)
+                            }
+                            if model.isFinalizing {
+                                Text("Finalizing transcript...")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                         .padding(8)
@@ -1526,13 +1577,32 @@ final class BackendProcess {
     }
 
     func stop() {
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        stdinPipe.fileHandleForWriting.closeFile()
+        cleanup()
+        terminate()
+    }
 
+    func requestStop() {
+        stdinPipe.fileHandleForWriting.closeFile()
+    }
+
+    func waitForExit(timeoutSeconds: Double) async -> Int32? {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return process.isRunning ? nil : process.terminationStatus
+    }
+
+    func terminate() {
         if process.isRunning {
             process.terminate()
         }
+    }
+
+    func cleanup() {
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        stdinPipe.fileHandleForWriting.closeFile()
     }
 }
 
