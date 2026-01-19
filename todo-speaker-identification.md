@@ -17,15 +17,15 @@
 - [x] Add fallback for empty screenshots.
 
 ## Phase 3 - UI/Workflow
-- [ ] Add “Identify speakers” button in Meeting Viewer.
-- [ ] Show progress state (extracting, analyzing, complete).
-- [ ] Present proposed mappings for review (accept/edit).
-- [ ] Persist accepted mappings to `meeting.json` (speakerNames).
+- [x] Add “Identify speakers” button in Meeting Viewer.
+- [x] Show progress state (extracting, analyzing, complete).
+- [x] Present proposed mappings for review (accept/edit).
+- [x] Persist accepted mappings to `meeting.json` (speakerNames).
 
 ## Phase 4 - Safety & Performance
-- [ ] Ensure no screenshots or prompts are logged to disk.
-- [ ] Add cancellation support (Task cancellation).
-- [ ] Add timeout/retry strategy for Ollama requests.
+- [x] Ensure no screenshots or prompts are logged to disk.
+- [x] Add cancellation support (Task cancellation).
+- [x] Add timeout/retry strategy for Ollama requests.
 
 ## Phase 5 - QA
 - [ ] Verify works with multiple windows/displays (Zoom/Meet/YouTube).

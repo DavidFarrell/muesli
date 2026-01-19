@@ -1155,7 +1155,23 @@ final class AppModel: ObservableObject {
 
     func renameSpeaker(id: String, to name: String) {
         transcriptModel.renameSpeaker(id: id, to: name)
-        persistSpeakerNames()
+        if let session = currentSession {
+            persistSpeakerNames(to: session.folderURL)
+        } else if case .viewing(let item) = activeScreen {
+            persistSpeakerNames(to: item.folderURL)
+        }
+    }
+
+    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
+        var didUpdate = false
+        for mapping in mappings {
+            let trimmed = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            transcriptModel.renameSpeaker(id: mapping.speakerId, to: trimmed)
+            didUpdate = true
+        }
+        guard didUpdate else { return }
+        persistSpeakerNames(to: meeting.folderURL)
     }
 
     func renameMeeting(_ item: MeetingHistoryItem, to newTitle: String) {
@@ -1188,13 +1204,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func persistSpeakerNames() {
-        guard let session = currentSession else { return }
+    private func persistSpeakerNames(to folderURL: URL) {
         do {
-            var metadata = try readMeetingMetadata(from: session.folderURL)
+            var metadata = try readMeetingMetadata(from: folderURL)
             metadata.speakerNames = transcriptModel.speakerNames
             metadata.updatedAt = Date()
-            try writeMeetingMetadata(metadata, to: session.folderURL)
+            try writeMeetingMetadata(metadata, to: folderURL)
         } catch {
             appendBackendLog("Failed to persist speaker names: \(error.localizedDescription)", toTail: true)
         }

@@ -33,10 +33,21 @@ actor SpeakerIdentifier {
     private let targetScreenshotCount = 16
     private let dedupeHashThreshold = 6
     private let dedupeMinTimeDelta: Double = 10.0
+    private let requestTimeout: TimeInterval = 90
+    private let maxRetries = 2
+    private let retryDelaySeconds: TimeInterval = 1.5
 
     private struct ImagePayload {
         let mediaType: String
         let base64Data: String
+    }
+
+    private struct OllamaHTTPError: LocalizedError {
+        let statusCode: Int
+
+        var errorDescription: String? {
+            "Ollama returned status \(statusCode)."
+        }
     }
 
     private struct ScreenshotCandidate {
@@ -52,6 +63,7 @@ actor SpeakerIdentifier {
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> IdentificationResult {
         progressHandler?(.extractingFrames)
+        try Task.checkCancellation()
         let selectedScreenshots = selectScreenshots(from: screenshots, targetCount: targetScreenshotCount)
         let imagePayloads = try loadImagePayloads(from: selectedScreenshots)
         progressHandler?(.analyzing)
@@ -251,13 +263,13 @@ actor SpeakerIdentifier {
     private func loadImagePayloads(from urls: [URL]) throws -> [ImagePayload] {
         var payloads: [ImagePayload] = []
         for url in urls {
+            try Task.checkCancellation()
             guard let image = loadImage(from: url),
                   let resized = resizeImage(image, maxDimension: maxImageDimension),
-                  let data = encodePNG(resized) else {
+                  let data = encodeJPEG(resized, quality: 0.8) else {
                 continue
             }
-            let mediaType = "image/png"
-            payloads.append(ImagePayload(mediaType: mediaType, base64Data: data.base64EncodedString()))
+            payloads.append(ImagePayload(mediaType: "image/jpeg", base64Data: data.base64EncodedString()))
         }
         return payloads
     }
@@ -294,27 +306,72 @@ actor SpeakerIdentifier {
         return context.makeImage()
     }
 
-    private func encodePNG(_ image: CGImage) -> Data? {
+    private func encodeJPEG(_ image: CGImage, quality: CGFloat) -> Data? {
         let rep = NSBitmapImageRep(cgImage: image)
-        return rep.representation(using: .png, properties: [:])
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: quality])
     }
 
     private func buildPrompt(transcript: String, speakerIds: [String]) -> String {
-        let ids = speakerIds.joined(separator: ", ")
+        let speakerList = speakerIds.map { "\($0) = [name]" }.joined(separator: "\n")
+
         return """
-        You are identifying real names for speakers in a transcript. The transcript uses labels like SPEAKER_00.\n\n\
-        Speaker IDs: \(ids)\n\n\
-        Transcript:\n\(transcript)\n\n\
-        Return ONLY JSON. Provide an array of objects with keys: speaker_id, name, confidence.\n\
-        confidence is 0.0 to 1.0. If unknown, set name to \"Unknown\" and confidence to 0.0.\n\
+        I'm sending you screenshots from a video recording (meeting, lecture, or video call).
+
+        WHERE TO FIND PARTICIPANT NAMES:
+        - VIDEO TILES: Small rectangles showing people's faces, with name labels below or on them
+        - PRESENTER INFO: Names shown on slides or in presenter panels
+        - YOUTUBE: Channel names or video titles
+        - IGNORE: Browser tab titles, file names, spreadsheet content - these are NOT participant names
+
+        Transcript excerpt with speaker labels:
+
+        \(transcript)
+
+        REASONING GUIDE FOR TRANSCRIPT CLUES:
+        - If someone says "Hey [Name]" or "Hi [Name]" -> the speaker is greeting that person, so speaker is NOT [Name]
+        - If someone says "Hi, I'm [Name]" -> the speaker IS [Name]
+        - If someone says "[Name] and I did something" -> the speaker is NOT [Name] (talking ABOUT them)
+        - If someone says "Thanks, [Name]" -> they're talking TO [Name], so speaker is NOT [Name]
+        - Look at who does most of the talking (presenting) vs who asks questions
+
+        Map each speaker to their real name:
+        \(speakerList)
+
+        Provide your answer as JSON array with objects containing: speaker_id, name, confidence (0.0-1.0).
+        If you cannot identify a speaker, set name to "Unknown" and confidence to 0.0.
+
+        Example: [{"speaker_id": "SPEAKER_00", "name": "Pete Stefanov", "confidence": 0.9}]
         """
     }
 
     private func requestOllama(images: [ImagePayload], prompt: String) async throws -> String {
+        var lastError: Error?
+        for attempt in 0...maxRetries {
+            try Task.checkCancellation()
+            do {
+                return try await performOllamaRequest(images: images, prompt: prompt)
+            } catch {
+                lastError = error
+                if attempt >= maxRetries || !shouldRetry(error) {
+                    throw error
+                }
+                let delay = retryDelaySeconds * pow(2.0, Double(attempt))
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        throw lastError ?? NSError(
+            domain: "SpeakerIdentifier",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Ollama request failed."]
+        )
+    }
+
+    private func performOllamaRequest(images: [ImagePayload], prompt: String) async throws -> String {
         let url = ollamaBaseURL.appendingPathComponent("v1/messages")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = requestTimeout
 
         var content: [[String: Any]] = images.map { payload in
             return [
@@ -348,10 +405,31 @@ actor SpeakerIdentifier {
             throw NSError(domain: "SpeakerIdentifier", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
         }
         guard (200..<300).contains(http.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "status \(http.statusCode)"
-            throw NSError(domain: "SpeakerIdentifier", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+            throw OllamaHTTPError(statusCode: http.statusCode)
         }
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func shouldRetry(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+        if let httpError = error as? OllamaHTTPError {
+            return httpError.statusCode == 408 || httpError.statusCode == 429 || httpError.statusCode >= 500
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut,
+                 .cannotConnectToHost,
+                 .cannotFindHost,
+                 .networkConnectionLost,
+                 .notConnectedToInternet:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
     }
 
     private func parseMappings(from rawResponse: String) -> [SpeakerMapping] {

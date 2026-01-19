@@ -423,6 +423,12 @@ struct MeetingViewer: View {
     @State private var copyIconName = "doc.on.clipboard"
     @State private var showRenameSheet = false
     @State private var renameTitle = ""
+    @State private var isIdentifyingSpeakers = false
+    @State private var identificationProgress: SpeakerIdentifier.Progress?
+    @State private var identificationError: String?
+    @State private var proposedMappings: [SpeakerIdentifier.SpeakerMapping] = []
+    @State private var showMappingSheet = false
+    @State private var identificationTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -438,6 +444,46 @@ struct MeetingViewer: View {
                         .padding(8)
                     }
 
+                    GroupBox("Speaker ID") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Button {
+                                identifySpeakers()
+                            } label: {
+                                Label("Identify speakers", systemImage: "person.text.rectangle")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!canIdentifySpeakers)
+
+                            if isIdentifyingSpeakers {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text(progressText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Button("Cancel") {
+                                    cancelSpeakerIdentification()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            if let message = model.speakerIdStatusMessage {
+                                Text(message)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let identificationError {
+                                Text(identificationError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                        .padding(8)
+                    }
+
                     Spacer()
                 }
                 .frame(width: 260)
@@ -448,6 +494,22 @@ struct MeetingViewer: View {
         .padding(16)
         .sheet(isPresented: $showSpeakers) {
             SpeakersSheet()
+        }
+        .sheet(isPresented: $showMappingSheet) {
+            SpeakerMappingSheet(
+                mappings: proposedMappings,
+                onConfirm: { mappings in
+                    model.applySpeakerMappings(mappings, for: meeting)
+                    showMappingSheet = false
+                },
+                onCancel: {
+                    showMappingSheet = false
+                }
+            )
+        }
+        .onDisappear {
+            identificationTask?.cancel()
+            identificationTask = nil
         }
     }
 
@@ -546,6 +608,115 @@ struct MeetingViewer: View {
             return String(format: "%dm %ds", mins, secs)
         }
         return "\(secs)s"
+    }
+
+    private var canIdentifySpeakers: Bool {
+        if isIdentifyingSpeakers {
+            return false
+        }
+        switch model.speakerIdStatus {
+        case .ready, .unknown:
+            return true
+        case .ollamaNotRunning, .modelMissing, .error:
+            return false
+        }
+    }
+
+    private var progressText: String {
+        switch identificationProgress {
+        case .extractingFrames:
+            return "Extracting frames..."
+        case .analyzing:
+            return "Analyzing with Ollama..."
+        case .complete:
+            return "Complete"
+        case nil:
+            return "Identifying..."
+        }
+    }
+
+    private func identifySpeakers() {
+        guard !isIdentifyingSpeakers else { return }
+
+        identificationError = nil
+        isIdentifyingSpeakers = true
+        identificationProgress = nil
+
+        let transcript = transcriptForIdentification()
+        let speakerIds = speakerIdsForIdentification()
+        let screenshots = loadScreenshots(for: meeting)
+
+        identificationTask = Task {
+            do {
+                try Task.checkCancellation()
+                let identifier = SpeakerIdentifier()
+                let result = try await identifier.identifySpeakers(
+                    screenshots: screenshots,
+                    transcript: transcript,
+                    speakerIds: speakerIds,
+                    progressHandler: { progress in
+                        Task { @MainActor in
+                            identificationProgress = progress
+                        }
+                    }
+                )
+                try Task.checkCancellation()
+                await MainActor.run {
+                    proposedMappings = result.mappings
+                    isIdentifyingSpeakers = false
+                    identificationProgress = nil
+                    showMappingSheet = true
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    isIdentifyingSpeakers = false
+                    identificationProgress = nil
+                }
+            } catch {
+                await MainActor.run {
+                    isIdentifyingSpeakers = false
+                    identificationProgress = nil
+                    identificationError = "Speaker ID failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func cancelSpeakerIdentification() {
+        identificationTask?.cancel()
+        identificationTask = nil
+    }
+
+    private func loadScreenshots(for meeting: MeetingHistoryItem) -> [URL] {
+        let folder = meeting.folderURL.appendingPathComponent("screenshots", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        let imageURLs = urls.filter { url in
+            let ext = url.pathExtension.lowercased()
+            return ext == "png" || ext == "jpg" || ext == "jpeg"
+        }
+        return imageURLs.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func speakerIdsForIdentification() -> [String] {
+        var ids = Set<String>()
+        for segment in model.transcriptModel.segments where !segment.isPartial {
+            ids.insert(segment.speakerID)
+        }
+        return ids.sorted()
+    }
+
+    private func transcriptForIdentification() -> String {
+        model.transcriptModel.segments
+            .filter { !$0.isPartial }
+            .map { segment in
+                let stream = segment.stream == "unknown" ? "" : "[\(segment.stream)] "
+                return "\(stream)t=\(String(format: "%.2f", segment.t0))s \(segment.speakerID): \(segment.text)"
+            }
+            .joined(separator: "\n")
     }
 }
 
@@ -955,6 +1126,73 @@ struct SpeakersSheet: View {
             ids.insert(s.speakerID)
         }
         return ids.sorted()
+    }
+}
+
+// MARK: - Speaker Mapping Sheet
+
+struct SpeakerMappingSheet: View {
+    let mappings: [SpeakerIdentifier.SpeakerMapping]
+    let onConfirm: ([SpeakerIdentifier.SpeakerMapping]) -> Void
+    let onCancel: () -> Void
+
+    @State private var workingMappings: [SpeakerIdentifier.SpeakerMapping]
+
+    init(
+        mappings: [SpeakerIdentifier.SpeakerMapping],
+        onConfirm: @escaping ([SpeakerIdentifier.SpeakerMapping]) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.mappings = mappings
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+        _workingMappings = State(initialValue: mappings.sorted { $0.speakerId < $1.speakerId })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Speaker mapping")
+                .font(.title2).bold()
+
+            Text("Review and edit names before applying them to the transcript.")
+                .foregroundStyle(.secondary)
+
+            List {
+                ForEach(workingMappings.indices, id: \.self) { index in
+                    HStack(spacing: 12) {
+                        Text(workingMappings[index].speakerId)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 90, alignment: .leading)
+
+                        TextField("Name", text: Binding(
+                            get: { workingMappings[index].name },
+                            set: { workingMappings[index].name = $0 }
+                        ))
+
+                        Text(confidenceText(for: workingMappings[index].confidence))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 60, alignment: .trailing)
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel() }
+                Button("Apply") { onConfirm(workingMappings) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 560, height: 420)
+    }
+
+    private func confidenceText(for confidence: Double) -> String {
+        let clamped = max(0.0, min(1.0, confidence))
+        let percent = Int((clamped * 100.0).rounded())
+        return "\(percent)%"
     }
 }
 
