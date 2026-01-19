@@ -359,7 +359,6 @@ final class AppModel: ObservableObject {
         let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
 
         var jsonlLines: [String] = []
-        var textLines: [String] = []
         for seg in finalized {
             let payload: [String: Any] = [
                 "speaker_id": seg.speakerID,
@@ -372,18 +371,10 @@ final class AppModel: ObservableObject {
                let line = String(data: data, encoding: .utf8) {
                 jsonlLines.append(line)
             }
-            let t1 = seg.t1 ?? seg.t0
-            let line = String(format: "%@ [%@] %.2f-%.2f %@",
-                              seg.speakerID,
-                              seg.stream,
-                              seg.t0,
-                              t1,
-                              seg.text)
-            textLines.append(line)
         }
 
         let jsonlString = jsonlLines.joined(separator: "\n")
-        let textString = textLines.joined(separator: "\n")
+        let textString = transcriptModel.asPlainText()
 
         let jsonlData = jsonlString.data(using: .utf8)
         let textData = textString.data(using: .utf8)
@@ -422,6 +413,65 @@ final class AppModel: ObservableObject {
             appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: true)
         } catch {
             appendBackendLog("Failed to save transcript temp copy: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func exportTranscriptFiles() {
+        guard let session = currentSession else {
+            appendBackendLog("Export failed: no active session.", toTail: true)
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedFileTypes = ["txt"]
+        panel.nameFieldStringValue = "\(session.title)-transcript.txt"
+        panel.prompt = "Export"
+        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
+            let targetDir = url.deletingLastPathComponent()
+
+            let textString = transcriptModel.asPlainText()
+            if let textData = textString.data(using: .utf8) {
+                do {
+                    try textData.write(to: url)
+                } catch {
+                    appendBackendLog("Failed to export transcript text: \(error.localizedDescription)", toTail: true)
+                }
+            } else {
+                appendBackendLog("Failed to encode exported transcript text.", toTail: true)
+            }
+
+            let jsonlString = transcriptModel.segments
+                .filter { !$0.isPartial }
+                .compactMap { seg -> String? in
+                    let payload: [String: Any] = [
+                        "speaker_id": seg.speakerID,
+                        "stream": seg.stream,
+                        "t0": seg.t0,
+                        "t1": seg.t1 ?? seg.t0,
+                        "text": seg.text
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: payload),
+                       let line = String(data: data, encoding: .utf8) {
+                        return line
+                    }
+                    return nil
+                }
+                .joined(separator: "\n")
+            if let jsonlData = jsonlString.data(using: .utf8) {
+                do {
+                    try jsonlData.write(to: jsonlURL)
+                } catch {
+                    appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
+                }
+            } else {
+                appendBackendLog("Failed to encode exported transcript JSONL.", toTail: true)
+            }
+
+            appendBackendLog("Transcript exported to \(targetDir.path).", toTail: true)
         }
     }
 
@@ -931,6 +981,11 @@ struct NewMeetingView: View {
 
                 Spacer()
             }
+            if model.sourceKind == .window {
+                Text("Window capture may only include that app's audio. Use Display to capture full system audio.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
 
             GroupBox("Select capture source") {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1063,6 +1118,7 @@ struct SessionView: View {
     @State private var showSpeakers = false
     @State private var autoScroll = true
     @State private var showDebug = false
+    @State private var copyIconName = "doc.on.clipboard"
     private let timeFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "HH:mm:ss"
@@ -1092,7 +1148,6 @@ struct SessionView: View {
                             Toggle("Show debug panel", isOn: $showDebug)
                             HStack {
                                 Button("Speakers") { showSpeakers = true }
-                                Button("Permissions") { model.showPermissionsSheet = true }
                                 Spacer()
                                 Button(model.isFinalizing ? "Finalizing..." : "Stop") {
                                     Task { await model.stopMeeting() }
@@ -1192,7 +1247,7 @@ struct SessionView: View {
     }
 
     private func transcriptPane(autoScroll: Bool) -> some View {
-        GroupBox("Live transcript") {
+        GroupBox {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
@@ -1211,6 +1266,32 @@ struct SessionView: View {
                         proxy.scrollTo("BOTTOM", anchor: .bottom)
                     }
                 }
+            }
+        }
+        label: {
+            HStack {
+                Text("Live transcript")
+                Spacer()
+                Button {
+                    let text = model.transcriptModel.asPlainText()
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(text, forType: .string)
+                    copyIconName = "checkmark"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        copyIconName = "doc.on.clipboard"
+                    }
+                } label: {
+                    Image(systemName: copyIconName)
+                }
+                .help("Copy transcript")
+
+                Button {
+                    model.exportTranscriptFiles()
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }
+                .help("Export transcript")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1503,6 +1584,57 @@ final class TranscriptModel: ObservableObject {
         }
     }
 
+    func asPlainText(includePartials: Bool = false) -> String {
+        segments
+            .filter { includePartials || !$0.isPartial }
+            .map { seg in
+                let name = displayName(for: seg.speakerID)
+                let stream = seg.stream == "unknown" ? "" : "[\(seg.stream)] "
+                return "\(stream)t=\(String(format: "%.2f", seg.t0))s \(name): \(seg.text)"
+            }
+            .joined(separator: "\n")
+    }
+
+    private func insertSegment(_ newSegment: TranscriptSegment) {
+        let epsilon: Double = 0.05
+        let newStart = newSegment.t0
+        let newEnd = newSegment.t1 ?? newSegment.t0
+        let newDuration = max(0, newEnd - newStart)
+        var shouldAppend = true
+
+        segments.removeAll { existing in
+            guard existing.stream == newSegment.stream else { return false }
+            let existingEnd = existing.t1 ?? existing.t0
+            let existingDuration = max(0, existingEnd - existing.t0)
+
+            let overlap = min(existingEnd, newEnd) - max(existing.t0, newStart)
+            if overlap <= 0 {
+                return false
+            }
+
+            let closeStart = abs(existing.t0 - newStart) <= 0.12
+            let newCoversExisting = newStart <= existing.t0 + epsilon && newEnd >= existingEnd - epsilon
+            let existingCoversNew = existing.t0 <= newStart + epsilon && existingEnd >= newEnd - epsilon
+
+            if existingCoversNew && existingDuration > newDuration + 0.1 && existing.text.count >= newSegment.text.count {
+                shouldAppend = false
+                return false
+            }
+
+            let overlapRatio = overlap / max(0.01, min(existingDuration, newDuration))
+            if newCoversExisting || closeStart || overlapRatio >= 0.8 {
+                return true
+            }
+
+            return false
+        }
+
+        if shouldAppend {
+            segments.append(newSegment)
+        }
+        segments.sort { $0.t0 < $1.t0 }
+    }
+
     func ingest(jsonLine: String) {
         guard let data = jsonLine.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1526,7 +1658,7 @@ final class TranscriptModel: ObservableObject {
                 isPartial: false
             )
             segments.removeAll { $0.isPartial }
-            segments.append(segment)
+            insertSegment(segment)
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text

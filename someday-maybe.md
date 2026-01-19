@@ -52,6 +52,22 @@ For now, clean slate is safest. Revisit if users find re-naming tedious in recur
 
 ---
 
+## Segment Deduplication
+
+### Magic numbers in overlap detection
+`insertSegment()` uses several hardcoded thresholds:
+- `epsilon = 0.05` - timing tolerance for "covers" checks
+- `closeStart` threshold `0.12` - how close two segment starts must be to be considered duplicates
+- `overlapRatio >= 0.8` - minimum overlap ratio to trigger replacement
+- `existingDuration > newDuration + 0.1` - margin for "existing is longer" check
+
+These seem reasonable but are somewhat arbitrary. If edge cases appear (valid segments being dropped, or duplicates slipping through), these may need tuning.
+
+### Sorting on every insert
+`segments.sort { $0.t0 < $1.t0 }` runs on every segment insert. For long meetings with many segments this could get slow. Could optimize with binary insert to maintain sorted order. Probably fine for typical meeting lengths (<2 hours).
+
+---
+
 ## General
 
 ### UI toast for errors
