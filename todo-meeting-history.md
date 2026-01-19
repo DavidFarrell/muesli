@@ -1,11 +1,11 @@
 # TODO: Meeting History & Resume (Comprehensive)
 
 ## Phase 0 - Refactor (Prerequisite)
-- [ ] Extract `AppModel` to `MuesliApp/MuesliApp/AppModel.swift`.
-- [ ] Extract `TranscriptModel` to `MuesliApp/MuesliApp/TranscriptModel.swift`.
-- [ ] Extract `CaptureEngine` + `AudioSampleExtractor` to `MuesliApp/MuesliApp/CaptureEngine.swift`.
-- [ ] Extract `BackendProcess` + `FramedWriter` to `MuesliApp/MuesliApp/BackendProcess.swift`.
-- [ ] Add `MuesliApp/MuesliApp/MeetingData.swift` for metadata types.
+- [x] Extract `AppModel` to `MuesliApp/MuesliApp/AppModel.swift`.
+- [x] Extract `TranscriptModel` to `MuesliApp/MuesliApp/TranscriptModel.swift`.
+- [x] Extract `CaptureEngine` + `AudioSampleExtractor` to `MuesliApp/MuesliApp/CaptureEngine.swift`.
+- [x] Extract `BackendProcess` + `FramedWriter` to `MuesliApp/MuesliApp/BackendProcess.swift`.
+- [x] Add `MuesliApp/MuesliApp/MeetingData.swift` for metadata types.
 
 ## Phase 1 - Metadata Foundation
 - [ ] Create `meeting.json` on meeting start with initial metadata (status=recording, session 1).
