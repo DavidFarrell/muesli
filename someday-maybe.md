@@ -38,6 +38,20 @@ Temp folders (`Muesli-<title>-<uuid>`) accumulate in the system temp directory. 
 
 ---
 
+## From Todo Item 5 (Reset Transcript State)
+
+### Cross-meeting speaker identification
+Currently `keepSpeakerNames: false` because diarisation assigns arbitrary IDs (SPEAKER_00, SPEAKER_01) per meeting - they don't map to the same people across recordings. Keeping names would show wrong names when IDs coincidentally match.
+
+Future options to revisit:
+- **Voice fingerprinting** - Store voice embeddings and match speakers across meetings
+- **User-assisted matching** - "Is this the same David from last meeting?" prompt
+- **Meeting context** - Use calendar/title to suggest likely participants
+
+For now, clean slate is safest. Revisit if users find re-naming tedious in recurring meetings.
+
+---
+
 ## General
 
 ### UI toast for errors

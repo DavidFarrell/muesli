@@ -771,12 +771,18 @@ final class AppModel: ObservableObject {
 
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
 
-        let folder = base.appendingPathComponent(title, isDirectory: true)
+        var folder = base.appendingPathComponent(title, isDirectory: true)
+        var index = 1
+        while FileManager.default.fileExists(atPath: folder.path) {
+            folder = base.appendingPathComponent("\(title)-\(String(format: "%02d", index))", isDirectory: true)
+            index += 1
+        }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         let metaURL = folder.appendingPathComponent("meta.json")
         let meta: [String: Any] = [
             "title": title,
+            "folder_name": folder.lastPathComponent,
             "created_at": ISO8601DateFormatter().string(from: Date())
         ]
         let data = try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted])
