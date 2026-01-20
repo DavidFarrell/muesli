@@ -256,7 +256,7 @@ struct MeetingViewer: View {
             }
             .background(.thinMaterial)
             .cornerRadius(12)
-            .onChange(of: model.transcriptModel.segments.count) { _ in
+            .onChange(of: model.transcriptModel.segments.count) { _, _ in
                 guard autoScroll, let last = model.transcriptModel.segments.last else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
                     proxy.scrollTo(last.id, anchor: .bottom)
@@ -422,7 +422,7 @@ struct MeetingViewer: View {
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
                     if let urlError = error as? URLError, urlError.code == .timedOut {
-                        identificationError = "Speaker ID timed out after 30 seconds. Try again."
+                        identificationError = "Speaker ID timed out after 5 minutes. Try again."
                     } else {
                         identificationError = "Speaker ID failed: \(error.localizedDescription)"
                     }

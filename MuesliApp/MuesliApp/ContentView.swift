@@ -19,27 +19,31 @@ struct RootView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Group {
-            if model.shouldShowOnboarding {
-                OnboardingView()
-            } else {
-                switch model.activeScreen {
-                case .start:
-                    NewMeetingView()
-                case .session:
-                    SessionView()
-                case .viewing(let item):
-                    MeetingViewer(meeting: item)
+        content
+            .padding(.top, 12)
+            .toolbar {
+                ToolbarItem(placement: .automatic) {
+                    Button("Permissions") { model.showPermissionsSheet = true }
                 }
             }
-        }
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Button("Permissions") { model.showPermissionsSheet = true }
+            .sheet(isPresented: $model.showPermissionsSheet) {
+                PermissionsSheet()
             }
-        }
-        .sheet(isPresented: $model.showPermissionsSheet) {
-            PermissionsSheet()
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if model.shouldShowOnboarding {
+            OnboardingView()
+        } else {
+            switch model.activeScreen {
+            case .start:
+                NewMeetingView()
+            case .session:
+                SessionView()
+            case .viewing(let item):
+                MeetingViewer(meeting: item)
+            }
         }
     }
 }
@@ -130,7 +134,7 @@ struct NewMeetingView: View {
             HStack(spacing: 12) {
                 Text("Title")
                     .frame(width: 60, alignment: .leading)
-                TextField("yyyy-MM-dd-meeting", text: $model.meetingTitle)
+                TextField("YYYY_MM_DD - Meeting n -", text: $model.meetingTitle)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 420)
                 Spacer()
@@ -703,13 +707,13 @@ enum AudioDeviceManager {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var name: CFString = "" as CFString
-        var dataSize = UInt32(MemoryLayout<CFString>.size)
+        var name: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(id, &address, 0, nil, &dataSize, &name)
         if status != noErr {
             return nil
         }
-        return name as String
+        return name?.takeUnretainedValue() as String?
     }
 
     private static func hasInputChannels(_ id: AudioObjectID) -> Bool {

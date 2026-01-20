@@ -180,7 +180,7 @@ final class TranscriptModel: ObservableObject {
             }
             let existing = segments.filter { !$0.isPartial }
             let lastT0 = existing.last?.t0 ?? -Double.infinity
-            var updated = mergeSegment(segment, into: existing)
+            let updated = mergeSegment(segment, into: existing)
             if segment.t0 >= lastT0 {
                 segments = updated
             } else {

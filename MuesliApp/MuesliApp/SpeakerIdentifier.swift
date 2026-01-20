@@ -68,7 +68,7 @@ actor SpeakerIdentifier {
     private let targetScreenshotCount = 16
     private let dedupeHashThreshold = 6
     private let dedupeMinTimeDelta: Double = 10.0
-    private let requestTimeout: TimeInterval = 30
+    private let requestTimeout: TimeInterval = 300
     private let maxRetries = 2
     private let retryDelaySeconds: TimeInterval = 1.5
 

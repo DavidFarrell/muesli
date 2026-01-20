@@ -72,6 +72,8 @@ enum AppScreen {
 final class AppModel: ObservableObject {
     private let captureSampleRate = 16000
     private let captureChannels = 1
+    private let micOutputSampleRate = 16000
+    private let micOutputChannels = 1
 
     @Published var showPermissionsSheet = false
     @Published var isCapturing = false
@@ -106,10 +108,22 @@ final class AppModel: ObservableObject {
         }
     }
     @Published var backendLogTail: [String] = []
+    @Published var micLevel: Float = 0
+    @Published var debugMicBuffers: Int = 0
+    @Published var debugMicFrames: Int = 0
+    @Published var debugMicPTS: Double = 0
+    @Published var debugMicFormat: String = "-"
+    @Published var debugMicErrorMessage: String = "-"
+    @Published var debugMicErrors: Int = 0
 
     let transcriptModel = TranscriptModel()
 
     private let captureEngine = CaptureEngine()
+    private var micEngine: MicEngine?
+    private var micStartTime: Date?
+    private var micOutputEnabled = false
+    private var pendingMicAudio: [PendingAudio] = []
+    private let maxPendingMicAudio = 200
     private let screenshotScheduler = ScreenshotScheduler()
     private let backendLogTailLimit = 200
 
@@ -197,19 +211,12 @@ final class AppModel: ObservableObject {
     }
 
     var systemLevel: Float { captureEngine.systemLevel }
-    var micLevel: Float { captureEngine.micLevel }
     var debugSystemBuffers: Int { captureEngine.debugSystemBuffers }
-    var debugMicBuffers: Int { captureEngine.debugMicBuffers }
     var debugSystemFrames: Int { captureEngine.debugSystemFrames }
-    var debugMicFrames: Int { captureEngine.debugMicFrames }
     var debugSystemPTS: Double { captureEngine.debugSystemPTS }
-    var debugMicPTS: Double { captureEngine.debugMicPTS }
     var debugSystemFormat: String { captureEngine.debugSystemFormat }
-    var debugMicFormat: String { captureEngine.debugMicFormat }
     var debugSystemErrorMessage: String { captureEngine.debugSystemErrorMessage }
-    var debugMicErrorMessage: String { captureEngine.debugMicErrorMessage }
     var debugAudioErrors: Int { captureEngine.debugAudioErrors }
-    var debugMicErrors: Int { captureEngine.debugMicErrors }
     var backendLogPath: String? { backendLogURL?.path }
     var debugSummary: String {
         let tail = backendLogTail.suffix(50).joined(separator: "\n")
@@ -415,6 +422,72 @@ final class AppModel: ObservableObject {
         transcriptModel.ingest(jsonLine: line)
     }
 
+    private func resetMicDebugState() {
+        micLevel = 0
+        debugMicBuffers = 0
+        debugMicFrames = 0
+        debugMicPTS = 0
+        debugMicFormat = "-"
+        debugMicErrorMessage = "-"
+        debugMicErrors = 0
+    }
+
+    private func handleMicAudio(_ data: Data) {
+        guard transcribeMic, writer != nil else { return }
+        let now = Date()
+        if micStartTime == nil {
+            micStartTime = now
+        }
+        let elapsed = now.timeIntervalSince(micStartTime ?? now)
+        let ptsUs = Int64(elapsed * 1_000_000.0)
+
+        micLevel = rmsLevelInt16(data)
+        debugMicBuffers += 1
+        debugMicFrames = data.count / 2
+        debugMicPTS = elapsed
+        debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
+
+        let payload = data
+        if micOutputEnabled {
+            writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: payload)
+        } else {
+            pendingMicAudio.append(PendingAudio(
+                ptsUs: ptsUs,
+                payload: payload,
+                sampleRate: micOutputSampleRate,
+                channels: micOutputChannels
+            ))
+            if pendingMicAudio.count > maxPendingMicAudio {
+                pendingMicAudio.removeFirst(pendingMicAudio.count - maxPendingMicAudio)
+            }
+        }
+    }
+
+    private func flushPendingMicAudio() {
+        guard micOutputEnabled, !pendingMicAudio.isEmpty else { return }
+        let pending = pendingMicAudio
+        pendingMicAudio.removeAll()
+        for item in pending {
+            writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
+        }
+    }
+
+    private func rmsLevelInt16(_ data: Data) -> Float {
+        let count = data.count / 2
+        if count == 0 { return 0 }
+
+        var sumSquares: Double = 0
+        data.withUnsafeBytes { raw in
+            let p = raw.bindMemory(to: Int16.self)
+            for i in 0..<count {
+                let v = Double(p[i]) / 32768.0
+                sumSquares += v * v
+            }
+        }
+        let rms = sqrt(sumSquares / Double(count))
+        return Float(min(1.0, rms))
+    }
+
     private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
         segments
             .filter { !$0.isPartial }
@@ -500,7 +573,7 @@ final class AppModel: ObservableObject {
 
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
-        panel.allowedFileTypes = ["txt"]
+        panel.allowedContentTypes = [.plainText]
         panel.nameFieldStringValue = "\(session.title)-transcript.txt"
         panel.prompt = "Export"
         panel.message = "Export transcript as .txt (JSONL will be written alongside)."
@@ -758,11 +831,11 @@ final class AppModel: ObservableObject {
             filter = SCContentFilter(desktopIndependentWindow: window)
         }
 
-        let title = normaliseMeetingTitle(meetingTitle)
+        var title = normaliseMeetingTitle(meetingTitle)
         let folderURL: URL
         let audioDir: URL
         var sessionID = 1
-        if let meeting, let metadata {
+        if let meeting {
             do {
                 let prepared = try prepareResumeSession(for: meeting)
                 folderURL = meeting.folderURL
@@ -773,6 +846,10 @@ final class AppModel: ObservableObject {
                 return
             }
         } else {
+            if let autoTitle = autoNumberedMeetingTitle(from: meetingTitle) {
+                meetingTitle = autoTitle
+                title = normaliseMeetingTitle(autoTitle)
+            }
             do {
                 folderURL = try createMeetingFolder(title: title)
                 audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
@@ -918,22 +995,37 @@ final class AppModel: ObservableObject {
                 recordTo: recordURL
             )
 
+            resetMicDebugState()
+            pendingMicAudio.removeAll()
+            micOutputEnabled = false
+            micStartTime = nil
+            if transcribeMic {
+                let engine = MicEngine()
+                micEngine = engine
+                do {
+                    try await engine.start { [weak self] data in
+                        Task { @MainActor in
+                            self?.handleMicAudio(data)
+                        }
+                    }
+                } catch {
+                    micEngine = nil
+                    debugMicErrors += 1
+                    debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
+                    appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
+                }
+            }
+
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
             let systemSampleRate = formats.systemSampleRate ?? captureSampleRate
             let systemChannels = formats.systemChannels ?? captureChannels
-            let micSampleRate = formats.micSampleRate ?? captureSampleRate
-            let micChannels = formats.micChannels ?? captureChannels
+            let micSampleRate = micOutputSampleRate
+            let micChannels = micOutputChannels
 
             if formats.systemSampleRate == nil {
                 appendBackendLog("System audio format not detected; using requested settings.", toTail: true)
             } else if systemSampleRate != captureSampleRate || systemChannels != captureChannels {
                 appendBackendLog("System audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(systemSampleRate)Hz/\(systemChannels)ch.", toTail: true)
-            }
-
-            if formats.micSampleRate == nil {
-                appendBackendLog("Mic audio format not detected; using requested settings.", toTail: true)
-            } else if micSampleRate != captureSampleRate || micChannels != captureChannels {
-                appendBackendLog("Mic audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(micSampleRate)Hz/\(micChannels)ch.", toTail: true)
             }
 
             let meta: [String: Any] = [
@@ -959,6 +1051,8 @@ final class AppModel: ObservableObject {
                 micChannels: micChannels
             )
             captureEngine.setAudioOutputEnabled(true)
+            micOutputEnabled = micEngine != nil
+            flushPendingMicAudio()
 
             if captureMode == .video {
                 let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
@@ -1005,6 +1099,13 @@ final class AppModel: ObservableObject {
 
         screenshotScheduler.stop()
         await captureEngine.stopCapture()
+        if let engine = micEngine {
+            await engine.stop()
+        }
+        micEngine = nil
+        micOutputEnabled = false
+        pendingMicAudio.removeAll()
+        micStartTime = nil
 
         writer?.sendSync(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer?.closeStdinAfterDraining()
@@ -1059,9 +1160,99 @@ final class AppModel: ObservableObject {
     }
 
     static func defaultMeetingTitle() -> String {
+        defaultMeetingTitle(for: Date(), number: 1)
+    }
+
+    private static func meetingDatePrefix(for date: Date) -> String {
         let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        return "\(df.string(from: Date()))-meeting"
+        df.dateFormat = "yyyy_MM_dd"
+        return df.string(from: date)
+    }
+
+    private static func defaultMeetingTitle(for date: Date, number: Int) -> String {
+        "\(meetingDatePrefix(for: date)) - Meeting \(number) - "
+    }
+
+    private func parseAutoMeetingTitle(_ title: String) -> (datePrefix: String, number: Int)? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.components(separatedBy: " - Meeting ")
+        guard parts.count >= 2 else { return nil }
+        let datePrefix = parts[0]
+        guard isDatePrefix(datePrefix) else { return nil }
+
+        let remainder = parts[1]
+        var digits = ""
+        var index = remainder.startIndex
+        while index < remainder.endIndex, remainder[index].isNumber {
+            digits.append(remainder[index])
+            index = remainder.index(after: index)
+        }
+        guard let number = Int(digits), number > 0 else { return nil }
+
+        let tail = remainder[index...].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty, tail != "-" {
+            return nil
+        }
+        return (datePrefix: datePrefix, number: number)
+    }
+
+    private func isDatePrefix(_ value: String) -> Bool {
+        guard value.count == 10 else { return false }
+        let chars = Array(value)
+        guard chars[4] == "_", chars[7] == "_" else { return false }
+        for (idx, ch) in chars.enumerated() where idx != 4 && idx != 7 {
+            guard ch.isNumber else { return false }
+        }
+        return true
+    }
+
+    private func parseMeetingNumber(in title: String, datePrefix: String) -> Int? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "\(datePrefix) - Meeting "
+        guard trimmed.hasPrefix(prefix) else { return nil }
+        let remainder = trimmed.dropFirst(prefix.count)
+        var digits = ""
+        for ch in remainder {
+            if ch.isNumber {
+                digits.append(ch)
+            } else {
+                break
+            }
+        }
+        guard let number = Int(digits) else { return nil }
+        return number
+    }
+
+    private func nextMeetingNumber(for datePrefix: String) -> Int {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Muesli", isDirectory: true)
+            .appendingPathComponent("Meetings", isDirectory: true)
+
+        guard let folders = try? FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 1
+        }
+
+        var maxNumber = 0
+        for folderURL in folders {
+            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard resourceValues?.isDirectory == true else { continue }
+            let title = (try? readMeetingMetadata(from: folderURL).title) ?? folderURL.lastPathComponent
+            if let number = parseMeetingNumber(in: title, datePrefix: datePrefix) {
+                maxNumber = max(maxNumber, number)
+            }
+        }
+
+        return maxNumber + 1
+    }
+
+    private func autoNumberedMeetingTitle(from proposed: String) -> String? {
+        guard let parsed = parseAutoMeetingTitle(proposed) else { return nil }
+        let next = nextMeetingNumber(for: parsed.datePrefix)
+        return "\(parsed.datePrefix) - Meeting \(next) - "
     }
 
     private func normaliseMeetingTitle(_ s: String) -> String {
@@ -1117,7 +1308,7 @@ final class AppModel: ObservableObject {
         let now = session.startedAt
         let metadata = MeetingMetadata(
             version: 1,
-            title: session.folderURL.lastPathComponent,
+            title: session.title,
             createdAt: now,
             updatedAt: now,
             durationSeconds: 0,
@@ -1349,6 +1540,42 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func renameCurrentMeeting(to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let session = currentSession else { return }
+
+        do {
+            var metadata = try readMeetingMetadata(from: session.folderURL)
+            metadata.title = trimmed
+            metadata.updatedAt = Date()
+            try writeMeetingMetadata(metadata, to: session.folderURL)
+
+            let updatedSession = MeetingSession(
+                title: trimmed,
+                folderURL: session.folderURL,
+                startedAt: session.startedAt
+            )
+            currentSession = updatedSession
+            meetingTitle = trimmed
+
+            if let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
+                let existing = meetingHistory[idx]
+                let updatedItem = MeetingHistoryItem(
+                    id: existing.id,
+                    folderURL: existing.folderURL,
+                    title: trimmed,
+                    createdAt: existing.createdAt,
+                    durationSeconds: existing.durationSeconds,
+                    segmentCount: existing.segmentCount,
+                    status: existing.status
+                )
+                meetingHistory[idx] = updatedItem
+            }
+        } catch {
+            appendBackendLog("Failed to rename active meeting: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
     private func persistSpeakerNames(to folderURL: URL) {
         do {
             var metadata = try readMeetingMetadata(from: folderURL)
@@ -1566,7 +1793,7 @@ final class AppModel: ObservableObject {
     func exportTranscriptFiles(for meeting: MeetingHistoryItem) {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
-        panel.allowedFileTypes = ["txt"]
+        panel.allowedContentTypes = [.plainText]
         panel.nameFieldStringValue = "\(meeting.title)-transcript.txt"
         panel.prompt = "Export"
         panel.message = "Export transcript as .txt (JSONL will be written alongside)."

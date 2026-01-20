@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Backend Process
 
-final class BackendProcess {
+nonisolated final class BackendProcess {
     private let process = Process()
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()

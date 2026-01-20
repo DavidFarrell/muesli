@@ -9,6 +9,8 @@ struct SessionView: View {
     @State private var autoScroll = true
     @State private var showDebug = false
     @State private var copyIconName = "doc.on.clipboard"
+    @State private var showRenameSheet = false
+    @State private var renameTitle = ""
     private let timeFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "HH:mm:ss"
@@ -118,13 +120,29 @@ struct SessionView: View {
         .sheet(isPresented: $showSpeakers) {
             SpeakersSheet()
         }
+        .sheet(isPresented: $showRenameSheet) {
+            RenameMeetingSheet(
+                title: $renameTitle,
+                onCancel: { showRenameSheet = false },
+                onSave: {
+                    model.renameCurrentMeeting(to: renameTitle)
+                    showRenameSheet = false
+                }
+            )
+        }
     }
 
     private var header: some View {
         HStack {
             VStack(alignment: .leading) {
-                Text(model.currentSession?.title ?? "Meeting")
-                    .font(.title2).bold()
+                Button {
+                    renameTitle = model.currentSession?.title ?? ""
+                    showRenameSheet = true
+                } label: {
+                    Text(model.currentSession?.title ?? "Meeting")
+                        .font(.title2).bold()
+                }
+                .buttonStyle(.plain)
                 if let folder = model.currentSession?.folderURL.path {
                     Text(folder)
                         .font(.footnote)

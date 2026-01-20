@@ -56,21 +56,30 @@ actor BatchRediarizer {
         let duration: Double
     }
 
-    private actor ProcessStore {
+    private final class ProcessStore {
         private var process: BackendProcess?
+        private let queue = DispatchQueue(label: "muesli.batch-rediarizer.process")
 
         func set(_ process: BackendProcess) {
-            self.process = process
+            queue.sync {
+                self.process = process
+            }
         }
 
         func clear() {
-            process = nil
+            queue.sync {
+                process = nil
+            }
         }
 
         func terminate() {
-            process?.terminate()
-            process?.cleanup()
-            process = nil
+            let current = queue.sync { () -> BackendProcess? in
+                let value = process
+                process = nil
+                return value
+            }
+            current?.terminate()
+            current?.cleanup()
         }
     }
 
@@ -84,6 +93,12 @@ actor BatchRediarizer {
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> Result {
         let processStore = ProcessStore()
+        let reportProgress: (Progress) -> Void = { progress in
+            guard let progressHandler else { return }
+            Task { @MainActor in
+                progressHandler(progress)
+            }
+        }
 
         return try await withTaskCancellationHandler(operation: {
             let command = [
@@ -96,7 +111,7 @@ actor BatchRediarizer {
             ]
             let env = backendEnvironment(root: backendRoot)
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: env)
-            await processStore.set(backend)
+            processStore.set(backend)
             try Task.checkCancellation()
 
             var capturedResult: Result?
@@ -108,7 +123,7 @@ actor BatchRediarizer {
                    status.type == "status",
                    let stage = status.stage,
                    let progress = Progress(rawValue: stage) {
-                    progressHandler?(progress)
+                    reportProgress(progress)
                     return
                 }
                 if let error = try? JSONDecoder().decode(ErrorEnvelope.self, from: data),
@@ -125,7 +140,7 @@ actor BatchRediarizer {
             try backend.start()
             let exitStatus = await backend.waitForExit(timeoutSeconds: timeoutSeconds)
             backend.cleanup()
-            await processStore.clear()
+            processStore.clear()
 
             if Task.isCancelled {
                 throw CancellationError()
@@ -164,10 +179,10 @@ actor BatchRediarizer {
                 )
             }
 
-            progressHandler?(.complete)
+            reportProgress(.complete)
             return result
         }, onCancel: {
-            Task { await processStore.terminate() }
+            processStore.terminate()
         })
     }
 
