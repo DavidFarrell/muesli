@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Any
 from .asr import Word, TranscriptResult
 from .diarisation import DiarSegment
 from .audio import format_timestamp, format_srt_timestamp
+from .constants import DEFAULT_GAP_THRESHOLD_SECONDS
 
 
 @dataclass
@@ -194,7 +195,7 @@ def _join_words_smart(words: List[LabelledWord]) -> str:
 
 def words_to_turns(
     words: List[LabelledWord],
-    gap_threshold: float = 0.8,
+    gap_threshold: float = DEFAULT_GAP_THRESHOLD_SECONDS,
     max_turn_duration: float = 60.0,
 ) -> List[SpeakerTurn]:
     """
@@ -258,7 +259,7 @@ def words_to_turns(
 def merge_transcript_with_diarisation(
     transcript: TranscriptResult,
     segments: List[DiarSegment],
-    gap_threshold: float = 0.8,
+    gap_threshold: float = DEFAULT_GAP_THRESHOLD_SECONDS,
     speaker_tolerance: float = 0.5,
     max_turn_duration: float = 60.0,
 ) -> MergedTranscript:

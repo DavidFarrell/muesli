@@ -36,7 +36,7 @@ final class BackendProcess {
         process.standardError = stderrPipe
 
         var continuation: AsyncStream<String>.Continuation?
-        self.stdoutLines = AsyncStream<String> { cont in
+        self.stdoutLines = AsyncStream<String>(bufferingPolicy: .bufferingNewest(500)) { cont in
             continuation = cont
         }
         self.stdoutContinuation = continuation
@@ -147,6 +147,8 @@ enum MsgType: UInt8 {
 final class FramedWriter {
     private let handle: FileHandle
     private let writeQueue = DispatchQueue(label: "muesli.framed-writer")
+    private var didFail = false
+    var onWriteError: ((Error) -> Void)?
 
     init(stdinHandle: FileHandle) {
         self.handle = stdinHandle
@@ -185,6 +187,10 @@ final class FramedWriter {
             try handle.write(contentsOf: header)
             try handle.write(contentsOf: payload)
         } catch {
+            if !didFail {
+                didFail = true
+                onWriteError?(error)
+            }
             return
         }
     }

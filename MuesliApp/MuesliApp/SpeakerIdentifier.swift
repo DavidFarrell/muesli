@@ -27,13 +27,48 @@ actor SpeakerIdentifier {
         case complete
     }
 
+    static func checkAvailability(
+        modelName: String = "gemma3:27b",
+        timeoutSeconds: TimeInterval = 3
+    ) async -> SpeakerIdStatus {
+        let url = URL(string: "http://localhost:11434/api/tags")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeoutSeconds
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .error("invalid response")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                return .error("status \(http.statusCode)")
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["models"] as? [[String: Any]] else {
+                return .error("invalid payload")
+            }
+            let hasModel = models.contains { ($0["name"] as? String) == modelName }
+            return hasModel ? .ready : .modelMissing(modelName)
+        } catch {
+            if let urlError = error as? URLError {
+                switch urlError.code {
+                case .cannotConnectToHost, .cannotFindHost, .notConnectedToInternet, .timedOut:
+                    return .ollamaNotRunning
+                default:
+                    return .error(urlError.localizedDescription)
+                }
+            }
+            return .error(error.localizedDescription)
+        }
+    }
+
     private let ollamaBaseURL = URL(string: "http://localhost:11434")!
     private let model = "gemma3:27b"
     private let maxImageDimension: CGFloat = 1024
     private let targetScreenshotCount = 16
     private let dedupeHashThreshold = 6
     private let dedupeMinTimeDelta: Double = 10.0
-    private let requestTimeout: TimeInterval = 90
+    private let requestTimeout: TimeInterval = 30
     private let maxRetries = 2
     private let retryDelaySeconds: TimeInterval = 1.5
 

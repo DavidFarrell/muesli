@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import struct
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from typing import BinaryIO, Optional
 
 from .audio import check_ffmpeg, normalise_audio, is_wav_16k_mono
 from .asr import ASRModel, DEFAULT_MODEL
+from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
 from .diarisation import SortformerDiarizer, MODEL_CONFIGS
 from .merge import merge_transcript_with_diarisation
 
@@ -60,13 +62,35 @@ def read_exact(f: BinaryIO, n: int) -> bytes:
     return data
 
 
-def emit_jsonl(obj: dict, lock: Optional[threading.Lock] = None) -> None:
-    line = json.dumps(obj, ensure_ascii=False) + "\n"
-    try:
-        if lock:
-            with lock:
+class StdoutWriter:
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="stdout-writer", daemon=True)
+        self._thread.start()
+
+    def write(self, line: str) -> None:
+        self._queue.put(line)
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            line = self._queue.get()
+            if line is None:
+                break
+            try:
                 sys.stdout.write(line)
                 sys.stdout.flush()
+            except Exception:
+                pass
+
+
+def emit_jsonl(obj: dict, writer: Optional["StdoutWriter"] = None) -> None:
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    try:
+        if writer:
+            writer.write(line)
         else:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -88,7 +112,11 @@ def open_stream_writer(path: Path, sample_rate: int, channels: int) -> StreamWri
     wav.setsampwidth(BYTES_PER_SAMPLE)
     wav.setframerate(sample_rate)
     pcm_path = path.with_suffix(".pcm")
-    pcm = open(pcm_path, "wb")
+    try:
+        pcm = open(pcm_path, "wb")
+    except Exception:
+        wav.close()
+        raise
     return StreamWriter(path=path, wav=wav, pcm=pcm)
 
 
@@ -266,8 +294,8 @@ def run_pipeline(
 
 
 class TranscriptEmitter:
-    def __init__(self, stdout_lock: threading.Lock, finalize_lag: float) -> None:
-        self._stdout_lock = stdout_lock
+    def __init__(self, stdout_writer: StdoutWriter, finalize_lag: float) -> None:
+        self._stdout_writer = stdout_writer
         self._finalize_lag = finalize_lag
         self._last_emitted_t1_by_stream = {}
         self._last_partial_by_stream = {}
@@ -298,7 +326,7 @@ class TranscriptEmitter:
 
             if new_speakers:
                 known = [{"speaker_id": s, "name": s} for s in sorted(self._seen_speakers)]
-                emit_jsonl({"type": "speakers", "known": known}, self._stdout_lock)
+                emit_jsonl({"type": "speakers", "known": known}, self._stdout_writer)
 
             cutoff = current_duration if finalize else max(0.0, current_duration - self._finalize_lag)
             for turn in merged.turns:
@@ -312,7 +340,7 @@ class TranscriptEmitter:
                         "t0": turn.start,
                         "t1": turn.end,
                         "text": turn.text,
-                    }, self._stdout_lock)
+                    }, self._stdout_writer)
                     last_emitted_t1 = max(last_emitted_t1, turn.end)
 
             if not finalize:
@@ -327,7 +355,7 @@ class TranscriptEmitter:
                             "stream": stream_name,
                             "t0": last_turn.start,
                             "text": last_turn.text,
-                        }, self._stdout_lock)
+                        }, self._stdout_writer)
                         last_partial = partial
 
             self._last_emitted_t1_by_stream[stream_key] = last_emitted_t1
@@ -439,7 +467,7 @@ class LiveProcessor:
             "stream": self._stream_name,
             "duration": duration,
             "finalize": finalize,
-        }, self._state.stdout_lock)
+        }, self._state.stdout_writer)
 
         temp_wav = write_wav_chunk(snapshot, self._output_dir, start_byte=read_start_byte)
         if not temp_wav:
@@ -459,7 +487,7 @@ class LiveProcessor:
                     verbose=self._verbose,
                 )
         except Exception as exc:
-            emit_jsonl({"type": "error", "message": str(exc)}, self._state.stdout_lock)
+            emit_jsonl({"type": "error", "message": str(exc)}, self._state.stdout_writer)
             return False
         finally:
             temp_wav.unlink(missing_ok=True)
@@ -471,7 +499,7 @@ class LiveProcessor:
             "duration": duration,
             "turns": len(merged.turns),
             "finalize": finalize,
-        }, self._state.stdout_lock)
+        }, self._state.stdout_writer)
 
         self._emitter.emit_transcript(merged, duration, finalize=finalize, stream_name=self._stream_name)
         self._last_processed_duration = max(self._last_processed_duration, duration)
@@ -480,9 +508,9 @@ class LiveProcessor:
 
 
 class BackendState:
-    def __init__(self, stdout_lock: threading.Lock) -> None:
+    def __init__(self, stdout_writer: StdoutWriter) -> None:
         self.lock = threading.Lock()
-        self.stdout_lock = stdout_lock
+        self.stdout_writer = stdout_writer
         self.system_writer: Optional[StreamWriter] = None
         self.mic_writer: Optional[StreamWriter] = None
         self.sample_rate: int = 48000
@@ -540,14 +568,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gap-threshold",
         type=float,
-        default=0.8,
-        help="Gap threshold seconds for speaker turns (default: 0.8)",
+        default=DEFAULT_GAP_THRESHOLD_SECONDS,
+        help=f"Gap threshold seconds for speaker turns (default: {DEFAULT_GAP_THRESHOLD_SECONDS})",
     )
     parser.add_argument(
         "--speaker-tolerance",
         type=float,
-        default=0.25,
-        help="Tolerance seconds for word-speaker assignment (default: 0.25)",
+        default=DEFAULT_SPEAKER_TOLERANCE_SECONDS,
+        help=f"Tolerance seconds for word-speaker assignment (default: {DEFAULT_SPEAKER_TOLERANCE_SECONDS})",
     )
     parser.add_argument(
         "--live-interval",
@@ -601,9 +629,9 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stdout_lock = threading.Lock()
-    state = BackendState(stdout_lock)
-    emitter = TranscriptEmitter(stdout_lock, finalize_lag=args.finalize_lag)
+    stdout_writer = StdoutWriter()
+    state = BackendState(stdout_writer)
+    emitter = TranscriptEmitter(stdout_writer, finalize_lag=args.finalize_lag)
 
     transcribe_streams = ["system", "mic"] if args.transcribe_stream == "both" else [args.transcribe_stream]
     live_processors = {}
@@ -645,10 +673,18 @@ def main() -> int:
                 state.sample_rate = int(meeting_meta.get("sample_rate", 48000))
                 state.channels = int(meeting_meta.get("channels", 1))
 
-                state.system_sample_rate = int(meeting_meta.get("system_sample_rate", state.sample_rate))
-                state.system_channels = int(meeting_meta.get("system_channels", state.channels))
-                state.mic_sample_rate = int(meeting_meta.get("mic_sample_rate", state.sample_rate))
-                state.mic_channels = int(meeting_meta.get("mic_channels", state.channels))
+                state.system_sample_rate = int(
+                    meeting_meta.get("system_sample_rate", meeting_meta.get("sample_rate", state.sample_rate))
+                )
+                state.system_channels = int(
+                    meeting_meta.get("system_channels", meeting_meta.get("channels", state.channels))
+                )
+                state.mic_sample_rate = int(
+                    meeting_meta.get("mic_sample_rate", meeting_meta.get("sample_rate", state.sample_rate))
+                )
+                state.mic_channels = int(
+                    meeting_meta.get("mic_channels", meeting_meta.get("channels", state.channels))
+                )
 
                 state.system_writer = open_stream_writer(
                     output_dir / "system.wav",
@@ -661,7 +697,7 @@ def main() -> int:
                     state.mic_channels
                 )
 
-            emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_lock)
+            emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_writer)
 
         elif msg_type == MSG_AUDIO:
             t = pts_us / 1_000_000.0
@@ -675,7 +711,7 @@ def main() -> int:
                         state.system_channels
                     )
                     if args.emit_meters:
-                        emit_jsonl({"type": "meter", "stream": "system", "t": t, "rms": rms_int16(payload)}, stdout_lock)
+                        emit_jsonl({"type": "meter", "stream": "system", "t": t, "rms": rms_int16(payload)}, stdout_writer)
                     if not args.no_live and "system" in live_processors:
                         duration = state.system_writer.last_sample_index / float(state.system_sample_rate)
                         live_processors["system"].notify_duration(duration)
@@ -688,7 +724,7 @@ def main() -> int:
                         state.mic_channels
                     )
                     if args.emit_meters:
-                        emit_jsonl({"type": "meter", "stream": "mic", "t": t, "rms": rms_int16(payload)}, stdout_lock)
+                        emit_jsonl({"type": "meter", "stream": "mic", "t": t, "rms": rms_int16(payload)}, stdout_writer)
                     if not args.no_live and "mic" in live_processors:
                         duration = state.mic_writer.last_sample_index / float(state.mic_sample_rate)
                         live_processors["mic"].notify_duration(duration)
@@ -696,10 +732,10 @@ def main() -> int:
         elif msg_type == MSG_SCREENSHOT_EVENT:
             if payload:
                 evt = json.loads(payload.decode("utf-8"))
-                emit_jsonl({"type": "screenshot", **evt}, stdout_lock)
+                emit_jsonl({"type": "screenshot", **evt}, stdout_writer)
 
         elif msg_type == MSG_MEETING_STOP:
-            emit_jsonl({"type": "status", "message": "meeting_stopped"}, stdout_lock)
+            emit_jsonl({"type": "status", "message": "meeting_stopped"}, stdout_writer)
             break
 
     if not args.no_live:
@@ -723,7 +759,7 @@ def main() -> int:
             emit_jsonl({
                 "type": "error",
                 "message": f"no_audio_for_stream_{stream_name}",
-            }, stdout_lock)
+            }, stdout_writer)
             continue
         had_audio = True
 
@@ -744,7 +780,7 @@ def main() -> int:
             snapshot = snapshot_stream(writer, sample_rate, channels)
             temp_wav = write_wav_from_pcm(snapshot, output_dir)
             if not temp_wav:
-                emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_lock)
+                emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_writer)
                 continue
 
             try:
@@ -761,7 +797,7 @@ def main() -> int:
                         verbose=args.verbose,
                     )
             except Exception as exc:
-                emit_jsonl({"type": "error", "message": str(exc)}, stdout_lock)
+                emit_jsonl({"type": "error", "message": str(exc)}, stdout_writer)
                 continue
             finally:
                 temp_wav.unlink(missing_ok=True)
@@ -788,6 +824,7 @@ def main() -> int:
         if mic_writer:
             mic_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
 
+    stdout_writer.close()
     return 0
 
 

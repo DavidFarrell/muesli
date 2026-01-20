@@ -4,13 +4,15 @@ import Combine
 // MARK: - Transcript Model
 
 struct TranscriptSegment: Identifiable {
-    var id: String { "\(stream)_\(Int(round(t0 * 1000)))" }
+    let id: UUID = UUID()
     let speakerID: String
     let stream: String
     let t0: Double
     let t1: Double?
     let text: String
     let isPartial: Bool
+
+    var logicKey: String { "\(stream)_\(Int(round(t0 * 1000)))" }
 }
 
 @MainActor
@@ -121,9 +123,14 @@ final class TranscriptModel: ObservableObject {
                 text: text,
                 isPartial: false
             )
-            var updated = segments.filter { !$0.isPartial }
-            updated = mergeSegment(segment, into: updated)
-            segments = sortedSegments(updated)
+            let existing = segments.filter { !$0.isPartial }
+            let lastT0 = existing.last?.t0 ?? -Double.infinity
+            var updated = mergeSegment(segment, into: existing)
+            if segment.t0 >= lastT0 {
+                segments = updated
+            } else {
+                segments = sortedSegments(updated)
+            }
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text
@@ -142,13 +149,18 @@ final class TranscriptModel: ObservableObject {
                 text: text,
                 isPartial: true
             )
+            let lastT0 = segments.last?.t0 ?? -Double.infinity
             var updated = segments
             if let idx = updated.lastIndex(where: { $0.isPartial && $0.stream == stream }) {
                 updated[idx] = segment
             } else {
                 updated.append(segment)
             }
-            segments = sortedSegments(updated)
+            if segment.t0 >= lastT0 {
+                segments = updated
+            } else {
+                segments = sortedSegments(updated)
+            }
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text

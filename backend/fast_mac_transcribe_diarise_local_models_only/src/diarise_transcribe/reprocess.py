@@ -13,6 +13,7 @@ from typing import Optional
 
 from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg
 from .asr import ASRModel, DEFAULT_MODEL
+from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
 from .diarisation import SortformerDiarizer
 from .merge import merge_transcript_with_diarisation
 from .senko_diarisation import SenkoDiarizer
@@ -156,14 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gap-threshold",
         type=float,
-        default=0.8,
-        help="Gap threshold in seconds (default: 0.8)",
+        default=DEFAULT_GAP_THRESHOLD_SECONDS,
+        help=f"Gap threshold in seconds (default: {DEFAULT_GAP_THRESHOLD_SECONDS})",
     )
     parser.add_argument(
         "--speaker-tolerance",
         type=float,
-        default=0.25,
-        help="Tolerance in seconds for word-speaker assignment (default: 0.25)",
+        default=DEFAULT_SPEAKER_TOLERANCE_SECONDS,
+        help=f"Tolerance in seconds for word-speaker assignment (default: {DEFAULT_SPEAKER_TOLERANCE_SECONDS})",
     )
     parser.add_argument(
         "--verbose", "-v",

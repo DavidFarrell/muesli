@@ -14,6 +14,7 @@ from typing import Optional
 
 from .audio import normalise_audio, check_ffmpeg, get_audio_duration
 from .asr import ASRModel, DEFAULT_MODEL
+from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
 from .diarisation import SortformerDiarizer, MODEL_CONFIGS, DiarSegment
 from .merge import (
     merge_transcript_with_diarisation,
@@ -117,14 +118,14 @@ Examples:
     parser.add_argument(
         "--gap-threshold",
         type=float,
-        default=0.8,
-        help="Gap threshold (seconds) for turn splitting (default: 0.8)",
+        default=DEFAULT_GAP_THRESHOLD_SECONDS,
+        help=f"Gap threshold (seconds) for turn splitting (default: {DEFAULT_GAP_THRESHOLD_SECONDS})",
     )
     parser.add_argument(
         "--speaker-tolerance",
         type=float,
-        default=0.25,
-        help="Tolerance (seconds) for word-to-speaker assignment (default: 0.25)",
+        default=DEFAULT_SPEAKER_TOLERANCE_SECONDS,
+        help=f"Tolerance (seconds) for word-to-speaker assignment (default: {DEFAULT_SPEAKER_TOLERANCE_SECONDS})",
     )
 
     # Debug options
@@ -153,8 +154,8 @@ def run_pipeline(
     asr_model: str = DEFAULT_MODEL,
     language: Optional[str] = None,
     num_speakers: Optional[int] = None,
-    gap_threshold: float = 0.8,
-    speaker_tolerance: float = 0.25,
+    gap_threshold: float = DEFAULT_GAP_THRESHOLD_SECONDS,
+    speaker_tolerance: float = DEFAULT_SPEAKER_TOLERANCE_SECONDS,
     keep_temp: bool = False,
     verbose: bool = False,
 ) -> None:

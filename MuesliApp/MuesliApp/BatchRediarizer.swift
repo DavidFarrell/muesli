@@ -56,6 +56,24 @@ actor BatchRediarizer {
         let duration: Double
     }
 
+    private actor ProcessStore {
+        private var process: BackendProcess?
+
+        func set(_ process: BackendProcess) {
+            self.process = process
+        }
+
+        func clear() {
+            process = nil
+        }
+
+        func terminate() {
+            process?.terminate()
+            process?.cleanup()
+            process = nil
+        }
+    }
+
     private let timeoutSeconds: Double = 60 * 60
 
     func run(
@@ -65,7 +83,7 @@ actor BatchRediarizer {
         stream: Stream,
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> Result {
-        var process: BackendProcess?
+        let processStore = ProcessStore()
 
         return try await withTaskCancellationHandler(operation: {
             let command = [
@@ -78,7 +96,8 @@ actor BatchRediarizer {
             ]
             let env = backendEnvironment(root: backendRoot)
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: env)
-            process = backend
+            await processStore.set(backend)
+            try Task.checkCancellation()
 
             var capturedResult: Result?
             var capturedError: String?
@@ -106,6 +125,7 @@ actor BatchRediarizer {
             try backend.start()
             let exitStatus = await backend.waitForExit(timeoutSeconds: timeoutSeconds)
             backend.cleanup()
+            await processStore.clear()
 
             if Task.isCancelled {
                 throw CancellationError()
@@ -147,8 +167,7 @@ actor BatchRediarizer {
             progressHandler?(.complete)
             return result
         }, onCancel: {
-            process?.terminate()
-            process?.cleanup()
+            Task { await processStore.terminate() }
         })
     }
 

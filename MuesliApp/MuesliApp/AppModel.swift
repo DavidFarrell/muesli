@@ -122,7 +122,23 @@ final class AppModel: ObservableObject {
     private var backendAccessURL: URL?
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
-    private let defaultBackendProjectRoot = URL(fileURLWithPath: "/Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only")
+    private var defaultBackendProjectRoot: URL? {
+        if let envPath = ProcessInfo.processInfo.environment["MUESLI_BACKEND_ROOT"],
+           !envPath.isEmpty {
+            let url = URL(fileURLWithPath: envPath)
+            if FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        #if DEBUG
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let candidate = cwd.appendingPathComponent("backend/fast_mac_transcribe_diarise_local_models_only")
+        if FileManager.default.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+        #endif
+        return nil
+    }
     private var transcriptCancellable: AnyCancellable?
 
     @Published var backendFolderURL: URL?
@@ -283,7 +299,9 @@ final class AppModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.directoryURL = defaultBackendProjectRoot.deletingLastPathComponent()
+        if let defaultBackendProjectRoot {
+            panel.directoryURL = defaultBackendProjectRoot.deletingLastPathComponent()
+        }
         panel.message = "Select the fast_mac_transcribe_diarise_local_models_only folder."
         if panel.runModal() == .OK, let url = panel.url {
             do {
@@ -358,6 +376,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func handleBackendWriteError(_ error: Error) {
+        guard isCapturing else { return }
+        let message = "Backend connection lost: \(error.localizedDescription)"
+        shareableContentError = message
+        appendBackendLog(message, toTail: true)
+        Task { await stopMeeting() }
+    }
+
     private func handleBackendJSONLine(_ line: String) {
         if let data = (line + "\n").data(using: .utf8) {
             transcriptEventsHandle?.write(data)
@@ -389,51 +415,65 @@ final class AppModel: ObservableObject {
         transcriptModel.ingest(jsonLine: line)
     }
 
+    private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
+        segments
+            .filter { !$0.isPartial }
+            .compactMap { seg -> String? in
+                let payload: [String: Any] = [
+                    "speaker_id": seg.speakerID,
+                    "stream": seg.stream,
+                    "t0": seg.t0,
+                    "t1": seg.t1 ?? seg.t0,
+                    "text": seg.text
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let line = String(data: data, encoding: .utf8) {
+                    return line
+                }
+                return nil
+            }
+            .joined(separator: "\n")
+    }
+
+    private func writeTranscriptData(
+        _ data: Data?,
+        to url: URL,
+        encodeFailure: String,
+        writeFailure: String
+    ) {
+        guard let data else {
+            appendBackendLog(encodeFailure, toTail: true)
+            return
+        }
+        do {
+            try data.write(to: url)
+        } catch {
+            appendBackendLog("\(writeFailure): \(error.localizedDescription)", toTail: true)
+        }
+    }
+
     private func saveTranscriptFiles(for session: MeetingSession) {
-        let finalized = transcriptModel.segments.filter { !$0.isPartial }
         let jsonlURL = session.folderURL.appendingPathComponent("transcript.jsonl")
         let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
 
-        var jsonlLines: [String] = []
-        for seg in finalized {
-            let payload: [String: Any] = [
-                "speaker_id": seg.speakerID,
-                "stream": seg.stream,
-                "t0": seg.t0,
-                "t1": seg.t1 ?? seg.t0,
-                "text": seg.text
-            ]
-            if let data = try? JSONSerialization.data(withJSONObject: payload),
-               let line = String(data: data, encoding: .utf8) {
-                jsonlLines.append(line)
-            }
-        }
-
-        let jsonlString = jsonlLines.joined(separator: "\n")
+        let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
         let textString = transcriptModel.asPlainText()
 
         let jsonlData = jsonlString.data(using: .utf8)
         let textData = textString.data(using: .utf8)
 
-        if let jsonlData {
-            do {
-                try jsonlData.write(to: jsonlURL)
-            } catch {
-                appendBackendLog("Failed to save transcript JSONL: \(error.localizedDescription)", toTail: true)
-            }
-        } else {
-            appendBackendLog("Failed to encode transcript JSONL.", toTail: true)
-        }
-
-        if let textData {
-            do {
-                try textData.write(to: txtURL)
-            } catch {
-                appendBackendLog("Failed to save transcript text: \(error.localizedDescription)", toTail: true)
-            }
-        } else {
-            appendBackendLog("Failed to encode transcript text.", toTail: true)
-        }
+        writeTranscriptData(
+            jsonlData,
+            to: jsonlURL,
+            encodeFailure: "Failed to encode transcript JSONL.",
+            writeFailure: "Failed to save transcript JSONL"
+        )
+        writeTranscriptData(
+            textData,
+            to: txtURL,
+            encodeFailure: "Failed to encode transcript text.",
+            writeFailure: "Failed to save transcript text"
+        )
 
         let tempBase = FileManager.default.temporaryDirectory
         let tempFolder = tempBase.appendingPathComponent("Muesli-\(session.title)-\(UUID().uuidString)")
@@ -470,42 +510,22 @@ final class AppModel: ObservableObject {
             let targetDir = url.deletingLastPathComponent()
 
             let textString = transcriptModel.asPlainText()
-            if let textData = textString.data(using: .utf8) {
-                do {
-                    try textData.write(to: url)
-                } catch {
-                    appendBackendLog("Failed to export transcript text: \(error.localizedDescription)", toTail: true)
-                }
-            } else {
-                appendBackendLog("Failed to encode exported transcript text.", toTail: true)
-            }
+            let textData = textString.data(using: .utf8)
+            writeTranscriptData(
+                textData,
+                to: url,
+                encodeFailure: "Failed to encode exported transcript text.",
+                writeFailure: "Failed to export transcript text"
+            )
 
-            let jsonlString = transcriptModel.segments
-                .filter { !$0.isPartial }
-                .compactMap { seg -> String? in
-                    let payload: [String: Any] = [
-                        "speaker_id": seg.speakerID,
-                        "stream": seg.stream,
-                        "t0": seg.t0,
-                        "t1": seg.t1 ?? seg.t0,
-                        "text": seg.text
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: payload),
-                       let line = String(data: data, encoding: .utf8) {
-                        return line
-                    }
-                    return nil
-                }
-                .joined(separator: "\n")
-            if let jsonlData = jsonlString.data(using: .utf8) {
-                do {
-                    try jsonlData.write(to: jsonlURL)
-                } catch {
-                    appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
-                }
-            } else {
-                appendBackendLog("Failed to encode exported transcript JSONL.", toTail: true)
-            }
+            let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
+            let jsonlData = jsonlString.data(using: .utf8)
+            writeTranscriptData(
+                jsonlData,
+                to: jsonlURL,
+                encodeFailure: "Failed to encode exported transcript JSONL.",
+                writeFailure: "Failed to export transcript JSONL"
+            )
 
             appendBackendLog("Transcript exported to \(targetDir.path).", toTail: true)
         }
@@ -611,34 +631,7 @@ final class AppModel: ObservableObject {
 
     @MainActor
     func refreshSpeakerIdStatus(modelName: String = "gemma3:27b") async {
-        let url = URL(string: "http://localhost:11434/api/tags")!
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 3
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                speakerIdStatus = .error("invalid response")
-                return
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                speakerIdStatus = .error("status \(http.statusCode)")
-                return
-            }
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let models = json["models"] as? [[String: Any]] else {
-                speakerIdStatus = .error("invalid payload")
-                return
-            }
-            let hasModel = models.contains { ($0["name"] as? String) == modelName }
-            speakerIdStatus = hasModel ? .ready : .modelMissing(modelName)
-        } catch {
-            if let urlError = error as? URLError, urlError.code == .cannotConnectToHost {
-                speakerIdStatus = .ollamaNotRunning
-            } else {
-                speakerIdStatus = .error(error.localizedDescription)
-            }
-        }
+        speakerIdStatus = await SpeakerIdentifier.checkAvailability(modelName: modelName)
     }
 
     @MainActor
@@ -893,6 +886,11 @@ final class AppModel: ObservableObject {
                     }
                 }
                 let createdWriter = FramedWriter(stdinHandle: backend.stdin)
+                createdWriter.onWriteError = { [weak self] error in
+                    Task { @MainActor in
+                        self?.handleBackendWriteError(error)
+                    }
+                }
                 self.writer = createdWriter
                 writer = createdWriter
 
@@ -1018,7 +1016,7 @@ final class AppModel: ObservableObject {
             backend?.terminate()
         }
         backend?.cleanup()
-        stdoutTask?.cancel()
+        await waitForStdoutDrain(timeoutSeconds: 2.0)
         stdoutTask = nil
         backend = nil
         if let session = currentSession {
@@ -1040,6 +1038,26 @@ final class AppModel: ObservableObject {
         activeScreen = .start
     }
 
+    private func waitForStdoutDrain(timeoutSeconds: Double) async {
+        guard let task = stdoutTask else { return }
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await task.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+        if !finished {
+            task.cancel()
+        }
+    }
+
     static func defaultMeetingTitle() -> String {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
@@ -1048,7 +1066,10 @@ final class AppModel: ObservableObject {
 
     private func normaliseMeetingTitle(_ s: String) -> String {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? Self.defaultMeetingTitle() : trimmed
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ")
+        let filtered = trimmed.components(separatedBy: allowed.inverted).joined()
+        let collapsed = filtered.split(whereSeparator: { $0 == " " }).joined(separator: " ")
+        return collapsed.isEmpty ? Self.defaultMeetingTitle() : collapsed
     }
 
     private func createMeetingFolder(title: String) throws -> URL {
@@ -1343,30 +1364,23 @@ final class AppModel: ObservableObject {
         let jsonlURL = folderURL.appendingPathComponent("transcript.jsonl")
         let txtURL = folderURL.appendingPathComponent("transcript.txt")
 
-        let jsonlLines = segments.map { seg -> String in
-            let payload: [String: Any] = [
-                "speaker_id": seg.speakerID,
-                "stream": seg.stream,
-                "t0": seg.t0,
-                "t1": seg.t1 ?? seg.t0,
-                "text": seg.text
-            ]
-            if let data = try? JSONSerialization.data(withJSONObject: payload),
-               let line = String(data: data, encoding: .utf8) {
-                return line
-            }
-            return ""
-        }.filter { !$0.isEmpty }
-
-        let jsonlString = jsonlLines.joined(separator: "\n")
+        let jsonlString = buildTranscriptJSONL(from: segments)
         let textString = transcriptModel.asPlainText()
+        let jsonlData = jsonlString.data(using: .utf8)
+        let textData = textString.data(using: .utf8)
 
-        if let jsonlData = jsonlString.data(using: .utf8) {
-            try? jsonlData.write(to: jsonlURL)
-        }
-        if let textData = textString.data(using: .utf8) {
-            try? textData.write(to: txtURL)
-        }
+        writeTranscriptData(
+            jsonlData,
+            to: jsonlURL,
+            encodeFailure: "Failed to encode transcript JSONL.",
+            writeFailure: "Failed to write transcript JSONL"
+        )
+        writeTranscriptData(
+            textData,
+            to: txtURL,
+            encodeFailure: "Failed to encode transcript text.",
+            writeFailure: "Failed to write transcript text"
+        )
     }
 
     private func updateMeetingMetadataAfterRediarization(
@@ -1561,51 +1575,29 @@ final class AppModel: ObservableObject {
             let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
 
             let transcriptURL = meeting.folderURL.appendingPathComponent("transcript.jsonl")
-            if FileManager.default.fileExists(atPath: transcriptURL.path) {
-                if let jsonlData = try? Data(contentsOf: transcriptURL) {
-                    do {
-                        try jsonlData.write(to: jsonlURL)
-                    } catch {
-                        appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
-                    }
-                }
+            let jsonlData: Data?
+            if FileManager.default.fileExists(atPath: transcriptURL.path),
+               let diskData = try? Data(contentsOf: transcriptURL) {
+                jsonlData = diskData
             } else {
-                let jsonlString = transcriptModel.segments
-                    .filter { !$0.isPartial }
-                    .compactMap { seg -> String? in
-                        let payload: [String: Any] = [
-                            "speaker_id": seg.speakerID,
-                            "stream": seg.stream,
-                            "t0": seg.t0,
-                            "t1": seg.t1 ?? seg.t0,
-                            "text": seg.text
-                        ]
-                        if let data = try? JSONSerialization.data(withJSONObject: payload),
-                           let line = String(data: data, encoding: .utf8) {
-                            return line
-                        }
-                        return nil
-                    }
-                    .joined(separator: "\n")
-                if let jsonlData = jsonlString.data(using: .utf8) {
-                    do {
-                        try jsonlData.write(to: jsonlURL)
-                    } catch {
-                        appendBackendLog("Failed to export transcript JSONL: \(error.localizedDescription)", toTail: true)
-                    }
-                }
+                let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
+                jsonlData = jsonlString.data(using: .utf8)
             }
+            writeTranscriptData(
+                jsonlData,
+                to: jsonlURL,
+                encodeFailure: "Failed to encode exported transcript JSONL.",
+                writeFailure: "Failed to export transcript JSONL"
+            )
 
             let textString = transcriptModel.asPlainText()
-            if let textData = textString.data(using: .utf8) {
-                do {
-                    try textData.write(to: url)
-                } catch {
-                    appendBackendLog("Failed to export transcript text: \(error.localizedDescription)", toTail: true)
-                }
-            } else {
-                appendBackendLog("Failed to encode exported transcript text.", toTail: true)
-            }
+            let textData = textString.data(using: .utf8)
+            writeTranscriptData(
+                textData,
+                to: url,
+                encodeFailure: "Failed to encode exported transcript text.",
+                writeFailure: "Failed to export transcript text"
+            )
         }
     }
 
