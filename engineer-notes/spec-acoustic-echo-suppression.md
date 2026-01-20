@@ -25,9 +25,11 @@ Two-part fix:
 
 ### Logic
 
-When a segment arrives, check if it's an echo:
+When a final segment arrives, check if it's an echo:
 - **Mic segments echoing System**: If a mic segment arrives within 1.0 second of a system segment with similar text, drop the mic segment (trust System as authoritative)
 - **Retroactive cleanup**: When a system segment arrives, check if any recent mic segments were actually echoes and remove them
+- **Finals only**: Echo suppression runs only for `segment` (final) events, not for `partial` updates
+- **Short phrases**: Small identical phrases may be suppressed; this is acceptable to reduce duplication
 
 ### Implementation
 
@@ -72,6 +74,7 @@ private let echoTimeWindowSeconds: Double = 1.0
 private func isEcho(_ segment: TranscriptSegment) -> Bool {
     // Only mic segments can be echoes of system
     guard segment.stream == "mic" else { return false }
+    guard echoSuppressionEnabled else { return false }
 
     // Look for system segments within the time window
     return segments.contains { existing in
@@ -84,6 +87,7 @@ private func isEcho(_ segment: TranscriptSegment) -> Bool {
 /// Remove mic segments that are echoes of a newly arrived system segment
 private func removeEchoes(causedBy systemSegment: TranscriptSegment) {
     guard systemSegment.stream == "system" else { return }
+    guard echoSuppressionEnabled else { return }
 
     let countBefore = segments.count
     segments.removeAll { existing in
@@ -94,14 +98,14 @@ private func removeEchoes(causedBy systemSegment: TranscriptSegment) {
 
     let removed = countBefore - segments.count
     if removed > 0 {
-        print("[Echo] Removed \(removed) mic echo(es) matching system segment at t=\(systemSegment.t0)")
+        // Optional debug logging (avoid printing transcript text).
     }
 }
 ```
 
 #### 3. Integrate into ingest()
 
-In the `case "segment":` branch, after creating the segment but before merging:
+In the `case "segment":` branch, after creating the segment but before merging (do not apply this to `partial` events):
 
 ```swift
 case "segment":
@@ -109,7 +113,6 @@ case "segment":
 
     // Echo suppression: drop if mic echoing system
     if isEcho(segment) {
-        print("[Echo] Dropping mic echo: \"\(segment.text.prefix(50))...\" at t=\(segment.t0)")
         return
     }
 
@@ -176,7 +179,6 @@ if transcribeSystem && transcribeMic {
    - Play audio from speakers (e.g., YouTube)
    - Have mic enabled alongside system
    - Verify system segments appear, mic echoes are dropped
-   - Check console for "[Echo] Dropping..." logs
 
 2. **Timing window is correct**
    - Echo within 1.0s of system → dropped

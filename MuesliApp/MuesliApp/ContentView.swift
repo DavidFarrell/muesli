@@ -284,6 +284,16 @@ struct NewMeetingView: View {
                         .disabled(!model.transcribeMic)
                     Toggle("Microphone", isOn: $model.transcribeMic)
                         .disabled(!model.transcribeSystem)
+                    if model.transcribeSystem && model.transcribeMic {
+                        HStack(spacing: 8) {
+                            Image(systemName: "speaker.wave.2.bubble.left")
+                                .foregroundStyle(.orange)
+                            Text("Using speakers? Headphones prevent duplicate transcription.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
                     Text("At least one source must be selected.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)

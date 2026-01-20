@@ -15,6 +15,28 @@ struct TranscriptSegment: Identifiable {
     var logicKey: String { "\(stream)_\(Int(round(t0 * 1000)))" }
 }
 
+extension String {
+    func isEchoOf(_ other: String) -> Bool {
+        let s1 = self.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let s2 = other.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !s1.isEmpty, !s2.isEmpty else { return false }
+
+        if s1.count >= 5 && s2.contains(s1) { return true }
+        if s2.count >= 5 && s1.contains(s2) { return true }
+
+        let words1 = Set(s1.split(separator: " ").map(String.init))
+        let words2 = Set(s2.split(separator: " ").map(String.init))
+
+        guard !words1.isEmpty, !words2.isEmpty else { return false }
+
+        let intersection = words1.intersection(words2)
+        let smaller = min(words1.count, words2.count)
+
+        return Double(intersection.count) / Double(smaller) >= 0.7
+    }
+}
+
 @MainActor
 final class TranscriptModel: ObservableObject {
     var timestampOffset: Double = 0
@@ -22,6 +44,9 @@ final class TranscriptModel: ObservableObject {
     @Published var speakerNames: [String: String] = [:]
     @Published var lastTranscriptAt: Date?
     @Published var lastTranscriptText: String = ""
+    var echoSuppressionEnabled: Bool = true
+
+    private let echoTimeWindowSeconds: Double = 1.0
 
     func displayName(for speakerID: String) -> String {
         speakerNames[speakerID] ?? speakerID
@@ -99,6 +124,30 @@ final class TranscriptModel: ObservableObject {
         items.sorted { $0.t0 < $1.t0 }
     }
 
+    private func isEcho(_ segment: TranscriptSegment) -> Bool {
+        guard echoSuppressionEnabled else { return false }
+        guard segment.stream == "mic" else { return false }
+
+        return segments.contains { existing in
+            !existing.isPartial &&
+            existing.stream == "system" &&
+            abs(existing.t0 - segment.t0) < echoTimeWindowSeconds &&
+            segment.text.isEchoOf(existing.text)
+        }
+    }
+
+    private func removeEchoes(causedBy systemSegment: TranscriptSegment) {
+        guard echoSuppressionEnabled else { return }
+        guard systemSegment.stream == "system" else { return }
+
+        segments.removeAll { existing in
+            !existing.isPartial &&
+            existing.stream == "mic" &&
+            abs(existing.t0 - systemSegment.t0) < echoTimeWindowSeconds &&
+            existing.text.isEchoOf(systemSegment.text)
+        }
+    }
+
     func ingest(jsonLine: String) {
         guard let data = jsonLine.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -123,6 +172,12 @@ final class TranscriptModel: ObservableObject {
                 text: text,
                 isPartial: false
             )
+            if isEcho(segment) {
+                return
+            }
+            if segment.stream == "system" {
+                removeEchoes(causedBy: segment)
+            }
             let existing = segments.filter { !$0.isPartial }
             let lastT0 = existing.last?.t0 ?? -Double.infinity
             var updated = mergeSegment(segment, into: existing)
