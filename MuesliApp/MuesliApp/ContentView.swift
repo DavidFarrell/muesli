@@ -151,7 +151,9 @@ struct NewMeetingView: View {
             Text("New meeting")
                 .font(.largeTitle).bold()
 
-            HStack(spacing: 12) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 12) {
                 Text("Title")
                     .frame(width: 60, alignment: .leading)
                 TextField("YYYY_MM_DD - Meeting n -", text: $model.meetingTitle)
@@ -389,11 +391,14 @@ struct NewMeetingView: View {
                 }
             }
 
-            if model.shouldShowOnboarding {
-                Text("Permissions are missing. Use the toolbar Permissions button or onboarding to grant them.")
-                    .foregroundStyle(.secondary)
+                    if model.shouldShowOnboarding {
+                        Text("Permissions are missing. Use the toolbar Permissions button or onboarding to grant them.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
+        .frame(maxHeight: .infinity, alignment: .top)
         .padding(24)
         .alert("Delete meeting?", isPresented: $showDeleteConfirm) {
             Button("Delete", role: .destructive) {
