@@ -385,7 +385,7 @@ struct NewMeetingView: View {
                         }
                         .padding(.vertical, 6)
                     }
-                    .frame(maxHeight: 200)
+                    .frame(maxHeight: 150)
                 }
             }
 
