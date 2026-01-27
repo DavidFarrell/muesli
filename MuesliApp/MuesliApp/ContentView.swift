@@ -151,7 +151,7 @@ struct NewMeetingView: View {
             Text("New meeting")
                 .font(.largeTitle).bold()
 
-            ScrollView {
+            ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 12) {
                 Text("Title")
@@ -396,6 +396,7 @@ struct NewMeetingView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
