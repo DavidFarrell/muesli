@@ -95,16 +95,42 @@ actor SpeakerIdentifier {
         screenshots: [URL],
         transcript: String,
         speakerIds: [String],
+        userHint: String? = nil,
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> IdentificationResult {
+        // DEBUG: Log inputs
+        print("[SpeakerID DEBUG] === Starting speaker identification ===")
+        print("[SpeakerID DEBUG] Screenshots count: \(screenshots.count)")
+        print("[SpeakerID DEBUG] Speaker IDs: \(speakerIds)")
+        print("[SpeakerID DEBUG] Transcript length: \(transcript.count) chars")
+        print("[SpeakerID DEBUG] User hint: \(userHint ?? "(none)")")
+
         progressHandler?(.extractingFrames)
         try Task.checkCancellation()
         let selectedScreenshots = selectScreenshots(from: screenshots, targetCount: targetScreenshotCount)
+        print("[SpeakerID DEBUG] Selected \(selectedScreenshots.count) screenshots")
+
         let imagePayloads = try loadImagePayloads(from: selectedScreenshots)
+        print("[SpeakerID DEBUG] Loaded \(imagePayloads.count) image payloads")
+
         progressHandler?(.analyzing)
-        let prompt = buildPrompt(transcript: transcript, speakerIds: speakerIds)
+        let sampledTranscript = sampleTranscript(transcript, speakerIds: speakerIds)
+        print("[SpeakerID DEBUG] Sampled transcript: \(transcript.components(separatedBy: .newlines).count) lines -> \(sampledTranscript.components(separatedBy: .newlines).count) lines")
+        print("[SpeakerID DEBUG] Sampled transcript preview (first 1000 chars):")
+        print(String(sampledTranscript.prefix(1000)))
+        print("[SpeakerID DEBUG] ---")
+
+        let prompt = buildPrompt(transcript: transcript, speakerIds: speakerIds, userHint: userHint)
+        print("[SpeakerID DEBUG] Built prompt (\(prompt.count) chars)")
+        print("[SpeakerID DEBUG] Prompt speaker list section:")
+        // Print just the speaker list part
+        for id in speakerIds {
+            print("[SpeakerID DEBUG]   \(id) = ?")
+        }
+
         let rawResponse = try await requestOllama(images: imagePayloads, prompt: prompt)
         let mappings = parseMappings(from: rawResponse)
+        print("[SpeakerID DEBUG] === Identification complete: \(mappings.count) mappings ===")
         progressHandler?(.complete)
         return IdentificationResult(mappings: mappings, rawResponse: rawResponse)
     }
@@ -348,36 +374,248 @@ actor SpeakerIdentifier {
         return rep.representation(using: .jpeg, properties: [.compressionFactor: quality])
     }
 
-    private func buildPrompt(transcript: String, speakerIds: [String]) -> String {
-        let speakerList = speakerIds.map { "\($0) = [name]" }.joined(separator: "\n")
+    private let maxTranscriptLines = 40
+    private let linesPerSpeaker = 3
+
+    /// Sample transcript to get representative lines for each speaker while staying within limits.
+    /// Strategy:
+    /// 1. For each speaker, collect lines where they speak
+    /// 2. Sample evenly from beginning, middle, end for each speaker
+    /// 3. Also include lines that mention names (greetings, introductions)
+    /// 4. Sort final selection by timestamp
+    private func sampleTranscript(_ transcript: String, speakerIds: [String]) -> String {
+        let lines = transcript.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return transcript }
+
+        // If already short enough, return as-is
+        if lines.count <= maxTranscriptLines {
+            return transcript
+        }
+
+        var selectedLines = Set<Int>()
+
+        // Group lines by speaker
+        var linesBySpeaker: [String: [Int]] = [:]
+        for speakerId in speakerIds {
+            linesBySpeaker[speakerId] = []
+        }
+
+        for (index, line) in lines.enumerated() {
+            for speakerId in speakerIds {
+                if line.contains(speakerId) {
+                    linesBySpeaker[speakerId, default: []].append(index)
+                    break
+                }
+            }
+        }
+
+        // For each speaker, sample evenly from their lines
+        for (_, indices) in linesBySpeaker {
+            guard !indices.isEmpty else { continue }
+            if indices.count <= linesPerSpeaker {
+                selectedLines.formUnion(indices)
+            } else {
+                // Sample from beginning, middle, end
+                selectedLines.insert(indices.first!)
+                selectedLines.insert(indices.last!)
+                let middleIndex = indices.count / 2
+                selectedLines.insert(indices[middleIndex])
+            }
+        }
+
+        // Also look for lines with potential name mentions (greetings, introductions)
+        let namePatterns = ["hey ", "hi ", "hello ", "thanks ", "thank you ", "bye ", "i'm ", "my name", "david", "nick", "brian", "bry", "col"]
+        for (index, line) in lines.enumerated() {
+            let lower = line.lowercased()
+            for pattern in namePatterns {
+                if lower.contains(pattern) {
+                    selectedLines.insert(index)
+                    break
+                }
+            }
+        }
+
+        // If we have too many, trim to maxTranscriptLines by sampling evenly
+        var finalIndices = Array(selectedLines).sorted()
+        if finalIndices.count > maxTranscriptLines {
+            let step = Double(finalIndices.count) / Double(maxTranscriptLines)
+            var sampled: [Int] = []
+            for i in 0..<maxTranscriptLines {
+                let idx = min(finalIndices.count - 1, Int(Double(i) * step))
+                sampled.append(finalIndices[idx])
+            }
+            finalIndices = sampled.sorted()
+        }
+
+        // Build result maintaining original order
+        let result = finalIndices.map { lines[$0] }.joined(separator: "\n")
+        let omitted = lines.count - finalIndices.count
+        if omitted > 0 {
+            return result + "\n[... \(omitted) more lines omitted ...]"
+        }
+        return result
+    }
+
+    private func buildPrompt(transcript: String, speakerIds: [String], userHint: String?) -> String {
+        let trimmedHint = userHint?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hintBlock: String
+        if let trimmedHint, !trimmedHint.isEmpty {
+            hintBlock = """
+
+            USER PROVIDED HINT:
+            \(trimmedHint)
+            """
+        } else {
+            hintBlock = ""
+        }
+
+        let hasSystem = speakerIds.contains { $0.lowercased().hasPrefix("system:") }
+        let hasMic = speakerIds.contains { $0.lowercased().hasPrefix("mic:") }
+        let mappingSpeakerIds: [String] = {
+            if hasSystem && hasMic {
+                let systemOnly = speakerIds.filter { $0.lowercased().hasPrefix("system:") }
+                return systemOnly.isEmpty ? speakerIds : systemOnly
+            }
+            if hasSystem {
+                let systemOnly = speakerIds.filter { $0.lowercased().hasPrefix("system:") }
+                return systemOnly.isEmpty ? speakerIds : systemOnly
+            }
+            if hasMic {
+                let micOnly = speakerIds.filter { $0.lowercased().hasPrefix("mic:") }
+                return micOnly.isEmpty ? speakerIds : micOnly
+            }
+            return speakerIds
+        }()
+        let speakerList = mappingSpeakerIds.map { "\($0) = ?" }.joined(separator: "\n")
+
+        let audioStreamsBlock: String
+        if hasMic && hasSystem {
+            audioStreamsBlock = """
+        AUDIO STREAMS EXPLAINED:
+        - "mic:SPEAKER_XX" = audio from the recorder's microphone (YOU are the recorder)
+        - "system:SPEAKER_XX" = audio from the call (everyone else comes through system audio)
+        """
+        } else if hasMic {
+            audioStreamsBlock = """
+        AUDIO STREAMS EXPLAINED:
+        - "mic:SPEAKER_XX" = audio from the microphone (all speakers are mic)
+        """
+        } else if hasSystem {
+            audioStreamsBlock = """
+        AUDIO STREAMS EXPLAINED:
+        - "system:SPEAKER_XX" = audio from the call (all speakers are system)
+        """
+        } else {
+            audioStreamsBlock = """
+        AUDIO STREAMS EXPLAINED:
+        - Speaker IDs are unprefixed (no mic/system stream label)
+        """
+        }
+
+        let stepsBlock: String
+        let mappingHeader: String
+        let importantBlock: String
+        if hasMic && hasSystem {
+            stepsBlock = """
+        STEP 2 - IDENTIFY THE RECORDER (CRITICAL):
+        Look at the transcript lines starting with "[mic]" - this is the recorder speaking.
+        The recorder is ONE of the people visible on screen.
+        To identify them: look for moments where other speakers address the recorder by name.
+        For example, if someone says "David, what do you think?" and mic:SPEAKER_01 responds, then David is the recorder.
+        IMPORTANT: Do NOT assign the recorder's name to any system:SPEAKER_XX. They only appear as mic:SPEAKER_XX.
+
+        STEP 3 - MATCH SYSTEM SPEAKERS:
+        The remaining participants (everyone EXCEPT the recorder) should map to system speaker IDs.
+        If you see 5 names on screen but only 4 system speakers, one of those names is the recorder - exclude them.
+        \(hintBlock)
+        """
+            mappingHeader = "Map each SYSTEM speaker to their real name:"
+            importantBlock = """
+        IMPORTANT:
+        - Only include system speakers in your JSON output. Do NOT include mic speakers.
+        - Use the EXACT speaker_id format shown above (including any prefix like "system:" or "mic:").
+        """
+        } else if hasMic {
+            stepsBlock = """
+        STEP 2 - MATCH MIC SPEAKERS:
+        All speakers are in the mic stream (no system audio). Map each mic speaker to their real name.
+        \(hintBlock)
+        """
+            mappingHeader = "Map each MIC speaker to their real name:"
+            importantBlock = """
+        IMPORTANT:
+        - Only include mic speakers in your JSON output. Do NOT invent system speaker IDs.
+        - Use the EXACT speaker_id format shown above (including any prefix like "mic:").
+        """
+        } else if hasSystem {
+            stepsBlock = """
+        STEP 2 - MATCH SYSTEM SPEAKERS:
+        Map each system speaker to their real name.
+        \(hintBlock)
+        """
+            mappingHeader = "Map each SYSTEM speaker to their real name:"
+            importantBlock = """
+        IMPORTANT:
+        - Only include system speakers in your JSON output.
+        - Use the EXACT speaker_id format shown above (including any prefix like "system:").
+        """
+        } else {
+            stepsBlock = """
+        STEP 2 - MATCH SPEAKERS:
+        Map each listed speaker ID to their real name.
+        \(hintBlock)
+        """
+            mappingHeader = "Map each speaker to their real name:"
+            importantBlock = """
+        IMPORTANT:
+        - Only include the listed speaker IDs in your JSON output.
+        - Use the EXACT speaker_id format shown above.
+        """
+        }
+
+        let transcriptClues: String = {
+            var lines = [
+                "- If someone says \"Hey [Name]\" or \"Hi [Name]\" -> speaker is NOT [Name] (talking TO them)",
+                "- If someone says \"Hi, I'm [Name]\" -> speaker IS [Name]",
+                "- If someone is addressed by nickname (e.g., \"Bry\" for Brian), use the full name from the video tile",
+            ]
+            if hasMic && hasSystem {
+                lines.append("- Lines starting with \"[mic]\" are the RECORDER speaking - use this to identify who the recorder is")
+            } else if hasMic {
+                lines.append("- Lines starting with \"[mic]\" are mic speakers - all speakers are mic")
+            }
+            return lines.joined(separator: "\n")
+        }()
+
+        // Smart transcript sampling to ensure coverage of all speakers
+        let truncatedTranscript = sampleTranscript(transcript, speakerIds: speakerIds)
 
         return """
-        I'm sending you screenshots from a video recording (meeting, lecture, or video call).
+        TASK: Identify speakers in a video call by reading name labels from screenshots.
 
-        WHERE TO FIND PARTICIPANT NAMES:
-        - VIDEO TILES: Small rectangles showing people's faces, with name labels below or on them
-        - PRESENTER INFO: Names shown on slides or in presenter panels
-        - YOUTUBE: Channel names or video titles
-        - IGNORE: Browser tab titles, file names, spreadsheet content - these are NOT participant names
+        \(audioStreamsBlock)
 
-        Transcript excerpt with speaker labels:
+        STEP 1 - READ THE NAME LABELS:
+        Look at each video tile in the screenshots. At the BOTTOM of each tile is a TEXT LABEL with the participant's name.
+        The text is usually white/light colored against a darker background.
+        List EVERY name you can read from the tiles.
 
-        \(transcript)
+        \(stepsBlock)
 
-        REASONING GUIDE FOR TRANSCRIPT CLUES:
-        - If someone says "Hey [Name]" or "Hi [Name]" -> the speaker is greeting that person, so speaker is NOT [Name]
-        - If someone says "Hi, I'm [Name]" -> the speaker IS [Name]
-        - If someone says "[Name] and I did something" -> the speaker is NOT [Name] (talking ABOUT them)
-        - If someone says "Thanks, [Name]" -> they're talking TO [Name], so speaker is NOT [Name]
-        - Look at who does most of the talking (presenting) vs who asks questions
+        TRANSCRIPT CLUES:
+        \(transcriptClues)
 
-        Map each speaker to their real name:
+        Transcript excerpt:
+
+        \(truncatedTranscript)
+
+        \(mappingHeader)
         \(speakerList)
 
-        Provide your answer as JSON array with objects containing: speaker_id, name, confidence (0.0-1.0).
-        If you cannot identify a speaker, set name to "Unknown" and confidence to 0.0.
+        \(importantBlock)
 
-        Example: [{"speaker_id": "SPEAKER_00", "name": "Pete Stefanov", "confidence": 0.9}]
+        Return JSON array: [{"speaker_id": "[exact ID from list above]", "name": "Full Name", "confidence": 0.0-1.0}]
+        If you cannot identify a speaker, use "Unknown" with confidence 0.0.
         """
     }
 
@@ -470,16 +708,49 @@ actor SpeakerIdentifier {
     }
 
     private func parseMappings(from rawResponse: String) -> [SpeakerMapping] {
-        let assistantText = extractAssistantText(from: rawResponse) ?? rawResponse
-        let jsonString = extractJson(from: assistantText) ?? assistantText
+        // DEBUG: Log raw response
+        print("[SpeakerID DEBUG] Raw response length: \(rawResponse.count) chars")
+        print("[SpeakerID DEBUG] Raw response (first 500 chars):")
+        print(String(rawResponse.prefix(500)))
+        print("[SpeakerID DEBUG] ---")
 
-        guard let data = jsonString.data(using: .utf8) else { return [] }
+        let assistantText = extractAssistantText(from: rawResponse) ?? rawResponse
+        print("[SpeakerID DEBUG] Extracted assistant text length: \(assistantText.count) chars")
+        print("[SpeakerID DEBUG] Assistant text (first 500 chars):")
+        print(String(assistantText.prefix(500)))
+        print("[SpeakerID DEBUG] ---")
+
+        let jsonString = extractJson(from: assistantText) ?? assistantText
+        print("[SpeakerID DEBUG] Extracted JSON length: \(jsonString.count) chars")
+        print("[SpeakerID DEBUG] JSON string:")
+        print(jsonString)
+        print("[SpeakerID DEBUG] ---")
+
+        guard let data = jsonString.data(using: .utf8) else {
+            print("[SpeakerID DEBUG] Failed to convert JSON string to data")
+            return []
+        }
         let decoder = JSONDecoder()
         if let direct = try? decoder.decode([SpeakerMapping].self, from: data) {
+            print("[SpeakerID DEBUG] Successfully decoded \(direct.count) mappings (direct array)")
+            for m in direct {
+                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
+            }
             return direct
         }
         if let wrapped = try? decoder.decode(MappingWrapper.self, from: data) {
+            print("[SpeakerID DEBUG] Successfully decoded \(wrapped.mappings.count) mappings (wrapped)")
+            for m in wrapped.mappings {
+                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
+            }
             return wrapped.mappings
+        }
+        print("[SpeakerID DEBUG] Failed to decode JSON as mappings")
+        // Try to see what the decode error is
+        do {
+            _ = try decoder.decode([SpeakerMapping].self, from: data)
+        } catch {
+            print("[SpeakerID DEBUG] Decode error: \(error)")
         }
         return []
     }

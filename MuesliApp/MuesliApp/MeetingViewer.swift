@@ -23,7 +23,8 @@ struct MeetingViewer: View {
     @State private var pendingRediarizeResult: BatchRediarizer.Result?
     @State private var showRediarizeConfirm = false
     @State private var rediarizeTask: Task<Void, Never>?
-    @State private var rediarizeStream: BatchRediarizer.Stream = .system
+    @State private var rediarizeStream: BatchRediarizer.Stream = .both
+    @State private var speakerIdHint = ""
 
     var body: some View {
         VStack(spacing: 12) {
@@ -87,6 +88,27 @@ struct MeetingViewer: View {
                             Text("Speaker naming")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Optional hint for speaker ID")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                TextEditor(text: $speakerIdHint)
+                                    .frame(minHeight: 60, maxHeight: 90)
+                                    .overlay {
+                                        if speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            Text("Example: The woman with the green jacket is Casey.")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 8)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }
+                                    .background(Color.secondary.opacity(0.08))
+                                    .cornerRadius(6)
+                            }
 
                             Button {
                                 identifySpeakers()
@@ -395,10 +417,12 @@ struct MeetingViewer: View {
             do {
                 try Task.checkCancellation()
                 let identifier = SpeakerIdentifier()
+                let hint = speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines)
                 let result = try await identifier.identifySpeakers(
                     screenshots: screenshots,
                     transcript: transcript,
                     speakerIds: speakerIds,
+                    userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in
                             identificationProgress = progress

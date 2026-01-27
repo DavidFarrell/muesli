@@ -357,11 +357,32 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
     }
 
-    private func resetTranscriptEventsLog(in folderURL: URL) {
+    private func resetTranscriptEventsLog(in folderURL: URL, append: Bool) {
         let logURL = folderURL.appendingPathComponent("transcript_events.jsonl")
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
         transcriptEventsURL = logURL
-        transcriptEventsHandle = try? FileHandle(forWritingTo: logURL)
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            if append {
+                _ = try? handle.seekToEnd()
+            } else {
+                try? handle.truncate(atOffset: 0)
+            }
+            transcriptEventsHandle = handle
+        }
+    }
+
+    private func loadTranscriptFromDisk(in folderURL: URL) {
+        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
+        guard FileManager.default.fileExists(atPath: transcriptURL.path) else { return }
+        guard let data = try? Data(contentsOf: transcriptURL),
+              let content = String(data: data, encoding: .utf8) else {
+            return
+        }
+        for line in content.split(whereSeparator: \.isNewline) {
+            transcriptModel.ingest(jsonLine: String(line))
+        }
     }
 
     private func closeTranscriptEventsLog() {
@@ -863,13 +884,19 @@ final class AppModel: ObservableObject {
         let session = MeetingSession(title: title, folderURL: folderURL, startedAt: Date())
         currentSession = session
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        if let metadata {
+            transcriptModel.speakerNames = metadata.speakerNames
+        }
+        if meeting != nil {
+            loadTranscriptFromDisk(in: folderURL)
+        }
         if timestampOffset > 0 {
             transcriptModel.timestampOffset = timestampOffset
         }
 
         do {
             resetBackendLog(in: folderURL)
-            resetTranscriptEventsLog(in: folderURL)
+            resetTranscriptEventsLog(in: folderURL, append: meeting != nil)
             if meeting == nil {
                 try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
             } else if let metadata {
@@ -1041,7 +1068,7 @@ final class AppModel: ObservableObject {
                 "mic_channels": micChannels
             ]
             let metaData = try JSONSerialization.data(withJSONObject: meta)
-            writer.sendSync(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
+            writer.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
             appendBackendLog("Sent meeting_start", toTail: true)
             updateMeetingMetadataStreams(
                 for: session,
@@ -1107,7 +1134,7 @@ final class AppModel: ObservableObject {
         pendingMicAudio.removeAll()
         micStartTime = nil
 
-        writer?.sendSync(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
+        writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer?.closeStdinAfterDraining()
         writer = nil
 
@@ -1147,7 +1174,11 @@ final class AppModel: ObservableObject {
                 return true
             }
             group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                } catch {
+                    return false
+                }
                 return false
             }
             let result = await group.next() ?? false
@@ -1401,6 +1432,8 @@ final class AppModel: ObservableObject {
     func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
         var didUpdate = false
         let segmentIds = Set(transcriptModel.segments.map { $0.speakerID })
+        let hasSystemSegments = segmentIds.contains { $0.lowercased().hasPrefix("system:") }
+        let hasMicSegments = segmentIds.contains { $0.lowercased().hasPrefix("mic:") }
         for mapping in mappings {
             let rawId = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmed = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1418,8 +1451,24 @@ final class AppModel: ObservableObject {
                 targets.insert(rawId)
             }
             if targets.isEmpty {
-                targets.insert(rawId)
+                let parts = rawId.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+                if parts.count == 2 {
+                    let prefix = String(parts[0]).lowercased()
+                    let base = String(parts[1])
+                    if prefix == "system", !hasSystemSegments, hasMicSegments {
+                        let alt = "mic:\(base)"
+                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
+                            targets.insert(alt)
+                        }
+                    } else if prefix == "mic", !hasMicSegments, hasSystemSegments {
+                        let alt = "system:\(base)"
+                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
+                            targets.insert(alt)
+                        }
+                    }
+                }
             }
+            guard !targets.isEmpty else { continue }
             for target in targets {
                 transcriptModel.renameSpeaker(id: target, to: trimmed)
                 didUpdate = true
