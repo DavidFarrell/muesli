@@ -340,49 +340,52 @@ struct NewMeetingView: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 6)
                 } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(visibleMeetings) { item in
-                            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                                Button {
-                                    model.openMeeting(item)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(item.title)
-                                            .font(.headline)
-                                            .lineLimit(1)
-                                        Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(visibleMeetings) { item in
+                                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                    Button {
+                                        model.openMeeting(item)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(item.title)
+                                                .font(.headline)
+                                                .lineLimit(1)
+                                            Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                    Spacer()
+                                    Button {
+                                        pendingDelete = item
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                                .padding(.vertical, 2)
+                                .contextMenu {
+                                    Button("Rename") {
+                                        pendingRename = item
+                                        renameTitle = item.title
+                                        showRenameSheet = true
                                     }
                                 }
-                                .buttonStyle(.plain)
-                                Spacer()
-                                Button {
-                                    pendingDelete = item
-                                    showDeleteConfirm = true
-                                } label: {
-                                    Image(systemName: "trash")
-                                }
-                                .buttonStyle(.borderless)
                             }
-                            .padding(.vertical, 2)
-                            .contextMenu {
-                                Button("Rename") {
-                                    pendingRename = item
-                                    renameTitle = item.title
-                                    showRenameSheet = true
-                                }
-                            }
-                        }
 
-                        if model.meetingHistory.count > maxVisibleMeetings {
-                            Button(showAllMeetings ? "Show less" : "Show more") {
-                                showAllMeetings.toggle()
+                            if model.meetingHistory.count > maxVisibleMeetings {
+                                Button(showAllMeetings ? "Show less" : "Show more") {
+                                    showAllMeetings.toggle()
+                                }
+                                .buttonStyle(.link)
                             }
-                            .buttonStyle(.link)
                         }
+                        .padding(.vertical, 6)
                     }
-                    .padding(.vertical, 6)
+                    .frame(maxHeight: 200)
                 }
             }
 
