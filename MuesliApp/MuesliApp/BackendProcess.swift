@@ -146,7 +146,7 @@ enum MsgType: UInt8 {
 
 final class FramedWriter {
     private let handle: FileHandle
-    private let writeQueue = DispatchQueue(label: "muesli.framed-writer")
+    private let writeQueue = DispatchQueue(label: "muesli.framed-writer", qos: .userInitiated)
     private var didFail = false
     var onWriteError: ((Error) -> Void)?
 
@@ -160,14 +160,8 @@ final class FramedWriter {
         }
     }
 
-    func sendSync(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
-        writeQueue.sync {
-            self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
-        }
-    }
-
     func closeStdinAfterDraining() {
-        writeQueue.sync {
+        writeQueue.async {
             try? self.handle.close()
         }
     }

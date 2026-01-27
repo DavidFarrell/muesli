@@ -58,7 +58,7 @@ actor BatchRediarizer {
 
     private final class ProcessStore {
         private var process: BackendProcess?
-        private let queue = DispatchQueue(label: "muesli.batch-rediarizer.process")
+        private let queue = DispatchQueue(label: "muesli.batch-rediarizer.process", qos: .userInitiated)
 
         func set(_ process: BackendProcess) {
             queue.sync {

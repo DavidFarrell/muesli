@@ -17,10 +17,12 @@ import Security
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @State private var titlebarInset: CGFloat = 28
 
     var body: some View {
         content
-            .padding(.top, 12)
+            .padding(.top, max(28, titlebarInset))
+            .background(TitlebarInsetReader(height: $titlebarInset))
             .toolbar {
                 ToolbarItem(placement: .automatic) {
                     Button("Permissions") { model.showPermissionsSheet = true }
@@ -43,6 +45,24 @@ struct RootView: View {
                 SessionView()
             case .viewing(let item):
                 MeetingViewer(meeting: item)
+            }
+        }
+    }
+}
+
+private struct TitlebarInsetReader: NSViewRepresentable {
+    @Binding var height: CGFloat
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            let inset = max(0, window.frame.height - window.contentLayoutRect.height)
+            if abs(height - inset) > 0.5 {
+                height = inset
             }
         }
     }
@@ -573,7 +593,7 @@ final class ScreenshotScheduler {
         outputDir: URL,
         onScreenshotEvent: @escaping (_ tSeconds: Double, _ relativePath: String) -> Void
     ) {
-        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "muesli.screenshots"))
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "muesli.screenshots", qos: .userInitiated))
         t.schedule(deadline: .now() + intervalSeconds, repeating: intervalSeconds)
         t.setEventHandler { [weak self] in
             guard let self else { return }

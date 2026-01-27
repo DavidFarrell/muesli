@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 
 actor MicEngine {
     private var engine: AVAudioEngine?
@@ -55,14 +55,18 @@ actor MicEngine {
         print("[MicEngine] Started with AEC enabled")
     }
 
-    func stop() {
+    func stop() async {
         guard isRunning else { return }
 
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
+        let engine = engine
+        self.engine = nil
         isRunning = false
         onAudioData = nil
+
+        DispatchQueue.global(qos: .userInitiated).async { [engine] in
+            engine?.inputNode.removeTap(onBus: 0)
+            engine?.stop()
+        }
 
         print("[MicEngine] Stopped")
     }

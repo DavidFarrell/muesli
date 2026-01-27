@@ -203,7 +203,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     private final class AudioStateStore {
         private var state: AudioState
-        private let queue = DispatchQueue(label: "muesli.audio.state")
+        private let queue = DispatchQueue(label: "muesli.audio.state", qos: .userInitiated)
 
         init(_ state: AudioState) {
             self.state = state
@@ -249,8 +249,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         let stream = SCStream(filter: contentFilter, configuration: config, delegate: self)
         self.stream = stream
 
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system"))
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop"))
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop", qos: .userInitiated))
 
         self.writer = writer
 
