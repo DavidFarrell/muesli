@@ -139,6 +139,7 @@ Muesli needs:
 
 struct NewMeetingView: View {
     @EnvironmentObject var model: AppModel
+    @State private var rolloverTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
     @State private var showAllMeetings = false
     @State private var pendingDelete: MeetingHistoryItem?
     @State private var showDeleteConfirm = false
@@ -190,7 +191,7 @@ struct NewMeetingView: View {
                 Spacer()
             }
             if model.sourceKind == .window {
-                Text("Window capture may only include that app's audio. Use Display to capture full system audio.")
+                Text("Window mode captures full system audio but takes screenshots of just this window.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -429,6 +430,12 @@ struct NewMeetingView: View {
                     showRenameSheet = false
                 }
             )
+        }
+        .onAppear {
+            model.refreshMeetingTitleForDateRollover()
+        }
+        .onReceive(rolloverTicker) { _ in
+            model.refreshMeetingTitleForDateRollover()
         }
     }
 

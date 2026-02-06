@@ -117,6 +117,7 @@ final class AppModel: ObservableObject {
     @Published var debugMicErrors: Int = 0
 
     let transcriptModel = TranscriptModel()
+    @Published var currentAttachments: [Attachment] = []
 
     private let captureEngine = CaptureEngine()
     private var micEngine: MicEngine?
@@ -133,6 +134,7 @@ final class AppModel: ObservableObject {
     private var backendLogURL: URL?
     private var transcriptEventsHandle: FileHandle?
     private var transcriptEventsURL: URL?
+    private var currentTranscriptEventsStartOffset: UInt64 = 0
     private var backendAccessURL: URL?
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
@@ -342,6 +344,10 @@ final class AppModel: ObservableObject {
         backendAccessURL = nil
     }
 
+    private func stopBackendAccess(for url: URL?) {
+        url?.stopAccessingSecurityScopedResource()
+    }
+
     private func resetBackendLog(in folderURL: URL) {
         backendLogTail.removeAll()
         let logURL = folderURL.appendingPathComponent("backend.log")
@@ -365,11 +371,14 @@ final class AppModel: ObservableObject {
         transcriptEventsURL = logURL
         if let handle = try? FileHandle(forWritingTo: logURL) {
             if append {
-                _ = try? handle.seekToEnd()
+                currentTranscriptEventsStartOffset = (try? handle.seekToEnd()) ?? 0
             } else {
                 try? handle.truncate(atOffset: 0)
+                currentTranscriptEventsStartOffset = 0
             }
             transcriptEventsHandle = handle
+        } else {
+            currentTranscriptEventsStartOffset = 0
         }
     }
 
@@ -390,12 +399,19 @@ final class AppModel: ObservableObject {
             try? handle.close()
         }
         transcriptEventsHandle = nil
+        currentTranscriptEventsStartOffset = 0
     }
 
-    private func appendBackendLog(_ line: String, toTail: Bool) {
+    private func closeHandle(_ handle: FileHandle?) {
+        if let handle {
+            try? handle.close()
+        }
+    }
+
+    private func appendBackendLog(_ line: String, toTail: Bool, handle: FileHandle? = nil) {
         let trimmed = line.trimmingCharacters(in: .newlines)
         if let data = (trimmed + "\n").data(using: .utf8) {
-            backendLogHandle?.write(data)
+            (handle ?? backendLogHandle)?.write(data)
         }
         guard toTail else { return }
         backendLogTail.append(trimmed)
@@ -412,7 +428,12 @@ final class AppModel: ObservableObject {
         Task { await stopMeeting() }
     }
 
-    private func handleBackendJSONLine(_ line: String) {
+    private func handleBackendJSONLine(
+        _ line: String,
+        transcriptEventsHandle: FileHandle?,
+        backendLogHandle: FileHandle?,
+        ingestIntoLiveTranscript: Bool
+    ) {
         if let data = (line + "\n").data(using: .utf8) {
             transcriptEventsHandle?.write(data)
         }
@@ -421,7 +442,7 @@ final class AppModel: ObservableObject {
            let type = obj["type"] as? String {
             if type == "error" {
                 let message = (obj["message"] as? String) ?? line
-                appendBackendLog("[error] \(message)", toTail: true)
+                appendBackendLog("[error] \(message)", toTail: ingestIntoLiveTranscript, handle: backendLogHandle)
             } else if type == "status" {
                 var parts: [String] = []
                 if let message = obj["message"] as? String {
@@ -437,10 +458,12 @@ final class AppModel: ObservableObject {
                     parts.append(String(format: "duration=%.2fs", duration))
                 }
                 let text = parts.isEmpty ? line : parts.joined(separator: " ")
-                appendBackendLog("[status] \(text)", toTail: true)
+                appendBackendLog("[status] \(text)", toTail: ingestIntoLiveTranscript, handle: backendLogHandle)
             }
         }
-        transcriptModel.ingest(jsonLine: line)
+        if ingestIntoLiveTranscript {
+            transcriptModel.ingest(jsonLine: line)
+        }
     }
 
     private func resetMicDebugState() {
@@ -533,25 +556,37 @@ final class AppModel: ObservableObject {
         _ data: Data?,
         to url: URL,
         encodeFailure: String,
-        writeFailure: String
+        writeFailure: String,
+        logToTail: Bool = true,
+        logHandle: FileHandle? = nil
     ) {
         guard let data else {
-            appendBackendLog(encodeFailure, toTail: true)
+            appendBackendLog(encodeFailure, toTail: logToTail, handle: logHandle)
             return
         }
         do {
             try data.write(to: url)
         } catch {
-            appendBackendLog("\(writeFailure): \(error.localizedDescription)", toTail: true)
+            appendBackendLog(
+                "\(writeFailure): \(error.localizedDescription)",
+                toTail: logToTail,
+                handle: logHandle
+            )
         }
     }
 
-    private func saveTranscriptFiles(for session: MeetingSession) {
+    private func saveTranscriptFiles(
+        for session: MeetingSession,
+        segments: [TranscriptSegment],
+        text: String,
+        logToTail: Bool = true,
+        logHandle: FileHandle? = nil
+    ) {
         let jsonlURL = session.folderURL.appendingPathComponent("transcript.jsonl")
         let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
 
-        let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
-        let textString = transcriptModel.asPlainText()
+        let jsonlString = buildTranscriptJSONL(from: segments)
+        let textString = text
 
         let jsonlData = jsonlString.data(using: .utf8)
         let textData = textString.data(using: .utf8)
@@ -560,13 +595,17 @@ final class AppModel: ObservableObject {
             jsonlData,
             to: jsonlURL,
             encodeFailure: "Failed to encode transcript JSONL.",
-            writeFailure: "Failed to save transcript JSONL"
+            writeFailure: "Failed to save transcript JSONL",
+            logToTail: logToTail,
+            logHandle: logHandle
         )
         writeTranscriptData(
             textData,
             to: txtURL,
             encodeFailure: "Failed to encode transcript text.",
-            writeFailure: "Failed to save transcript text"
+            writeFailure: "Failed to save transcript text",
+            logToTail: logToTail,
+            logHandle: logHandle
         )
 
         let tempBase = FileManager.default.temporaryDirectory
@@ -579,11 +618,29 @@ final class AppModel: ObservableObject {
             if let textData {
                 try textData.write(to: tempFolder.appendingPathComponent("transcript.txt"))
             }
-            tempTranscriptFolderPath = tempFolder.path
-            appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: true)
+            if logToTail {
+                tempTranscriptFolderPath = tempFolder.path
+            }
+            appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: logToTail, handle: logHandle)
         } catch {
-            appendBackendLog("Failed to save transcript temp copy: \(error.localizedDescription)", toTail: true)
+            appendBackendLog(
+                "Failed to save transcript temp copy: \(error.localizedDescription)",
+                toTail: logToTail,
+                handle: logHandle
+            )
         }
+    }
+
+    private func linesFromTranscriptEvents(
+        in folderURL: URL,
+        startingAt offset: UInt64
+    ) -> [String] {
+        let eventsURL = folderURL.appendingPathComponent("transcript_events.jsonl")
+        guard let data = try? Data(contentsOf: eventsURL) else { return [] }
+        let start = Int(min(offset, UInt64(data.count)))
+        let slice = data.subdata(in: start..<data.count)
+        guard let content = String(data: slice, encoding: .utf8) else { return [] }
+        return content.split(whereSeparator: \.isNewline).map(String.init)
     }
 
     func exportTranscriptFiles() {
@@ -671,13 +728,17 @@ final class AppModel: ObservableObject {
             displays = content.displays
             windows = sortWindows(content.windows)
             screenPermissionGranted = true
-            await captureThumbnails()
 
             if selectedDisplayID == nil {
                 selectedDisplayID = displays.first?.displayID
             }
             if selectedWindowID == nil {
                 selectedWindowID = windows.first?.windowID
+            }
+
+            // Capture thumbnails in background - don't block the UI
+            Task { @MainActor in
+                await captureThumbnails()
             }
         } catch {
             shareableContentError = String(describing: error)
@@ -758,19 +819,32 @@ final class AppModel: ObservableObject {
         config.showsCursor = false
         config.pixelFormat = kCVPixelFormatType_32BGRA
 
-        return await withCheckedContinuation { continuation in
-            SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
-                guard error == nil,
-                      let sampleBuffer,
-                      let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-                    continuation.resume(returning: nil)
-                    return
+        // Use a timeout to prevent hanging if a window capture never returns
+        return await withTaskGroup(of: CGImage?.self) { group in
+            group.addTask {
+                await withCheckedContinuation { continuation in
+                    SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
+                        guard error == nil,
+                              let sampleBuffer,
+                              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        let ciImage = CIImage(cvImageBuffer: imageBuffer)
+                        let context = CIContext()
+                        let cgImage = context.createCGImage(ciImage, from: ciImage.extent)
+                        continuation.resume(returning: cgImage)
+                    }
                 }
-                let ciImage = CIImage(cvImageBuffer: imageBuffer)
-                let context = CIContext()
-                let cgImage = context.createCGImage(ciImage, from: ciImage.extent)
-                continuation.resume(returning: cgImage)
             }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                return nil
+            }
+            // Return first result (either the capture or timeout)
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
         }
     }
 
@@ -815,6 +889,7 @@ final class AppModel: ObservableObject {
         metadata: MeetingMetadata?,
         timestampOffset: Double
     ) async {
+        refreshMeetingTitleForDateRollover()
         refreshPermissions()
         backendFolderError = nil
         shareableContentError = nil
@@ -836,20 +911,35 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let filter: SCContentFilter
-        switch sourceKind {
-        case .display:
-            guard let display = selectedDisplay else {
-                shareableContentError = "No display selected."
-                return
+        // Always use a display filter for audio capture (system-wide audio)
+        // Use selectedDisplay if available, otherwise fall back to first display
+        let displayForAudio = selectedDisplay ?? displays.first
+        guard let audioDisplay = displayForAudio else {
+            shareableContentError = "No display available for audio capture."
+            return
+        }
+        let audioFilter = SCContentFilter(display: audioDisplay, excludingApplications: [], exceptingWindows: [])
+
+        // Screenshot filter can be display or window based on user selection
+        let screenshotFilter: SCContentFilter
+        if captureMode == .audioOnly {
+            // Audio-only mode doesn't use screenshots, but we still need a valid filter
+            screenshotFilter = audioFilter
+        } else {
+            switch sourceKind {
+            case .display:
+                guard let display = selectedDisplay else {
+                    shareableContentError = "No display selected."
+                    return
+                }
+                screenshotFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            case .window:
+                guard let window = selectedWindow else {
+                    shareableContentError = "No window selected."
+                    return
+                }
+                screenshotFilter = SCContentFilter(desktopIndependentWindow: window)
             }
-            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        case .window:
-            guard let window = selectedWindow else {
-                shareableContentError = "No window selected."
-                return
-            }
-            filter = SCContentFilter(desktopIndependentWindow: window)
         }
 
         var title = normaliseMeetingTitle(meetingTitle)
@@ -889,6 +979,9 @@ final class AppModel: ObservableObject {
         }
         if meeting != nil {
             loadTranscriptFromDisk(in: folderURL)
+            loadAttachments(from: folderURL)
+        } else {
+            clearAttachments()
         }
         if timestampOffset > 0 {
             transcriptModel.timestampOffset = timestampOffset
@@ -968,17 +1061,32 @@ final class AppModel: ObservableObject {
                     workingDirectory: backendProjectRoot,
                     environment: backendEnv
                 )
+                let sessionFolderURL = folderURL
+                let sessionLogHandle = backendLogHandle
+                let sessionEventsHandle = transcriptEventsHandle
                 appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
                 appendBackendLog("PATH: \(mergedPath)", toTail: true)
                 appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
                 backend.onExit = { [weak self] status in
                     Task { @MainActor in
-                        self?.appendBackendLog("Backend exited with status \(status)", toTail: true)
+                        guard let self else { return }
+                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                        self.appendBackendLog(
+                            "Backend exited with status \(status)",
+                            toTail: isActiveSession,
+                            handle: sessionLogHandle
+                        )
                     }
                 }
                 backend.onStderrLine = { [weak self] line in
                     Task { @MainActor in
-                        self?.appendBackendLog("[stderr] \(line)", toTail: true)
+                        guard let self else { return }
+                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                        self.appendBackendLog(
+                            "[stderr] \(line)",
+                            toTail: isActiveSession,
+                            handle: sessionLogHandle
+                        )
                     }
                 }
                 try backend.start()
@@ -986,7 +1094,13 @@ final class AppModel: ObservableObject {
                 stdoutTask?.cancel()
                 stdoutTask = Task { @MainActor in
                     for await line in backend.stdoutLines {
-                        self.handleBackendJSONLine(line)
+                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                        self.handleBackendJSONLine(
+                            line,
+                            transcriptEventsHandle: sessionEventsHandle,
+                            backendLogHandle: sessionLogHandle,
+                            ingestIntoLiveTranscript: isActiveSession
+                        )
                     }
                 }
                 let createdWriter = FramedWriter(stdinHandle: backend.stdin)
@@ -1017,7 +1131,7 @@ final class AppModel: ObservableObject {
             }
 
             try await captureEngine.startCapture(
-                contentFilter: filter,
+                contentFilter: audioFilter,
                 writer: writer,
                 recordTo: recordURL
             )
@@ -1087,7 +1201,7 @@ final class AppModel: ObservableObject {
 
                 screenshotScheduler.start(
                     every: 5.0,
-                    contentFilter: filter,
+                    contentFilter: screenshotFilter,
                     streamConfig: captureEngine.streamConfigurationForScreenshots(),
                     meetingStartPTSProvider: { [weak self] in self?.captureEngine.meetingStartPTS },
                     outputDir: screenshotsDir
@@ -1136,38 +1250,117 @@ final class AppModel: ObservableObject {
 
         writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer?.closeStdinAfterDraining()
-        writer = nil
 
-        let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
-        if exitStatus == nil {
-            appendBackendLog("Backend did not exit after stop; terminating.", toTail: true)
-            backend?.terminate()
-        }
-        backend?.cleanup()
-        await waitForStdoutDrain(timeoutSeconds: 2.0)
-        stdoutTask = nil
+        let stoppingSession = currentSession
+        let stoppingBackend = backend
+        let stoppingStdoutTask = stdoutTask
+        let stoppingBackendLogHandle = backendLogHandle
+        let stoppingTranscriptEventsHandle = transcriptEventsHandle
+        let stoppingBackendAccessURL = backendAccessURL
+        let stoppingTranscriptEventsStartOffset = currentTranscriptEventsStartOffset
+        let stoppingTranscriptSegments = transcriptModel.segments.filter { !$0.isPartial }
+        let stoppingSpeakerNames = transcriptModel.speakerNames
+        let stoppingTimestampOffset = transcriptModel.timestampOffset
+
+        writer = nil
         backend = nil
-        if let session = currentSession {
-            saveTranscriptFiles(for: session)
-            finalizeMeetingMetadata(for: session)
-            if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
-               let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
-                meetingHistory[idx] = updatedItem
-            } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
-                meetingHistory.insert(updatedItem, at: 0)
-            }
-        }
-        closeBackendLog()
-        closeTranscriptEventsLog()
-        stopBackendAccess()
-        isFinalizing = false
+        stdoutTask = nil
+        backendLogHandle = nil
+        backendLogURL = nil
+        transcriptEventsHandle = nil
+        transcriptEventsURL = nil
+        backendAccessURL = nil
+        currentTranscriptEventsStartOffset = 0
+        clearAttachments()
+
         isCapturing = false
         currentSession = nil
         activeScreen = .start
+        isFinalizing = false
+
+        guard let stoppingSession else {
+            closeHandle(stoppingTranscriptEventsHandle)
+            closeHandle(stoppingBackendLogHandle)
+            stopBackendAccess(for: stoppingBackendAccessURL)
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.finalizeStoppedMeeting(
+                session: stoppingSession,
+                backend: stoppingBackend,
+                stdoutTask: stoppingStdoutTask,
+                backendLogHandle: stoppingBackendLogHandle,
+                transcriptEventsHandle: stoppingTranscriptEventsHandle,
+                backendAccessURL: stoppingBackendAccessURL,
+                transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
+                transcriptSegmentsSnapshot: stoppingTranscriptSegments,
+                speakerNamesSnapshot: stoppingSpeakerNames,
+                timestampOffsetSnapshot: stoppingTimestampOffset
+            )
+        }
     }
 
-    private func waitForStdoutDrain(timeoutSeconds: Double) async {
-        guard let task = stdoutTask else { return }
+    private func finalizeStoppedMeeting(
+        session: MeetingSession,
+        backend: BackendProcess?,
+        stdoutTask: Task<Void, Never>?,
+        backendLogHandle: FileHandle?,
+        transcriptEventsHandle: FileHandle?,
+        backendAccessURL: URL?,
+        transcriptEventsStartOffset: UInt64,
+        transcriptSegmentsSnapshot: [TranscriptSegment],
+        speakerNamesSnapshot: [String: String],
+        timestampOffsetSnapshot: Double
+    ) async {
+        defer {
+            closeHandle(transcriptEventsHandle)
+            closeHandle(backendLogHandle)
+            stopBackendAccess(for: backendAccessURL)
+        }
+
+        let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
+        if exitStatus == nil {
+            appendBackendLog(
+                "Backend did not exit after stop; terminating.",
+                toTail: false,
+                handle: backendLogHandle
+            )
+            backend?.terminate()
+        }
+        backend?.cleanup()
+        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
+        transcriptEventsHandle?.synchronizeFile()
+        backendLogHandle?.synchronizeFile()
+
+        let model = TranscriptModel()
+        model.timestampOffset = timestampOffsetSnapshot
+        model.segments = transcriptSegmentsSnapshot
+        model.speakerNames = speakerNamesSnapshot
+        for line in linesFromTranscriptEvents(in: session.folderURL, startingAt: transcriptEventsStartOffset) {
+            model.ingest(jsonLine: line)
+        }
+
+        let finalizedSegments = model.segments.filter { !$0.isPartial }
+        saveTranscriptFiles(
+            for: session,
+            segments: finalizedSegments,
+            text: model.asPlainText(),
+            logToTail: false,
+            logHandle: backendLogHandle
+        )
+        finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments)
+        if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
+           let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
+            meetingHistory[idx] = updatedItem
+        } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
+            meetingHistory.insert(updatedItem, at: 0)
+        }
+    }
+
+    private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {
+        guard let task else { return }
         let finished = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await task.value
@@ -1192,6 +1385,14 @@ final class AppModel: ObservableObject {
 
     static func defaultMeetingTitle() -> String {
         defaultMeetingTitle(for: Date(), number: 1)
+    }
+
+    func refreshMeetingTitleForDateRollover(now: Date = Date()) {
+        guard !isCapturing else { return }
+        guard let parsed = parseAutoMeetingTitle(meetingTitle) else { return }
+        let todayPrefix = Self.meetingDatePrefix(for: now)
+        guard parsed.datePrefix != todayPrefix else { return }
+        meetingTitle = Self.defaultMeetingTitle(for: now, number: nextMeetingNumber(for: todayPrefix))
     }
 
     private static func meetingDatePrefix(for date: Date) -> String {
@@ -1384,10 +1585,12 @@ final class AppModel: ObservableObject {
         try writeMeetingMetadata(updated, to: session.folderURL)
     }
 
-    private func finalizeMeetingMetadata(for session: MeetingSession) {
+    private func finalizeMeetingMetadata(
+        for session: MeetingSession,
+        finalizedSegments: [TranscriptSegment]
+    ) {
         do {
             var metadata = try readMeetingMetadata(from: session.folderURL)
-            let finalizedSegments = transcriptModel.segments.filter { !$0.isPartial }
             let lastTimestamp = max(
                 metadata.lastTimestamp,
                 finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
@@ -1427,6 +1630,144 @@ final class AppModel: ObservableObject {
         } else if case .viewing(let item) = activeScreen {
             persistSpeakerNames(to: item.folderURL)
         }
+    }
+
+    // MARK: - Attachments
+
+    private func attachmentsFolderURL(for session: MeetingSession) -> URL {
+        session.folderURL.appendingPathComponent("attachments", isDirectory: true)
+    }
+
+    private func attachmentsManifestURL(for session: MeetingSession) -> URL {
+        session.folderURL.appendingPathComponent("attachments.json")
+    }
+
+    private func meetingElapsedSeconds() -> Double {
+        guard let session = currentSession else { return 0 }
+        return Date().timeIntervalSince(session.startedAt)
+    }
+
+    private func formatTimestampFilename(_ seconds: Double, extension ext: String) -> String {
+        // Format: t+0000005.123.png (7 digits for seconds, 3 for milliseconds)
+        let wholeSec = Int(seconds)
+        let millis = Int((seconds - Double(wholeSec)) * 1000)
+        return String(format: "t+%07d.%03d.%@", wholeSec, millis, ext)
+    }
+
+    func saveImageAttachment(_ image: NSImage) {
+        guard let session = currentSession else { return }
+
+        let attachmentsDir = attachmentsFolderURL(for: session)
+        do {
+            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
+        } catch {
+            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
+            return
+        }
+
+        let elapsed = meetingElapsedSeconds()
+        let filename = formatTimestampFilename(elapsed, extension: "png")
+        let fileURL = attachmentsDir.appendingPathComponent(filename)
+
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            appendBackendLog("Failed to convert image to PNG", toTail: true)
+            return
+        }
+
+        do {
+            try pngData.write(to: fileURL)
+            let attachment = Attachment(type: .image, timestamp: elapsed, filename: filename)
+            currentAttachments.append(attachment)
+            saveAttachmentsManifest(for: session)
+            appendBackendLog("Saved image attachment: \(filename)", toTail: true)
+        } catch {
+            appendBackendLog("Failed to save image attachment: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func saveTextAttachment(_ text: String) {
+        guard let session = currentSession else { return }
+
+        let attachmentsDir = attachmentsFolderURL(for: session)
+        do {
+            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
+        } catch {
+            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
+            return
+        }
+
+        let elapsed = meetingElapsedSeconds()
+        let filename = formatTimestampFilename(elapsed, extension: "txt")
+        let fileURL = attachmentsDir.appendingPathComponent(filename)
+
+        do {
+            try text.write(to: fileURL, atomically: true, encoding: .utf8)
+            let attachment = Attachment(type: .text, timestamp: elapsed, filename: filename)
+            currentAttachments.append(attachment)
+            saveAttachmentsManifest(for: session)
+            appendBackendLog("Saved text attachment: \(filename)", toTail: true)
+        } catch {
+            appendBackendLog("Failed to save text attachment: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func deleteAttachment(_ attachment: Attachment) {
+        guard let session = currentSession else { return }
+
+        let attachmentsDir = attachmentsFolderURL(for: session)
+        let fileURL = attachmentsDir.appendingPathComponent(attachment.filename)
+
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+            currentAttachments.removeAll { $0.id == attachment.id }
+            saveAttachmentsManifest(for: session)
+            appendBackendLog("Deleted attachment: \(attachment.filename)", toTail: true)
+        } catch {
+            appendBackendLog("Failed to delete attachment: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    func attachmentFileURL(for attachment: Attachment) -> URL? {
+        guard let session = currentSession else { return nil }
+        return attachmentsFolderURL(for: session).appendingPathComponent(attachment.filename)
+    }
+
+    private func saveAttachmentsManifest(for session: MeetingSession) {
+        let manifest = AttachmentsManifest(attachments: currentAttachments)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        do {
+            let data = try encoder.encode(manifest)
+            try data.write(to: attachmentsManifestURL(for: session), options: [.atomic])
+        } catch {
+            appendBackendLog("Failed to save attachments manifest: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func loadAttachments(from folderURL: URL) {
+        currentAttachments = []
+        let manifestURL = folderURL.appendingPathComponent("attachments.json")
+        guard FileManager.default.fileExists(atPath: manifestURL.path) else { return }
+
+        do {
+            let data = try Data(contentsOf: manifestURL)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let manifest = try decoder.decode(AttachmentsManifest.self, from: data)
+            currentAttachments = manifest.attachments
+        } catch {
+            appendBackendLog("Failed to load attachments manifest: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func clearAttachments() {
+        currentAttachments = []
     }
 
     func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {

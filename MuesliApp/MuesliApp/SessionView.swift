@@ -9,8 +9,10 @@ struct SessionView: View {
     @State private var autoScroll = true
     @State private var showDebug = false
     @State private var copyIconName = "doc.on.clipboard"
-    @State private var showRenameSheet = false
-    @State private var renameTitle = ""
+    @State private var isEditingTitle = false
+    @State private var pendingTitle = ""
+    @FocusState private var isViewFocused: Bool
+    @FocusState private var isTitleFieldFocused: Bool
     private let timeFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "HH:mm:ss"
@@ -27,6 +29,25 @@ struct SessionView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             LevelMeter(label: "System", level: model.systemLevel)
                             LevelMeter(label: "Microphone", level: model.micLevel)
+
+                            if !model.debugMicErrorMessage.isEmpty && model.debugMicErrorMessage != "-" {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.red)
+                                    Text(model.debugMicErrorMessage)
+                                        .foregroundStyle(.red)
+                                }
+                                .font(.footnote)
+                            } else if model.transcribeMic && model.debugMicBuffers == 0 {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text("Mic enabled but no audio received yet")
+                                        .foregroundStyle(.orange)
+                                }
+                                .font(.footnote)
+                            }
+
                             Text("If a meter is flat at 0, your capture is not receiving that stream.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
@@ -37,7 +58,6 @@ struct SessionView: View {
                     GroupBox("Controls") {
                         VStack(alignment: .leading, spacing: 10) {
                             Toggle("Auto-scroll transcript", isOn: $autoScroll)
-                            Toggle("Show debug panel", isOn: $showDebug)
                             HStack {
                                 Button("Speakers") { showSpeakers = true }
                                 Spacer()
@@ -56,58 +76,51 @@ struct SessionView: View {
                         .padding(8)
                     }
 
-                    if showDebug {
-                        GroupBox("Debug") {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Button("Copy debug") {
-                                        let pasteboard = NSPasteboard.general
-                                        pasteboard.clearContents()
-                                        pasteboard.setString(model.debugSummary, forType: .string)
-                                    }
-                                    .buttonStyle(.bordered)
-
-                                    Spacer()
+                    DisclosureGroup("Debug", isExpanded: $showDebug) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Button("Copy debug") {
+                                    let pasteboard = NSPasteboard.general
+                                    pasteboard.clearContents()
+                                    pasteboard.setString(model.debugSummary, forType: .string)
                                 }
-                                Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
-                                Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
-                                Text("System format: \(model.debugSystemFormat)")
-                                Text("System errors: \(model.debugAudioErrors)")
-                                Text("System last error: \(model.debugSystemErrorMessage)")
-                                Divider()
-                                Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
-                                Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
-                                Text("Mic format: \(model.debugMicFormat)")
-                                Text("Mic errors: \(model.debugMicErrors)")
-                                Text("Mic last error: \(model.debugMicErrorMessage)")
-                                Divider()
-                                Text("Transcript segments: \(model.transcriptModel.segments.count)")
-                                if let last = model.transcriptModel.lastTranscriptAt {
-                                    Text("Last transcript: \(timeFormatter.string(from: last))")
-                                }
-                                if !model.transcriptModel.lastTranscriptText.isEmpty {
-                                    let snippet = model.transcriptModel.lastTranscriptText.prefix(120)
-                                    Text("Last text: \(snippet)")
-                                }
-                                Divider()
-                                Text("Backend folder: \(model.backendFolderPath)")
-                                Text("Backend log: \(model.backendLogPath ?? "-")")
-                                if let tempPath = model.tempTranscriptFolderPath {
-                                    Text("Transcript temp folder: \(tempPath)")
-                                }
-                                if !model.backendLogTail.isEmpty {
-                                    ScrollView {
-                                        Text(model.backendLogTail.joined(separator: "\n"))
-                                            .textSelection(.enabled)
-                                    }
-                                    .frame(maxHeight: 120)
-                                }
+                                .buttonStyle(.bordered)
+                                Spacer()
                             }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(8)
+                            Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
+                            Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
+                            Text("System format: \(model.debugSystemFormat)")
+                            Text("System errors: \(model.debugAudioErrors)")
+                            if model.debugSystemErrorMessage != "-" {
+                                Text("System error: \(model.debugSystemErrorMessage)")
+                                    .foregroundStyle(.red)
+                            }
+                            Divider()
+                            Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
+                            Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
+                            Text("Mic format: \(model.debugMicFormat)")
+                            Text("Mic errors: \(model.debugMicErrors)")
+                            if model.debugMicErrorMessage != "-" {
+                                Text("Mic error: \(model.debugMicErrorMessage)")
+                                    .foregroundStyle(.red)
+                            }
+                            Divider()
+                            Text("Transcript segments: \(model.transcriptModel.segments.count)")
+                            if let last = model.transcriptModel.lastTranscriptAt {
+                                Text("Last transcript: \(timeFormatter.string(from: last))")
+                            }
+                            if !model.transcriptModel.lastTranscriptText.isEmpty {
+                                let snippet = model.transcriptModel.lastTranscriptText.prefix(120)
+                                Text("Last text: \(snippet)")
+                            }
                         }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(8)
                     }
+                    .font(.caption)
+
+                    AttachmentsCard()
 
                     Spacer()
                 }
@@ -117,32 +130,67 @@ struct SessionView: View {
             }
         }
         .padding(16)
+        .focusable()
+        .focused($isViewFocused)
+        .onAppear {
+            pendingTitle = model.currentSession?.title ?? ""
+            isViewFocused = true
+        }
+        .onChange(of: model.currentSession?.title) { _, newValue in
+            guard !isEditingTitle else { return }
+            pendingTitle = newValue ?? ""
+        }
+        .onKeyPress(keys: [.init("v")], phases: .down) { keyPress in
+            guard !isEditingTitle else { return .ignored }
+            guard keyPress.modifiers.contains(.command) else { return .ignored }
+            handlePasteFromClipboard()
+            return .handled
+        }
         .sheet(isPresented: $showSpeakers) {
             SpeakersSheet()
         }
-        .sheet(isPresented: $showRenameSheet) {
-            RenameMeetingSheet(
-                title: $renameTitle,
-                onCancel: { showRenameSheet = false },
-                onSave: {
-                    model.renameCurrentMeeting(to: renameTitle)
-                    showRenameSheet = false
-                }
-            )
+    }
+
+    private func handlePasteFromClipboard() {
+        let pasteboard = NSPasteboard.general
+
+        // Try image first (various types)
+        if let image = NSImage(pasteboard: pasteboard) {
+            model.saveImageAttachment(image)
+            return
+        }
+
+        // Fall back to text
+        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            model.saveTextAttachment(text)
         }
     }
 
     private var header: some View {
         HStack {
             VStack(alignment: .leading) {
-                Button {
-                    renameTitle = model.currentSession?.title ?? ""
-                    showRenameSheet = true
-                } label: {
+                if isEditingTitle {
+                    TextField("Meeting title", text: $pendingTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.title2.weight(.bold))
+                        .focused($isTitleFieldFocused)
+                        .onSubmit {
+                            commitTitleEdit()
+                        }
+                        .onChange(of: isTitleFieldFocused) { _, focused in
+                            guard !focused else { return }
+                            commitTitleEdit()
+                        }
+                        .onExitCommand {
+                            cancelTitleEdit()
+                        }
+                } else {
                     Text(model.currentSession?.title ?? "Meeting")
                         .font(.title2).bold()
+                        .onTapGesture {
+                            startTitleEdit()
+                        }
                 }
-                .buttonStyle(.plain)
                 if let folder = model.currentSession?.folderURL.path {
                     Text(folder)
                         .font(.footnote)
@@ -152,6 +200,33 @@ struct SessionView: View {
             }
             Spacer()
         }
+    }
+
+    private func startTitleEdit() {
+        pendingTitle = model.currentSession?.title ?? ""
+        isEditingTitle = true
+        DispatchQueue.main.async {
+            isTitleFieldFocused = true
+        }
+    }
+
+    private func commitTitleEdit() {
+        guard isEditingTitle else { return }
+        let trimmed = pendingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed != model.currentSession?.title {
+            model.renameCurrentMeeting(to: trimmed)
+        } else {
+            pendingTitle = model.currentSession?.title ?? ""
+        }
+        isEditingTitle = false
+        isViewFocused = true
+    }
+
+    private func cancelTitleEdit() {
+        guard isEditingTitle else { return }
+        pendingTitle = model.currentSession?.title ?? ""
+        isEditingTitle = false
+        isViewFocused = true
     }
 
     private func transcriptPane(autoScroll: Bool) -> some View {

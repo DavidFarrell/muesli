@@ -501,6 +501,7 @@ struct SpeakerMappingSheet: View {
     let onCancel: () -> Void
 
     @State private var workingMappings: [SpeakerIdentifier.SpeakerMapping]
+    @FocusState private var focusedMappingIndex: Int?
 
     init(
         mappings: [SpeakerIdentifier.SpeakerMapping],
@@ -533,6 +534,15 @@ struct SpeakerMappingSheet: View {
                             get: { workingMappings[index].name },
                             set: { workingMappings[index].name = $0 }
                         ))
+                        .focused($focusedMappingIndex, equals: index)
+                        .onKeyPress(keys: [.init("\t")], phases: .down) { keyPress in
+                            let moved = moveFocus(
+                                from: index,
+                                count: workingMappings.count,
+                                backwards: keyPress.modifiers.contains(.shift)
+                            )
+                            return moved ? .handled : .ignored
+                        }
 
                         Text(confidenceText(for: workingMappings[index].confidence))
                             .font(.caption2)
@@ -551,6 +561,13 @@ struct SpeakerMappingSheet: View {
         }
         .padding(16)
         .frame(width: 560, height: 420)
+    }
+
+    private func moveFocus(from index: Int, count: Int, backwards: Bool) -> Bool {
+        let target = backwards ? (index - 1) : (index + 1)
+        guard target >= 0, target < count else { return false }
+        focusedMappingIndex = target
+        return true
     }
 
     private func confidenceText(for confidence: Double) -> String {
