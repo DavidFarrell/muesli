@@ -152,6 +152,20 @@ struct NewMeetingView: View {
             Text("New meeting")
                 .font(.largeTitle).bold()
 
+            if model.isFinalizing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Processing meeting files...")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(.thinMaterial)
+                .cornerRadius(8)
+            }
+
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 12) {
@@ -177,7 +191,7 @@ struct NewMeetingView: View {
                 Button(model.isLoadingShareableContent ? "Loading..." : "Refresh sources") {
                     Task { await model.loadShareableContent() }
                 }
-                .disabled(model.isLoadingShareableContent)
+                .disabled(model.isLoadingShareableContent || model.isStartingMeeting)
             }
 
             HStack(spacing: 16) {
@@ -246,7 +260,7 @@ struct NewMeetingView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Picker("Input", selection: Binding(
                         get: { model.selectedInputDeviceID },
-                        set: { model.selectedInputDeviceID = $0 }
+                        set: { model.selectInputDevice($0) }
                     )) {
                         ForEach(model.inputDevices, id: \.id) { device in
                             Text(device.name)
@@ -258,8 +272,32 @@ struct NewMeetingView: View {
                         model.loadInputDevices()
                     }
                     .buttonStyle(.link)
+                    .disabled(model.isSwitchingInputDevice)
 
-                    Text("Changing the mic uses the system default input. Restart the meeting to apply.")
+                    if model.isSwitchingInputDevice {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Switching microphone...")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Text("Changing the mic applies to the live input preview and active meeting.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+            }
+
+            GroupBox("Live input check") {
+                VStack(alignment: .leading, spacing: 10) {
+                    LevelMeter(label: "System", level: model.systemLevel)
+                    LevelMeter(label: "Microphone", level: model.micLevel)
+                    Text(model.isPreviewingLevels
+                         ? "Previewing live levels before recording."
+                         : "Level preview unavailable. Check permissions and selected source.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -330,11 +368,11 @@ struct NewMeetingView: View {
 
             HStack {
                 Spacer()
-                Button("Start meeting") {
+                Button(model.isStartingMeeting ? "Starting..." : "Start meeting") {
                     Task { await model.startMeeting() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.shouldShowOnboarding)
+                .disabled(model.shouldShowOnboarding || model.isStartingMeeting || model.isFinalizing)
             }
 
             GroupBox("Recent meetings") {
@@ -433,6 +471,13 @@ struct NewMeetingView: View {
         }
         .onAppear {
             model.refreshMeetingTitleForDateRollover()
+            Task { await model.startHomeLevelPreview() }
+        }
+        .onDisappear {
+            Task { await model.stopHomeLevelPreview() }
+        }
+        .onChange(of: model.selectedDisplayID) { _, _ in
+            Task { await model.refreshHomeLevelPreview() }
         }
         .onReceive(rolloverTicker) { _ in
             model.refreshMeetingTitleForDateRollover()
@@ -676,6 +721,29 @@ struct AudioDevice: Identifiable, Hashable {
 }
 
 enum AudioDeviceManager {
+    private static let observerQueue = DispatchQueue(label: "muesli.audio.device.observer", qos: .utility)
+    private static var observerInstalled = false
+    private static var observerHandler: (() -> Void)?
+
+    static func observeInputDeviceChanges(_ onChange: @escaping () -> Void) {
+        observerHandler = onChange
+        guard !observerInstalled else { return }
+        observerInstalled = true
+
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        for addressTemplate in observedAddresses {
+            var address = addressTemplate
+            let status = AudioObjectAddPropertyListenerBlock(systemObject, &address, observerQueue) { _, _ in
+                DispatchQueue.main.async {
+                    Self.observerHandler?()
+                }
+            }
+            if status != noErr {
+                print("[AudioDeviceManager] Failed to add input observer (\(addressTemplate.mSelector)): \(status)")
+            }
+        }
+    }
+
     static func inputDevices() -> [AudioDevice] {
         let systemObject = AudioObjectID(kAudioObjectSystemObject)
         var address = AudioObjectPropertyAddress(
@@ -778,5 +846,20 @@ enum AudioDeviceManager {
         let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
         let channelCount = buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
         return channelCount > 0
+    }
+
+    private static var observedAddresses: [AudioObjectPropertyAddress] {
+        [
+            AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            ),
+            AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+        ]
     }
 }

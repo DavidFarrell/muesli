@@ -6,13 +6,36 @@ enum AudioConverterHelper {
         buffer: AVAudioPCMBuffer,
         targetSampleRate: Double = 16000
     ) -> Data? {
-        guard let floatData = buffer.floatChannelData else { return nil }
-
         let sourceRate = buffer.format.sampleRate
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0 else { return nil }
 
-        let sourcePtr = floatData[0]
+        let channels = max(1, Int(buffer.format.channelCount))
+        let interleaved = buffer.format.isInterleaved
+        let sourceFloats: [Float]
+
+        if let floatData = buffer.floatChannelData {
+            let sourcePtr = floatData[0]
+            sourceFloats = (0..<frameCount).map { frameIndex in
+                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
+                return sourcePtr[sampleIndex]
+            }
+        } else if let int16Data = buffer.int16ChannelData {
+            let sourcePtr = int16Data[0]
+            sourceFloats = (0..<frameCount).map { frameIndex in
+                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
+                return Float(sourcePtr[sampleIndex]) / 32768.0
+            }
+        } else if let int32Data = buffer.int32ChannelData {
+            let sourcePtr = int32Data[0]
+            sourceFloats = (0..<frameCount).map { frameIndex in
+                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
+                return Float(sourcePtr[sampleIndex]) / 2147483648.0
+            }
+        } else {
+            return nil
+        }
+
         let step = Float(sourceRate / targetSampleRate)
         guard step > 0 else { return nil }
 
@@ -26,9 +49,20 @@ enum AudioConverterHelper {
         vDSP_vramp(&start, &stride, &indices, 1, vDSP_Length(outputFrames))
 
         var resampled = [Float](repeating: 0, count: outputFrames)
+        guard !sourceFloats.isEmpty else { return nil }
         indices.withUnsafeBufferPointer { idxPtr in
             resampled.withUnsafeMutableBufferPointer { outPtr in
-                vDSP_vlint(sourcePtr, idxPtr.baseAddress!, 1, outPtr.baseAddress!, 1, vDSP_Length(outputFrames), vDSP_Length(frameCount))
+                sourceFloats.withUnsafeBufferPointer { srcPtr in
+                    vDSP_vlint(
+                        srcPtr.baseAddress!,
+                        idxPtr.baseAddress!,
+                        1,
+                        outPtr.baseAddress!,
+                        1,
+                        vDSP_Length(outputFrames),
+                        vDSP_Length(frameCount)
+                    )
+                }
             }
         }
 

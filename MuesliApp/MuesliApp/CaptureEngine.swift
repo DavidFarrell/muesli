@@ -230,7 +230,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func startCapture(
         contentFilter: SCContentFilter,
-        writer: FramedWriter,
+        writer: FramedWriter?,
         recordTo url: URL?
     ) async throws {
         audioState.withState { state in

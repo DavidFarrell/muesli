@@ -100,15 +100,12 @@ final class AppModel: ObservableObject {
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
     @Published var inputDevices: [AudioDevice] = []
-    @Published var selectedInputDeviceID: UInt32 = 0 {
-        didSet {
-            if selectedInputDeviceID != 0 {
-                _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
-            }
-        }
-    }
+    @Published var selectedInputDeviceID: UInt32 = 0
     @Published var backendLogTail: [String] = []
     @Published var micLevel: Float = 0
+    @Published var isPreviewingLevels = false
+    @Published private(set) var isStartingMeeting = false
+    @Published private(set) var isSwitchingInputDevice = false
     @Published var debugMicBuffers: Int = 0
     @Published var debugMicFrames: Int = 0
     @Published var debugMicPTS: Double = 0
@@ -121,6 +118,10 @@ final class AppModel: ObservableObject {
 
     private let captureEngine = CaptureEngine()
     private var micEngine: MicEngine?
+    private var previewMicEngine: MicEngine?
+    private var isPreviewCaptureRunning = false
+    private var previewLifecycleTask: Task<Void, Never>?
+    private var inputDeviceSelectionTask: Task<Void, Never>?
     private var micStartTime: Date?
     private var micOutputEnabled = false
     private var pendingMicAudio: [PendingAudio] = []
@@ -198,10 +199,17 @@ final class AppModel: ObservableObject {
 
     init() {
         captureEngine.onLevelsUpdated = { [weak self] in
-            self?.objectWillChange.send()
+            Task { @MainActor [weak self] in
+                self?.objectWillChange.send()
+            }
         }
         transcriptCancellable = transcriptModel.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            Task { @MainActor [weak self] in
+                self?.objectWillChange.send()
+            }
+        }
+        AudioDeviceManager.observeInputDeviceChanges { [weak self] in
+            self?.loadInputDevices()
         }
         refreshPermissions()
         loadInputDevices()
@@ -408,16 +416,41 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func appendBackendLog(_ line: String, toTail: Bool, handle: FileHandle? = nil) {
-        let trimmed = line.trimmingCharacters(in: .newlines)
-        if let data = (trimmed + "\n").data(using: .utf8) {
-            (handle ?? backendLogHandle)?.write(data)
-        }
-        guard toTail else { return }
-        backendLogTail.append(trimmed)
+    private func appendBackendLogTail(_ line: String) {
+        backendLogTail.append(line)
         if backendLogTail.count > backendLogTailLimit {
             backendLogTail.removeFirst(backendLogTail.count - backendLogTailLimit)
         }
+    }
+
+    private func writeDataToHandle(_ data: Data, handle: FileHandle?) -> Error? {
+        guard let handle else { return nil }
+        do {
+            try handle.write(contentsOf: data)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
+    private func synchronizeHandle(_ handle: FileHandle?, label: String) {
+        guard let handle else { return }
+        do {
+            try handle.synchronize()
+        } catch {
+            appendBackendLogTail("Failed to flush \(label): \(error.localizedDescription)")
+        }
+    }
+
+    private func appendBackendLog(_ line: String, toTail: Bool, handle: FileHandle? = nil) {
+        let trimmed = line.trimmingCharacters(in: .newlines)
+        if let data = (trimmed + "\n").data(using: .utf8) {
+            if let error = writeDataToHandle(data, handle: handle ?? backendLogHandle), toTail {
+                appendBackendLogTail("[backend.log write failed] \(error.localizedDescription)")
+            }
+        }
+        guard toTail else { return }
+        appendBackendLogTail(trimmed)
     }
 
     private func handleBackendWriteError(_ error: Error) {
@@ -435,7 +468,13 @@ final class AppModel: ObservableObject {
         ingestIntoLiveTranscript: Bool
     ) {
         if let data = (line + "\n").data(using: .utf8) {
-            transcriptEventsHandle?.write(data)
+            if let error = writeDataToHandle(data, handle: transcriptEventsHandle) {
+                appendBackendLog(
+                    "Failed to append transcript event: \(error.localizedDescription)",
+                    toTail: ingestIntoLiveTranscript,
+                    handle: backendLogHandle
+                )
+            }
         }
         if let data = line.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -504,6 +543,246 @@ final class AppModel: ObservableObject {
             if pendingMicAudio.count > maxPendingMicAudio {
                 pendingMicAudio.removeFirst(pendingMicAudio.count - maxPendingMicAudio)
             }
+        }
+    }
+
+    private func handlePreviewMicAudio(_ data: Data) {
+        micLevel = rmsLevelInt16(data)
+    }
+
+    private var isStartScreenActive: Bool {
+        if case .start = activeScreen { return true }
+        return false
+    }
+
+    private func runPreviewLifecycleOperation(
+        _ operation: @escaping @MainActor (AppModel) async -> Void
+    ) async {
+        let previousTask = previewLifecycleTask
+        let task = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            await operation(self)
+        }
+        previewLifecycleTask = task
+        await task.value
+    }
+
+    private func queueInputDeviceSelectionChange(to newValue: UInt32) {
+        let previousTask = inputDeviceSelectionTask
+        let task = Task { @MainActor [weak self] in
+            await previousTask?.value
+            await Task.yield()
+            guard let self else { return }
+            await self.applyInputDeviceSelectionChange(to: newValue)
+        }
+        inputDeviceSelectionTask = task
+    }
+
+    private func applyInputDeviceSelectionChange(to newValue: UInt32) async {
+        guard newValue != 0 else { return }
+        guard selectedInputDeviceID == newValue else { return }
+
+        isSwitchingInputDevice = true
+        defer { isSwitchingInputDevice = false }
+
+        guard AudioDeviceManager.setDefaultInputDevice(newValue) else {
+            debugMicErrors += 1
+            debugMicErrorMessage = "mic_device_switch_failed"
+            loadInputDevices()
+            appendBackendLog("Failed to switch microphone to \(inputDeviceName(for: newValue)).", toTail: true)
+            return
+        }
+
+        await waitForDefaultInputDevice(newValue, timeoutSeconds: 1.0)
+        appendBackendLog("Microphone switched to \(inputDeviceName(for: newValue)).", toTail: isCapturing)
+
+        if isCapturing {
+            await restartMeetingMicEngineForInputSwitch()
+        } else if previewMicEngine != nil {
+            await restartPreviewMicEngineForInputSwitch()
+        }
+    }
+
+    private func waitForDefaultInputDevice(_ id: UInt32, timeoutSeconds: Double) async {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if AudioDeviceManager.defaultInputDeviceID() == id {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private func inputDeviceName(for id: UInt32) -> String {
+        if let name = inputDevices.first(where: { $0.id == id })?.name {
+            return name
+        }
+        return "Device \(id)"
+    }
+
+    func selectInputDevice(_ id: UInt32) {
+        guard id != 0 else { return }
+        guard id != selectedInputDeviceID else { return }
+        selectedInputDeviceID = id
+        let selectedID = id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.selectedInputDeviceID == selectedID else { return }
+            self.queueInputDeviceSelectionChange(to: selectedID)
+        }
+    }
+
+    private func startHomeLevelPreviewNow() async {
+        guard !isCapturing else { return }
+        guard !isStartingMeeting else { return }
+        guard !shouldShowOnboarding else {
+            isPreviewingLevels = false
+            return
+        }
+        guard isStartScreenActive else {
+            isPreviewingLevels = false
+            return
+        }
+
+        if !isPreviewCaptureRunning {
+            guard let display = selectedDisplay ?? displays.first else {
+                isPreviewingLevels = previewMicEngine != nil
+                return
+            }
+            let audioFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            do {
+                try await captureEngine.startCapture(contentFilter: audioFilter, writer: nil, recordTo: nil)
+                guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
+                    await captureEngine.stopCapture()
+                    isPreviewCaptureRunning = false
+                    isPreviewingLevels = false
+                    return
+                }
+                captureEngine.setAudioOutputEnabled(false)
+                isPreviewCaptureRunning = true
+            } catch {
+                shareableContentError = "Failed to start system audio preview: \(error.localizedDescription)"
+            }
+        }
+
+        if previewMicEngine == nil {
+            let engine = MicEngine()
+            previewMicEngine = engine
+            do {
+                try await engine.start(preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+                    Task { @MainActor in
+                        self?.handlePreviewMicAudio(data)
+                    }
+                }
+                guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
+                    await engine.stop()
+                    previewMicEngine = nil
+                    isPreviewingLevels = isPreviewCaptureRunning
+                    return
+                }
+            } catch {
+                previewMicEngine = nil
+                debugMicErrors += 1
+                debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
+            }
+        }
+
+        isPreviewingLevels = isPreviewCaptureRunning || (previewMicEngine != nil)
+    }
+
+    private func stopHomeLevelPreviewNow() async {
+        if let engine = previewMicEngine {
+            await engine.stop()
+            previewMicEngine = nil
+        }
+
+        if isCapturing {
+            // Never stop captureEngine here during a live meeting.
+            isPreviewCaptureRunning = false
+            isPreviewingLevels = false
+            return
+        }
+
+        if isPreviewCaptureRunning {
+            await captureEngine.stopCapture()
+            isPreviewCaptureRunning = false
+        }
+
+        isPreviewingLevels = false
+        micLevel = 0
+        captureEngine.systemLevel = 0
+        objectWillChange.send()
+    }
+
+    func startHomeLevelPreview() async {
+        await runPreviewLifecycleOperation { model in
+            await model.startHomeLevelPreviewNow()
+        }
+    }
+
+    func stopHomeLevelPreview() async {
+        await runPreviewLifecycleOperation { model in
+            await model.stopHomeLevelPreviewNow()
+        }
+    }
+
+    func refreshHomeLevelPreview() async {
+        await runPreviewLifecycleOperation { model in
+            await model.stopHomeLevelPreviewNow()
+            await model.startHomeLevelPreviewNow()
+        }
+    }
+
+    private func startMeetingMicEngine() async {
+        guard transcribeMic else {
+            micEngine = nil
+            micOutputEnabled = false
+            return
+        }
+
+        let engine = MicEngine()
+        micEngine = engine
+
+        do {
+            try await engine.start(preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+                Task { @MainActor in
+                    self?.handleMicAudio(data)
+                }
+            }
+            micOutputEnabled = true
+            debugMicErrorMessage = "-"
+        } catch {
+            micEngine = nil
+            micOutputEnabled = false
+            debugMicErrors += 1
+            debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
+            appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
+        }
+    }
+
+    private func restartMeetingMicEngineForInputSwitch() async {
+        guard isCapturing else { return }
+        guard transcribeMic else { return }
+
+        if let engine = micEngine {
+            await engine.stop()
+            micEngine = nil
+        }
+
+        pendingMicAudio.removeAll()
+        micOutputEnabled = false
+        micLevel = 0
+        await startMeetingMicEngine()
+    }
+
+    private func restartPreviewMicEngineForInputSwitch() async {
+        await runPreviewLifecycleOperation { model in
+            if let engine = model.previewMicEngine {
+                await engine.stop()
+                model.previewMicEngine = nil
+            }
+            await model.startHomeLevelPreviewNow()
         }
     }
 
@@ -740,6 +1019,10 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 await captureThumbnails()
             }
+
+            if isStartScreenActive && !isCapturing {
+                await refreshHomeLevelPreview()
+            }
         } catch {
             shareableContentError = String(describing: error)
             screenPermissionGranted = false
@@ -765,10 +1048,35 @@ final class AppModel: ObservableObject {
     }
 
     func loadInputDevices() {
-        inputDevices = AudioDeviceManager.inputDevices()
-        if selectedInputDeviceID == 0 {
-            let defaultID = AudioDeviceManager.defaultInputDeviceID()
-            selectedInputDeviceID = defaultID ?? inputDevices.first?.id ?? 0
+        let available = AudioDeviceManager.inputDevices()
+        inputDevices = available
+
+        let availableIDs = Set(available.map(\.id))
+        let defaultID = AudioDeviceManager.defaultInputDeviceID()
+        let previousSelection = selectedInputDeviceID
+        let resolvedSelection: UInt32
+
+        if availableIDs.contains(selectedInputDeviceID) {
+            resolvedSelection = selectedInputDeviceID
+        } else if let defaultID, availableIDs.contains(defaultID) {
+            resolvedSelection = defaultID
+        } else {
+            resolvedSelection = available.first?.id ?? 0
+        }
+
+        if selectedInputDeviceID != resolvedSelection {
+            selectedInputDeviceID = resolvedSelection
+        }
+
+        guard resolvedSelection != 0 else { return }
+        guard previousSelection != 0 else { return }
+        guard previousSelection != resolvedSelection else { return }
+
+        let selectedID = resolvedSelection
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.selectedInputDeviceID == selectedID else { return }
+            self.queueInputDeviceSelectionChange(to: selectedID)
         }
     }
 
@@ -881,7 +1189,11 @@ final class AppModel: ObservableObject {
     }
 
     func startMeeting() async {
+        guard !isStartingMeeting else { return }
         await startMeeting(resuming: nil, metadata: nil, timestampOffset: 0)
+        if !isCapturing, case .start = activeScreen {
+            await startHomeLevelPreview()
+        }
     }
 
     private func startMeeting(
@@ -889,6 +1201,10 @@ final class AppModel: ObservableObject {
         metadata: MeetingMetadata?,
         timestampOffset: Double
     ) async {
+        guard !isStartingMeeting else { return }
+        isStartingMeeting = true
+        defer { isStartingMeeting = false }
+        await stopHomeLevelPreview()
         refreshMeetingTitleForDateRollover()
         refreshPermissions()
         backendFolderError = nil
@@ -998,6 +1314,7 @@ final class AppModel: ObservableObject {
 
             if selectedInputDeviceID != 0 {
                 _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
+                await waitForDefaultInputDevice(selectedInputDeviceID, timeoutSeconds: 1.0)
             }
 
             guard startBackendAccess(for: backendProjectRoot) else {
@@ -1139,23 +1456,8 @@ final class AppModel: ObservableObject {
             resetMicDebugState()
             pendingMicAudio.removeAll()
             micOutputEnabled = false
-            micStartTime = nil
-            if transcribeMic {
-                let engine = MicEngine()
-                micEngine = engine
-                do {
-                    try await engine.start { [weak self] data in
-                        Task { @MainActor in
-                            self?.handleMicAudio(data)
-                        }
-                    }
-                } catch {
-                    micEngine = nil
-                    debugMicErrors += 1
-                    debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
-                    appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
-                }
-            }
+            micStartTime = Date()
+            await startMeetingMicEngine()
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
             let systemSampleRate = formats.systemSampleRate ?? captureSampleRate
@@ -1192,7 +1494,6 @@ final class AppModel: ObservableObject {
                 micChannels: micChannels
             )
             captureEngine.setAudioOutputEnabled(true)
-            micOutputEnabled = micEngine != nil
             flushPendingMicAudio()
 
             if captureMode == .video {
@@ -1276,12 +1577,12 @@ final class AppModel: ObservableObject {
         isCapturing = false
         currentSession = nil
         activeScreen = .start
-        isFinalizing = false
 
         guard let stoppingSession else {
             closeHandle(stoppingTranscriptEventsHandle)
             closeHandle(stoppingBackendLogHandle)
             stopBackendAccess(for: stoppingBackendAccessURL)
+            isFinalizing = false
             return
         }
 
@@ -1318,6 +1619,7 @@ final class AppModel: ObservableObject {
             closeHandle(transcriptEventsHandle)
             closeHandle(backendLogHandle)
             stopBackendAccess(for: backendAccessURL)
+            isFinalizing = false
         }
 
         let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
@@ -1331,8 +1633,8 @@ final class AppModel: ObservableObject {
         }
         backend?.cleanup()
         await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
-        transcriptEventsHandle?.synchronizeFile()
-        backendLogHandle?.synchronizeFile()
+        synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
+        synchronizeHandle(backendLogHandle, label: "backend log")
 
         let model = TranscriptModel()
         model.timestampOffset = timestampOffsetSnapshot

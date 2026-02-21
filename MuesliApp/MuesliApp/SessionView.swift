@@ -76,6 +76,42 @@ struct SessionView: View {
                         .padding(8)
                     }
 
+                    GroupBox("Microphone input") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Picker("Input", selection: Binding(
+                                get: { model.selectedInputDeviceID },
+                                set: { model.selectInputDevice($0) }
+                            )) {
+                                ForEach(model.inputDevices, id: \.id) { device in
+                                    Text(device.name)
+                                        .tag(device.id)
+                                }
+                            }
+                            .disabled(model.isSwitchingInputDevice)
+
+                            Button("Refresh microphones") {
+                                model.loadInputDevices()
+                            }
+                            .buttonStyle(.link)
+                            .disabled(model.isSwitchingInputDevice)
+
+                            if model.isSwitchingInputDevice {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Switching input...")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+
+                            Text("Switching input restarts mic capture briefly and continues recording.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(8)
+                    }
+
                     DisclosureGroup("Debug", isExpanded: $showDebug) {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
