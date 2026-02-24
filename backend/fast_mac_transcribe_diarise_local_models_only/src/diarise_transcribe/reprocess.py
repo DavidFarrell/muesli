@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,86 @@ def emit_status(stage: str, stream: Optional[str] = None) -> None:
     if stream:
         payload["stream"] = stream
     emit(payload)
+
+
+def format_exception_message(error: Exception) -> str:
+    detail = str(error).strip()
+    if detail:
+        return f"{type(error).__name__}: {detail}"
+    return type(error).__name__
+
+
+def _discover_session_audio_dirs(meeting_dir: Path, verbose: bool) -> list[Path]:
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg, file=sys.stderr)
+
+    session_dirs: list[Path] = []
+    seen: set[str] = set()
+
+    metadata_path = meeting_dir / "meeting.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            log(f"Warning: failed to parse meeting.json ({format_exception_message(error)})")
+        else:
+            raw_sessions = metadata.get("sessions")
+            if isinstance(raw_sessions, list):
+                ordered_sessions: list[tuple[tuple[int, int, int], str]] = []
+                for idx, session in enumerate(raw_sessions):
+                    if not isinstance(session, dict):
+                        continue
+                    folder = session.get("audio_folder")
+                    if not isinstance(folder, str):
+                        continue
+                    folder = folder.strip()
+                    if not folder:
+                        continue
+                    session_id = session.get("session_id")
+                    if isinstance(session_id, int):
+                        sort_key = (0, session_id, idx)
+                    else:
+                        sort_key = (1, idx, idx)
+                    ordered_sessions.append((sort_key, folder))
+
+                for _, folder in sorted(ordered_sessions, key=lambda item: item[0]):
+                    path = meeting_dir / folder
+                    resolved = str(path.resolve())
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    if not path.exists() or not path.is_dir():
+                        log(f"Warning: session audio folder missing: {path}")
+                        continue
+                    session_dirs.append(path)
+
+    if session_dirs:
+        return session_dirs
+
+    fallback_dirs: list[Path] = []
+    default_audio = meeting_dir / "audio"
+    if default_audio.exists() and default_audio.is_dir():
+        fallback_dirs.append(default_audio)
+        seen.add(str(default_audio.resolve()))
+
+    try:
+        entries = sorted(meeting_dir.iterdir(), key=lambda p: p.name)
+    except FileNotFoundError:
+        entries = []
+
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if not entry.name.lower().startswith("audio"):
+            continue
+        resolved = str(entry.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        fallback_dirs.append(entry)
+
+    return fallback_dirs
 
 
 def reprocess_stream(
@@ -125,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "meeting_dir",
-        help="Path to meeting directory containing audio/ folder",
+        help="Path to meeting directory containing audio session folders",
     )
     parser.add_argument(
         "--stream",
@@ -178,57 +259,80 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    meeting_dir = Path(args.meeting_dir).expanduser().resolve()
-    audio_dir = meeting_dir / "audio"
-    if not audio_dir.exists():
-        emit({"type": "error", "message": "audio folder not found"})
-        print(f"Audio folder not found: {audio_dir}", file=sys.stderr)
-        return 1
-
-    streams = ["system", "mic"] if args.stream == "both" else [args.stream]
-    audio_paths = {}
-    for stream in streams:
-        filename = STREAM_FILES[stream]
-        path = audio_dir / filename
-        if not path.exists():
-            emit({"type": "error", "message": f"missing audio for {stream}"})
-            print(f"Missing audio file: {path}", file=sys.stderr)
+    try:
+        meeting_dir = Path(args.meeting_dir).expanduser().resolve()
+        session_audio_dirs = _discover_session_audio_dirs(meeting_dir, verbose=args.verbose)
+        if not session_audio_dirs:
+            emit({"type": "error", "message": "audio folder not found"})
+            print(f"No audio folders found in: {meeting_dir}", file=sys.stderr)
             return 1
-        audio_paths[stream] = path
 
-    emit_status("preparing")
+        streams = ["system", "mic"] if args.stream == "both" else [args.stream]
 
-    all_turns = []
-    all_speakers = set()
-    durations = []
+        emit_status("preparing")
 
-    for stream, path in audio_paths.items():
-        result = reprocess_stream(
-            path,
-            stream,
-            diar_backend=args.diar_backend,
-            diar_model=args.diar_model,
-            asr_model=args.asr_model,
-            language=args.language,
-            gap_threshold=args.gap_threshold,
-            speaker_tolerance=args.speaker_tolerance,
-            verbose=args.verbose,
-        )
-        all_turns.extend(result["turns"])
-        all_speakers.update(result["speakers"])
-        durations.append(result["duration"])
+        all_turns = []
+        all_speakers = set()
+        running_offset = 0.0
 
-    all_turns.sort(key=lambda item: (item["t0"], item["stream"], item["speaker_id"]))
-    duration = max(durations + [max((t["t1"] for t in all_turns), default=0.0)])
+        for session_audio_dir in session_audio_dirs:
+            session_duration = 0.0
+            for stream in streams:
+                filename = STREAM_FILES[stream]
+                path = session_audio_dir / filename
+                if not path.exists():
+                    emit({"type": "error", "message": f"missing audio for {stream}"})
+                    print(f"Missing audio file: {path}", file=sys.stderr)
+                    return 1
 
-    emit_status("complete")
-    emit({
-        "type": "result",
-        "turns": all_turns,
-        "speakers": sorted(all_speakers),
-        "duration": duration,
-    })
-    return 0
+                try:
+                    result = reprocess_stream(
+                        path,
+                        stream,
+                        diar_backend=args.diar_backend,
+                        diar_model=args.diar_model,
+                        asr_model=args.asr_model,
+                        language=args.language,
+                        gap_threshold=args.gap_threshold,
+                        speaker_tolerance=args.speaker_tolerance,
+                        verbose=args.verbose,
+                    )
+                except Exception as error:
+                    message = f"{stream} reprocess failed ({format_exception_message(error)})"
+                    emit({"type": "error", "message": message})
+                    print(message, file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                    return 1
+
+                local_max_t1 = 0.0
+                for turn in result["turns"]:
+                    local_max_t1 = max(local_max_t1, turn["t1"])
+                    turn["t0"] += running_offset
+                    turn["t1"] += running_offset
+
+                all_turns.extend(result["turns"])
+                all_speakers.update(result["speakers"])
+                session_duration = max(session_duration, result["duration"], local_max_t1)
+
+            running_offset += session_duration
+
+        all_turns.sort(key=lambda item: (item["t0"], item["stream"], item["speaker_id"]))
+        duration = max(running_offset, max((t["t1"] for t in all_turns), default=0.0))
+
+        emit_status("complete")
+        emit({
+            "type": "result",
+            "turns": all_turns,
+            "speakers": sorted(all_speakers),
+            "duration": duration,
+        })
+        return 0
+    except Exception as error:
+        message = f"batch reprocess failed ({format_exception_message(error)})"
+        emit({"type": "error", "message": message})
+        print(message, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
