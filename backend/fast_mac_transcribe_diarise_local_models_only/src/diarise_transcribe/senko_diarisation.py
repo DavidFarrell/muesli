@@ -83,9 +83,21 @@ class SenkoDiarizer:
         # Run Senko diarisation
         result = self._diarizer.diarize(audio_path, generate_colors=False)
 
+        # Senko can return None / empty output for silent inputs.
+        if not result:
+            if not self._quiet:
+                print("No speakers detected in the audio.")
+            return []
+
+        merged_segments = result.get("merged_segments")
+        if not merged_segments:
+            if not self._quiet:
+                print("No speakers detected in the audio.")
+            return []
+
         # Convert Senko segments to our DiarSegment format
         segments = []
-        for seg in result["merged_segments"]:
+        for seg in merged_segments:
             segments.append(DiarSegment(
                 start=seg["start"],
                 end=seg["end"],

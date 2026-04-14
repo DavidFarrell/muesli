@@ -105,7 +105,7 @@ struct SessionView: View {
                                 }
                             }
 
-                            Text("Switching input restarts mic capture briefly and continues recording.")
+                            Text("Muesli follows the macOS default input. Changing it in System Settings restarts mic capture briefly and continues recording.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }

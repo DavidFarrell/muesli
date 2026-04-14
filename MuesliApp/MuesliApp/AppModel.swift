@@ -122,8 +122,11 @@ final class AppModel: ObservableObject {
     private var isPreviewCaptureRunning = false
     private var previewLifecycleTask: Task<Void, Never>?
     private var inputDeviceSelectionTask: Task<Void, Never>?
+    private var micStartupHealthTask: Task<Void, Never>?
     private var micStartTime: Date?
     private var micOutputEnabled = false
+    private var micStartupRecoveryAttempts = 0
+    private let maxMicStartupRecoveryAttempts = 1
     private var pendingMicAudio: [PendingAudio] = []
     private let maxPendingMicAudio = 200
     private let screenshotScheduler = ScreenshotScheduler()
@@ -568,34 +571,47 @@ final class AppModel: ObservableObject {
         await task.value
     }
 
-    private func queueInputDeviceSelectionChange(to newValue: UInt32) {
+    private func queueInputDeviceSelectionChange(to newValue: UInt32, updateSystemDefault: Bool) {
         let previousTask = inputDeviceSelectionTask
         let task = Task { @MainActor [weak self] in
             await previousTask?.value
             await Task.yield()
             guard let self else { return }
-            await self.applyInputDeviceSelectionChange(to: newValue)
+            await self.applyInputDeviceSelectionChange(
+                to: newValue,
+                updateSystemDefault: updateSystemDefault
+            )
         }
         inputDeviceSelectionTask = task
     }
 
-    private func applyInputDeviceSelectionChange(to newValue: UInt32) async {
+    private func applyInputDeviceSelectionChange(
+        to newValue: UInt32,
+        updateSystemDefault: Bool
+    ) async {
         guard newValue != 0 else { return }
         guard selectedInputDeviceID == newValue else { return }
 
         isSwitchingInputDevice = true
         defer { isSwitchingInputDevice = false }
 
-        guard AudioDeviceManager.setDefaultInputDevice(newValue) else {
-            debugMicErrors += 1
-            debugMicErrorMessage = "mic_device_switch_failed"
-            loadInputDevices()
-            appendBackendLog("Failed to switch microphone to \(inputDeviceName(for: newValue)).", toTail: true)
-            return
-        }
+        if updateSystemDefault {
+            guard AudioDeviceManager.setDefaultInputDevice(newValue) else {
+                debugMicErrors += 1
+                debugMicErrorMessage = "mic_device_switch_failed"
+                loadInputDevices()
+                appendBackendLog("Failed to switch microphone to \(inputDeviceName(for: newValue)).", toTail: true)
+                return
+            }
 
-        await waitForDefaultInputDevice(newValue, timeoutSeconds: 1.0)
-        appendBackendLog("Microphone switched to \(inputDeviceName(for: newValue)).", toTail: isCapturing)
+            await waitForDefaultInputDevice(newValue, timeoutSeconds: 1.0)
+            appendBackendLog("Microphone switched to \(inputDeviceName(for: newValue)).", toTail: isCapturing)
+        } else {
+            appendBackendLog(
+                "Microphone followed system default: \(inputDeviceName(for: newValue)).",
+                toTail: isCapturing
+            )
+        }
 
         if isCapturing {
             await restartMeetingMicEngineForInputSwitch()
@@ -629,7 +645,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard self.selectedInputDeviceID == selectedID else { return }
-            self.queueInputDeviceSelectionChange(to: selectedID)
+            self.queueInputDeviceSelectionChange(to: selectedID, updateSystemDefault: true)
         }
     }
 
@@ -738,6 +754,7 @@ final class AppModel: ObservableObject {
         guard transcribeMic else {
             micEngine = nil
             micOutputEnabled = false
+            cancelMicStartupHealthCheck()
             return
         }
 
@@ -752,9 +769,13 @@ final class AppModel: ObservableObject {
             }
             micOutputEnabled = true
             debugMicErrorMessage = "-"
+            if isCapturing {
+                scheduleMicStartupHealthCheck()
+            }
         } catch {
             micEngine = nil
             micOutputEnabled = false
+            cancelMicStartupHealthCheck()
             debugMicErrors += 1
             debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
             appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
@@ -773,6 +794,9 @@ final class AppModel: ObservableObject {
         pendingMicAudio.removeAll()
         micOutputEnabled = false
         micLevel = 0
+        debugMicBuffers = 0
+        debugMicFrames = 0
+        debugMicPTS = 0
         await startMeetingMicEngine()
     }
 
@@ -792,6 +816,36 @@ final class AppModel: ObservableObject {
         pendingMicAudio.removeAll()
         for item in pending {
             writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
+        }
+    }
+
+    private func cancelMicStartupHealthCheck() {
+        micStartupHealthTask?.cancel()
+        micStartupHealthTask = nil
+    }
+
+    private func scheduleMicStartupHealthCheck() {
+        cancelMicStartupHealthCheck()
+        guard transcribeMic else { return }
+
+        micStartupHealthTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            guard isCapturing else { return }
+            guard transcribeMic else { return }
+            guard micEngine != nil else { return }
+            guard debugMicBuffers == 0 else { return }
+
+            guard micStartupRecoveryAttempts < maxMicStartupRecoveryAttempts else {
+                appendBackendLog("Mic health check: still no audio after automatic retry.", toTail: true)
+                return
+            }
+
+            micStartupRecoveryAttempts += 1
+            appendBackendLog("Mic health check: no audio detected after start; restarting microphone capture.", toTail: true)
+            await restartMeetingMicEngineForInputSwitch()
+            scheduleMicStartupHealthCheck()
         }
     }
 
@@ -1071,12 +1125,14 @@ final class AppModel: ObservableObject {
         guard resolvedSelection != 0 else { return }
         guard previousSelection != 0 else { return }
         guard previousSelection != resolvedSelection else { return }
+        guard !isSwitchingInputDevice else { return }
+        guard isCapturing else { return }
 
         let selectedID = resolvedSelection
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard self.selectedInputDeviceID == selectedID else { return }
-            self.queueInputDeviceSelectionChange(to: selectedID)
+            self.queueInputDeviceSelectionChange(to: selectedID, updateSystemDefault: false)
         }
     }
 
@@ -1204,9 +1260,12 @@ final class AppModel: ObservableObject {
         guard !isStartingMeeting else { return }
         isStartingMeeting = true
         defer { isStartingMeeting = false }
+        cancelMicStartupHealthCheck()
+        micStartupRecoveryAttempts = 0
         await stopHomeLevelPreview()
         refreshMeetingTitleForDateRollover()
         refreshPermissions()
+        loadInputDevices()
         backendFolderError = nil
         shareableContentError = nil
         tempTranscriptFolderPath = nil
@@ -1310,11 +1369,6 @@ final class AppModel: ObservableObject {
                 try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
             } else if let metadata {
                 try appendResumeSessionMetadata(metadata, for: session, sessionID: sessionID, audioFolderName: audioDir.lastPathComponent)
-            }
-
-            if selectedInputDeviceID != 0 {
-                _ = AudioDeviceManager.setDefaultInputDevice(selectedInputDeviceID)
-                await waitForDefaultInputDevice(selectedInputDeviceID, timeoutSeconds: 1.0)
             }
 
             guard startBackendAccess(for: backendProjectRoot) else {
@@ -1521,6 +1575,7 @@ final class AppModel: ObservableObject {
 
             isCapturing = true
             activeScreen = .session
+            scheduleMicStartupHealthCheck()
         } catch {
             let pythonPath = backendPythonCandidatePath ?? "(unknown)"
             let nsError = error as NSError
@@ -1538,6 +1593,8 @@ final class AppModel: ObservableObject {
         guard isCapturing else { return }
 
         isFinalizing = true
+        cancelMicStartupHealthCheck()
+        micStartupRecoveryAttempts = 0
 
         screenshotScheduler.stop()
         await captureEngine.stopCapture()

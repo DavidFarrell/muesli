@@ -98,7 +98,7 @@ struct MeetingViewer: View {
                                     .frame(minHeight: 60, maxHeight: 90)
                                     .overlay {
                                         if speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                            Text("Example: The woman with the green jacket is Casey.")
+                                            Text("Example: Recorder is David Gérouville-Farrell. The woman with the green jacket is Casey.")
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                                 .padding(.horizontal, 6)
@@ -422,6 +422,7 @@ struct MeetingViewer: View {
                     screenshots: screenshots,
                     transcript: transcript,
                     speakerIds: speakerIds,
+                    existingSpeakerNames: model.transcriptModel.speakerNames,
                     userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in

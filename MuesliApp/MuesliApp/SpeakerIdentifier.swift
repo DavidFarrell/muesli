@@ -95,6 +95,7 @@ actor SpeakerIdentifier {
         screenshots: [URL],
         transcript: String,
         speakerIds: [String],
+        existingSpeakerNames: [String: String] = [:],
         userHint: String? = nil,
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> IdentificationResult {
@@ -129,7 +130,14 @@ actor SpeakerIdentifier {
         }
 
         let rawResponse = try await requestOllama(images: imagePayloads, prompt: prompt)
-        let mappings = parseMappings(from: rawResponse)
+        let targetSpeakerIds = mappingTargetSpeakerIds(from: speakerIds)
+        let parsedMappings = parseMappings(from: rawResponse, targetSpeakerIds: targetSpeakerIds)
+        let mappings = sanitizeMappings(
+            parsedMappings,
+            speakerIds: speakerIds,
+            existingSpeakerNames: existingSpeakerNames,
+            userHint: userHint
+        )
         print("[SpeakerID DEBUG] === Identification complete: \(mappings.count) mappings ===")
         progressHandler?(.complete)
         return IdentificationResult(mappings: mappings, rawResponse: rawResponse)
@@ -456,6 +464,451 @@ actor SpeakerIdentifier {
         return result
     }
 
+    private func mappingTargetSpeakerIds(from speakerIds: [String]) -> [String] {
+        let hasSystem = speakerIds.contains { $0.lowercased().hasPrefix("system:") }
+        let hasMic = speakerIds.contains { $0.lowercased().hasPrefix("mic:") }
+        if hasSystem && hasMic {
+            return speakerIds
+        }
+        if hasSystem {
+            let systemOnly = speakerIds.filter { $0.lowercased().hasPrefix("system:") }
+            return systemOnly.isEmpty ? speakerIds : systemOnly
+        }
+        if hasMic {
+            let micOnly = speakerIds.filter { $0.lowercased().hasPrefix("mic:") }
+            return micOnly.isEmpty ? speakerIds : micOnly
+        }
+        return speakerIds
+    }
+
+    private func splitSpeakerId(_ raw: String) -> (prefix: String?, base: String) {
+        let compact = raw.components(separatedBy: .whitespacesAndNewlines).joined()
+        let parts = compact.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        if parts.count == 2 {
+            return (String(parts[0]), String(parts[1]))
+        }
+        return (nil, compact)
+    }
+
+    private func speakerIndex(from base: String) -> Int? {
+        let folded = base.folding(
+            options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        if let regex = try? NSRegularExpression(pattern: #"speaker\D*0*([0-9]{1,4})"#, options: [.caseInsensitive]) {
+            let range = NSRange(folded.startIndex..<folded.endIndex, in: folded)
+            if let match = regex.firstMatch(in: folded, options: [], range: range),
+               match.numberOfRanges >= 2,
+               let numberRange = Range(match.range(at: 1), in: folded) {
+                return Int(folded[numberRange])
+            }
+        }
+
+        let digits = folded.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        if !digits.isEmpty {
+            return Int(digits)
+        }
+        return nil
+    }
+
+    private func canonicalTargetSpeakerId(for rawSpeakerId: String, targetSpeakerIds: [String]) -> String? {
+        let compactRaw = rawSpeakerId.components(separatedBy: .whitespacesAndNewlines).joined()
+        guard !compactRaw.isEmpty else { return nil }
+
+        if targetSpeakerIds.contains(compactRaw) {
+            return compactRaw
+        }
+        if let caseInsensitive = targetSpeakerIds.first(where: { $0.caseInsensitiveCompare(compactRaw) == .orderedSame }) {
+            return caseInsensitive
+        }
+
+        let rawParts = splitSpeakerId(compactRaw)
+        let rawPrefix = rawParts.prefix?.lowercased()
+        let candidatePool = targetSpeakerIds.filter { target in
+            guard let rawPrefix else { return true }
+            let targetPrefix = splitSpeakerId(target).prefix?.lowercased()
+            return targetPrefix == rawPrefix
+        }
+
+        let baseMatches = candidatePool.filter {
+            splitSpeakerId($0).base.caseInsensitiveCompare(rawParts.base) == .orderedSame
+        }
+        if baseMatches.count == 1 {
+            return baseMatches[0]
+        }
+
+        if let rawIndex = speakerIndex(from: rawParts.base) {
+            let numericMatches = candidatePool.filter {
+                speakerIndex(from: splitSpeakerId($0).base) == rawIndex
+            }
+            if numericMatches.count == 1 {
+                return numericMatches[0]
+            }
+        }
+
+        return nil
+    }
+
+    private func sanitizeMappings(
+        _ mappings: [SpeakerMapping],
+        speakerIds: [String],
+        existingSpeakerNames: [String: String],
+        userHint: String?
+    ) -> [SpeakerMapping] {
+        let targetSpeakerIds = mappingTargetSpeakerIds(from: speakerIds)
+        guard !targetSpeakerIds.isEmpty else { return [] }
+
+        let hasSystem = speakerIds.contains { $0.lowercased().hasPrefix("system:") }
+        let hasMic = speakerIds.contains { $0.lowercased().hasPrefix("mic:") }
+        let targetSet = Set(targetSpeakerIds)
+
+        var bestBySpeakerId: [String: SpeakerMapping] = [:]
+        for mapping in mappings {
+            guard let speakerId = canonicalTargetSpeakerId(for: mapping.speakerId, targetSpeakerIds: targetSpeakerIds) else {
+                let raw = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !raw.isEmpty {
+                    print("[SpeakerID DEBUG] Ignoring mapping with unmatched speaker_id: \(raw)")
+                }
+                continue
+            }
+            guard targetSet.contains(speakerId) else { continue }
+
+            var normalized = mapping
+            normalized.speakerId = speakerId
+            normalized.name = cleanedMappingName(mapping.name)
+            normalized.confidence = min(max(mapping.confidence, 0.0), 1.0)
+
+            if let existing = bestBySpeakerId[speakerId] {
+                if normalized.confidence > existing.confidence {
+                    bestBySpeakerId[speakerId] = normalized
+                }
+            } else {
+                bestBySpeakerId[speakerId] = normalized
+            }
+        }
+
+        var normalizedMappings: [SpeakerMapping] = targetSpeakerIds.map { speakerId in
+            if let mapping = bestBySpeakerId[speakerId] {
+                return mapping
+            }
+            return SpeakerMapping(speakerId: speakerId, name: "Unknown", confidence: 0.0)
+        }
+
+        let recorderNames = recorderNameCandidates(from: userHint)
+        if hasSystem && hasMic {
+            if !recorderNames.isEmpty {
+                var strongestRecorderMapping: SpeakerMapping?
+                for idx in normalizedMappings.indices {
+                    guard !isUnknownName(normalizedMappings[idx].name) else { continue }
+                    guard isRecorderName(normalizedMappings[idx].name, recorderNames: recorderNames) else { continue }
+
+                    if let existing = strongestRecorderMapping {
+                        if normalizedMappings[idx].confidence > existing.confidence {
+                            strongestRecorderMapping = normalizedMappings[idx]
+                        }
+                    } else {
+                        strongestRecorderMapping = normalizedMappings[idx]
+                    }
+
+                    guard normalizedMappings[idx].speakerId.lowercased().hasPrefix("system:") else { continue }
+                    print("[SpeakerID DEBUG] Blocking recorder name '\(normalizedMappings[idx].name)' from \(normalizedMappings[idx].speakerId); setting Unknown")
+                    normalizedMappings[idx].name = "Unknown"
+                    normalizedMappings[idx].confidence = 0.0
+                }
+
+                let hasRecorderOnMic = normalizedMappings.contains { mapping in
+                    mapping.speakerId.lowercased().hasPrefix("mic:") &&
+                    !isUnknownName(mapping.name) &&
+                    isRecorderName(mapping.name, recorderNames: recorderNames)
+                }
+                if !hasRecorderOnMic,
+                   let strongestRecorderMapping,
+                   !isUnknownName(strongestRecorderMapping.name),
+                   let micIndex = normalizedMappings.indices.first(where: { normalizedMappings[$0].speakerId.lowercased().hasPrefix("mic:") }) {
+                    print("[SpeakerID DEBUG] Assigning recorder name '\(strongestRecorderMapping.name)' to \(normalizedMappings[micIndex].speakerId)")
+                    normalizedMappings[micIndex].name = strongestRecorderMapping.name
+                    normalizedMappings[micIndex].confidence = max(normalizedMappings[micIndex].confidence, strongestRecorderMapping.confidence)
+                }
+            }
+        }
+
+        normalizedMappings = applyExistingNameFallback(
+            normalizedMappings,
+            existingSpeakerNames: existingSpeakerNames,
+            hasSystem: hasSystem,
+            hasMic: hasMic,
+            recorderNames: recorderNames
+        )
+        normalizedMappings = enforceUniqueNonUnknownNames(normalizedMappings)
+
+        if hasSystem {
+            normalizedMappings = fillMissingSystemNamesFromExisting(
+                normalizedMappings,
+                existingSpeakerNames: existingSpeakerNames,
+                hasMic: hasMic,
+                recorderNames: recorderNames
+            )
+            normalizedMappings = enforceUniqueNonUnknownNames(normalizedMappings)
+        }
+
+        return normalizedMappings
+    }
+
+    private func cleanedMappingName(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Unknown" }
+        return trimmed
+    }
+
+    private func normalizePersonName(_ raw: String) -> String {
+        let folded = raw.folding(
+            options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let words = folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        return words.joined(separator: " ")
+    }
+
+    private func isUnknownName(_ raw: String) -> Bool {
+        let normalized = normalizePersonName(raw)
+        if normalized.isEmpty { return true }
+        let unknownTokens: Set<String> = ["unknown", "unk", "na", "none", "n a"]
+        return unknownTokens.contains(normalized)
+    }
+
+    private func recorderNameCandidates(from userHint: String?) -> Set<String> {
+        var recorderNames = Set<String>()
+        for clue in recorderNameClues(from: userHint) {
+            let normalized = normalizePersonName(clue)
+            guard !normalized.isEmpty else { continue }
+            recorderNames.insert(normalized)
+        }
+        return recorderNames
+    }
+
+    private func recorderNameClues(from userHint: String?) -> [String] {
+        var rawNames: [String] = []
+
+        let fullUserName = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fullUserName.isEmpty {
+            rawNames.append(fullUserName)
+        }
+
+        let trimmedHint = userHint?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedHint.isEmpty {
+            let patterns = [
+                #"(?i)\b(?:recorder(?:'s)?\s+name|recorder|mic\s+speaker|microphone\s+speaker)\s*(?:is|=|:)\s*([A-Za-z][A-Za-z'’\-]*(?:\s+[A-Za-z][A-Za-z'’\-]*){0,3})"#,
+                #"(?i)\b(?:i am|i'm|im|my name is)\s+([A-Za-z][A-Za-z'’\-]*(?:\s+[A-Za-z][A-Za-z'’\-]*){0,3})"#,
+                #"(?i)\b([A-Za-z][A-Za-z'’\-]*(?:\s+[A-Za-z][A-Za-z'’\-]*){0,3})\s+is\s+the\s+person\s+on\s+the\s+host\s+machine\b"#,
+            ]
+            for pattern in patterns {
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                let nsRange = NSRange(trimmedHint.startIndex..<trimmedHint.endIndex, in: trimmedHint)
+                regex.enumerateMatches(in: trimmedHint, options: [], range: nsRange) { match, _, _ in
+                    guard let match,
+                          match.numberOfRanges >= 2,
+                          let range = Range(match.range(at: 1), in: trimmedHint) else { return }
+                    let captured = String(trimmedHint[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !captured.isEmpty {
+                        rawNames.append(captured)
+                    }
+                }
+            }
+        }
+
+        var seen = Set<String>()
+        var deduped: [String] = []
+        for candidate in rawNames {
+            let key = normalizePersonName(candidate)
+            guard !key.isEmpty else { continue }
+            if seen.insert(key).inserted {
+                deduped.append(candidate)
+            }
+        }
+        return deduped
+    }
+
+    private func isRecorderName(_ rawName: String, recorderNames: Set<String>) -> Bool {
+        let normalized = normalizePersonName(rawName)
+        guard !normalized.isEmpty else { return false }
+        if recorderNames.contains(normalized) {
+            return true
+        }
+
+        let words = Set(normalized.split(separator: " ").map(String.init))
+        guard !words.isEmpty else { return false }
+
+        for candidate in recorderNames {
+            let candidateWords = candidate.split(separator: " ").map(String.init)
+            guard !candidateWords.isEmpty else { continue }
+            if candidateWords.count == 1 {
+                if words.contains(candidateWords[0]) {
+                    return true
+                }
+                continue
+            }
+            let candidateSet = Set(candidateWords)
+            if candidateSet.isSubset(of: words) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func lookupExistingName(
+        for speakerId: String,
+        in existingSpeakerNames: [String: String]
+    ) -> String? {
+        if let exact = existingSpeakerNames[speakerId]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !exact.isEmpty {
+            return exact
+        }
+        if let ciMatch = existingSpeakerNames.first(where: {
+            $0.key.caseInsensitiveCompare(speakerId) == .orderedSame
+        })?.value.trimmingCharacters(in: .whitespacesAndNewlines),
+           !ciMatch.isEmpty {
+            return ciMatch
+        }
+
+        let targetParts = splitSpeakerId(speakerId)
+        let targetPrefix = targetParts.prefix?.lowercased()
+        let targetBase = targetParts.base
+
+        if let targetPrefix {
+            if let samePrefix = existingSpeakerNames.first(where: { key, value in
+                let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !candidate.isEmpty else { return false }
+                let parts = splitSpeakerId(key)
+                return parts.prefix?.lowercased() == targetPrefix &&
+                    parts.base.caseInsensitiveCompare(targetBase) == .orderedSame
+            })?.value.trimmingCharacters(in: .whitespacesAndNewlines),
+               !samePrefix.isEmpty {
+                return samePrefix
+            }
+        }
+
+        if let suffixMatch = existingSpeakerNames.first(where: { key, value in
+            let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty else { return false }
+            return splitSpeakerId(key).base.caseInsensitiveCompare(targetBase) == .orderedSame
+        })?.value.trimmingCharacters(in: .whitespacesAndNewlines),
+           !suffixMatch.isEmpty {
+            return suffixMatch
+        }
+
+        return nil
+    }
+
+    private func applyExistingNameFallback(
+        _ mappings: [SpeakerMapping],
+        existingSpeakerNames: [String: String],
+        hasSystem: Bool,
+        hasMic: Bool,
+        recorderNames: Set<String>
+    ) -> [SpeakerMapping] {
+        guard !existingSpeakerNames.isEmpty else { return mappings }
+        var result = mappings
+        var fallbackByIndex: [Int: String] = [:]
+        for idx in result.indices {
+            guard let fallback = lookupExistingName(for: result[idx].speakerId, in: existingSpeakerNames) else { continue }
+            guard !isUnknownName(fallback) else { continue }
+            if hasSystem && hasMic &&
+                result[idx].speakerId.lowercased().hasPrefix("system:") &&
+                !recorderNames.isEmpty &&
+                isRecorderName(fallback, recorderNames: recorderNames) {
+                continue
+            }
+            fallbackByIndex[idx] = fallback
+        }
+
+        let hasCompleteCoverage = fallbackByIndex.count == result.count
+
+        for idx in result.indices {
+            guard let fallback = fallbackByIndex[idx] else { continue }
+            let shouldApply: Bool
+            if hasCompleteCoverage {
+                shouldApply = normalizePersonName(result[idx].name) != normalizePersonName(fallback)
+            } else {
+                shouldApply = isUnknownName(result[idx].name)
+            }
+            guard shouldApply else { continue }
+
+            if hasCompleteCoverage {
+                print("[SpeakerID DEBUG] Preserving existing name for \(result[idx].speakerId) as '\(fallback)'")
+                result[idx].confidence = max(result[idx].confidence, 0.995)
+            } else {
+                print("[SpeakerID DEBUG] Filling \(result[idx].speakerId) from existing name '\(fallback)'")
+                result[idx].confidence = max(result[idx].confidence, 0.99)
+            }
+            result[idx].name = fallback
+        }
+        return result
+    }
+
+    private func fillMissingSystemNamesFromExisting(
+        _ mappings: [SpeakerMapping],
+        existingSpeakerNames: [String: String],
+        hasMic: Bool,
+        recorderNames: Set<String>
+    ) -> [SpeakerMapping] {
+        guard !existingSpeakerNames.isEmpty else { return mappings }
+        var result = mappings
+        var usedSystemNames = Set(
+            result
+                .filter { $0.speakerId.lowercased().hasPrefix("system:") && !isUnknownName($0.name) }
+                .map { normalizePersonName($0.name) }
+                .filter { !$0.isEmpty }
+        )
+
+        for idx in result.indices {
+            guard result[idx].speakerId.lowercased().hasPrefix("system:") else { continue }
+            guard isUnknownName(result[idx].name) else { continue }
+            guard let fallback = lookupExistingName(for: result[idx].speakerId, in: existingSpeakerNames) else { continue }
+            guard !isUnknownName(fallback) else { continue }
+
+            let normalizedFallback = normalizePersonName(fallback)
+            guard !normalizedFallback.isEmpty else { continue }
+            if usedSystemNames.contains(normalizedFallback) {
+                continue
+            }
+            if hasMic && !recorderNames.isEmpty && isRecorderName(fallback, recorderNames: recorderNames) {
+                continue
+            }
+
+            print("[SpeakerID DEBUG] Restoring missing system speaker \(result[idx].speakerId) as '\(fallback)'")
+            result[idx].name = fallback
+            result[idx].confidence = max(result[idx].confidence, 0.98)
+            usedSystemNames.insert(normalizedFallback)
+        }
+
+        return result
+    }
+
+    private func enforceUniqueNonUnknownNames(_ mappings: [SpeakerMapping]) -> [SpeakerMapping] {
+        var groups: [String: [Int]] = [:]
+        for (index, mapping) in mappings.enumerated() {
+            guard !isUnknownName(mapping.name) else { continue }
+            let normalized = normalizePersonName(mapping.name)
+            guard !normalized.isEmpty else { continue }
+            groups[normalized, default: []].append(index)
+        }
+
+        var result = mappings
+        for (name, indices) in groups where indices.count > 1 {
+            let keepIndex = indices.max { lhs, rhs in
+                result[lhs].confidence < result[rhs].confidence
+            } ?? indices[0]
+            for index in indices where index != keepIndex {
+                print("[SpeakerID DEBUG] Duplicate name '\(name)' for \(result[index].speakerId); setting Unknown")
+                result[index].name = "Unknown"
+                result[index].confidence = 0.0
+            }
+        }
+        return result
+    }
+
     private func buildPrompt(transcript: String, speakerIds: [String], userHint: String?) -> String {
         let trimmedHint = userHint?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hintBlock: String
@@ -471,22 +924,20 @@ actor SpeakerIdentifier {
 
         let hasSystem = speakerIds.contains { $0.lowercased().hasPrefix("system:") }
         let hasMic = speakerIds.contains { $0.lowercased().hasPrefix("mic:") }
-        let mappingSpeakerIds: [String] = {
-            if hasSystem && hasMic {
-                let systemOnly = speakerIds.filter { $0.lowercased().hasPrefix("system:") }
-                return systemOnly.isEmpty ? speakerIds : systemOnly
-            }
-            if hasSystem {
-                let systemOnly = speakerIds.filter { $0.lowercased().hasPrefix("system:") }
-                return systemOnly.isEmpty ? speakerIds : systemOnly
-            }
-            if hasMic {
-                let micOnly = speakerIds.filter { $0.lowercased().hasPrefix("mic:") }
-                return micOnly.isEmpty ? speakerIds : micOnly
-            }
-            return speakerIds
-        }()
+        let mappingSpeakerIds = mappingTargetSpeakerIds(from: speakerIds)
         let speakerList = mappingSpeakerIds.map { "\($0) = ?" }.joined(separator: "\n")
+        let recorderNameConstraintBlock: String = {
+            guard hasMic && hasSystem else { return "" }
+            let recorderClues = recorderNameClues(from: userHint)
+            guard !recorderClues.isEmpty else { return "" }
+            let names = recorderClues.joined(separator: ", ")
+            return """
+            RECORDER NAME CONSTRAINT:
+            - Recorder name clue(s): \(names)
+            - Never assign these names to any system:SPEAKER_XX.
+
+            """
+        }()
 
         let audioStreamsBlock: String
         if hasMic && hasSystem {
@@ -521,18 +972,21 @@ actor SpeakerIdentifier {
         Look at the transcript lines starting with "[mic]" - this is the recorder speaking.
         The recorder is ONE of the people visible on screen.
         To identify them: look for moments where other speakers address the recorder by name.
-        For example, if someone says "David, what do you think?" and mic:SPEAKER_01 responds, then David is the recorder.
-        IMPORTANT: Do NOT assign the recorder's name to any system:SPEAKER_XX. They only appear as mic:SPEAKER_XX.
+        For example, if someone says "David Gérouville-Farrell, what do you think?" and mic:SPEAKER_01 responds, then David Gérouville-Farrell is the recorder.
+        IMPORTANT: Do NOT assign the recorder's name to any system:SPEAKER_XX.
 
-        STEP 3 - MATCH SYSTEM SPEAKERS:
-        The remaining participants (everyone EXCEPT the recorder) should map to system speaker IDs.
-        If you see 5 names on screen but only 4 system speakers, one of those names is the recorder - exclude them.
+        STEP 3 - MAP ALL LISTED SPEAKERS:
+        Map every listed speaker_id.
+        - mic:SPEAKER_XX should map to the recorder.
+        - system:SPEAKER_XX should map to everyone else from the call audio.
+        If you see extra names on screen, use transcript timing and address patterns to decide who is speaking.
         \(hintBlock)
         """
-            mappingHeader = "Map each SYSTEM speaker to their real name:"
+            mappingHeader = "Map each listed speaker ID to their real name:"
             importantBlock = """
         IMPORTANT:
-        - Only include system speakers in your JSON output. Do NOT include mic speakers.
+        - Include BOTH mic and system speakers in your JSON output.
+        - Recorder name must appear only on mic:SPEAKER_XX.
         - Use the EXACT speaker_id format shown above (including any prefix like "system:" or "mic:").
         """
         } else if hasMic {
@@ -594,6 +1048,8 @@ actor SpeakerIdentifier {
         TASK: Identify speakers in a video call by reading name labels from screenshots.
 
         \(audioStreamsBlock)
+
+        \(recorderNameConstraintBlock)
 
         STEP 1 - READ THE NAME LABELS:
         Look at each video tile in the screenshots. At the BOTTOM of each tile is a TEXT LABEL with the participant's name.
@@ -707,7 +1163,7 @@ actor SpeakerIdentifier {
         return false
     }
 
-    private func parseMappings(from rawResponse: String) -> [SpeakerMapping] {
+    private func parseMappings(from rawResponse: String, targetSpeakerIds: [String]) -> [SpeakerMapping] {
         // DEBUG: Log raw response
         print("[SpeakerID DEBUG] Raw response length: \(rawResponse.count) chars")
         print("[SpeakerID DEBUG] Raw response (first 500 chars):")
@@ -745,6 +1201,16 @@ actor SpeakerIdentifier {
             }
             return wrapped.mappings
         }
+
+        let lenient = parseMappingsLenient(from: data, targetSpeakerIds: targetSpeakerIds)
+        if !lenient.isEmpty {
+            print("[SpeakerID DEBUG] Successfully decoded \(lenient.count) mappings (lenient)")
+            for m in lenient {
+                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
+            }
+            return lenient
+        }
+
         print("[SpeakerID DEBUG] Failed to decode JSON as mappings")
         // Try to see what the decode error is
         do {
@@ -757,6 +1223,111 @@ actor SpeakerIdentifier {
 
     private struct MappingWrapper: Codable {
         let mappings: [SpeakerMapping]
+    }
+
+    private func parseMappingsLenient(from data: Data, targetSpeakerIds: [String]) -> [SpeakerMapping] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        if let names = json as? [String],
+           names.count == targetSpeakerIds.count,
+           !names.isEmpty {
+            var mappings: [SpeakerMapping] = []
+            for (speakerId, rawName) in zip(targetSpeakerIds, names) {
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                mappings.append(SpeakerMapping(speakerId: speakerId, name: name, confidence: 0.75))
+            }
+            if mappings.count == targetSpeakerIds.count {
+                return mappings
+            }
+        }
+
+        let items: [[String: Any]]
+        if let array = json as? [[String: Any]] {
+            items = array
+        } else if let dict = json as? [String: Any] {
+            if let mappings = dict["mappings"] as? [[String: Any]] {
+                items = mappings
+            } else if let mappings = dict["speaker_mappings"] as? [[String: Any]] {
+                items = mappings
+            } else if let mappings = dict["results"] as? [[String: Any]] {
+                items = mappings
+            } else {
+                items = []
+            }
+        } else {
+            items = []
+        }
+
+        guard !items.isEmpty else { return [] }
+
+        var mappings: [SpeakerMapping] = []
+        for item in items {
+            let speakerId = firstString(
+                in: item,
+                keys: ["speaker_id", "speakerId", "speaker", "speaker_label", "id"]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let name = firstString(
+                in: item,
+                keys: ["name", "person", "participant", "full_name"]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            guard !speakerId.isEmpty, !name.isEmpty else { continue }
+
+            let confidenceRaw = firstAny(
+                in: item,
+                keys: ["confidence", "score", "probability", "prob", "certainty"]
+            )
+            let confidence = normalizedConfidence(confidenceRaw)
+
+            mappings.append(SpeakerMapping(speakerId: speakerId, name: name, confidence: confidence))
+        }
+        return mappings
+    }
+
+    private func firstAny(in dict: [String: Any], keys: [String]) -> Any? {
+        for key in keys {
+            if let value = dict[key] {
+                return value
+            }
+            if let value = dict.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame })?.value {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func firstString(in dict: [String: Any], keys: [String]) -> String? {
+        guard let value = firstAny(in: dict, keys: keys) else { return nil }
+        if let string = value as? String {
+            return string
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    private func normalizedConfidence(_ raw: Any?) -> Double {
+        guard let raw else { return 0.0 }
+        let value: Double?
+        if let number = raw as? NSNumber {
+            value = number.doubleValue
+        } else if let string = raw as? String {
+            let cleaned = string.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            value = Double(cleaned)
+        } else {
+            value = nil
+        }
+        guard var confidence = value else { return 0.0 }
+        if confidence > 1.0, confidence <= 100.0 {
+            confidence /= 100.0
+        }
+        if confidence < 0.0 { return 0.0 }
+        if confidence > 1.0 { return 1.0 }
+        return confidence
     }
 
     private func extractAssistantText(from rawResponse: String) -> String? {
@@ -773,15 +1344,88 @@ actor SpeakerIdentifier {
     }
 
     private func extractJson(from text: String) -> String? {
-        guard let startIndex = text.firstIndex(where: { $0 == "{" || $0 == "[" }) else {
-            return nil
+        if let fenced = extractFencedJson(from: text) {
+            return fenced
         }
-        guard let endIndex = text.lastIndex(where: { $0 == "}" || $0 == "]" }) else {
-            return nil
+
+        let chars = Array(text)
+        guard !chars.isEmpty else { return nil }
+
+        for start in chars.indices where chars[start] == "{" || chars[start] == "[" {
+            guard let end = findJsonEnd(in: chars, start: start) else { continue }
+            let candidate = String(chars[start...end])
+            guard let data = candidate.data(using: .utf8) else { continue }
+            if (try? JSONSerialization.jsonObject(with: data)) != nil {
+                return candidate
+            }
         }
-        if startIndex >= endIndex {
-            return nil
+        return nil
+    }
+
+    private func extractFencedJson(from text: String) -> String? {
+        let patterns = [
+            #"(?s)```json\s*(\[[\s\S]*?\]|\{[\s\S]*?\})\s*```"#,
+            #"(?s)```\s*(\[[\s\S]*?\]|\{[\s\S]*?\})\s*```"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let match = regex.firstMatch(in: text, options: [], range: nsRange),
+                  match.numberOfRanges >= 2,
+                  let range = Range(match.range(at: 1), in: text) else {
+                continue
+            }
+            let candidate = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let data = candidate.data(using: .utf8) else { continue }
+            if (try? JSONSerialization.jsonObject(with: data)) != nil {
+                return candidate
+            }
         }
-        return String(text[startIndex...endIndex])
+        return nil
+    }
+
+    private func findJsonEnd(in chars: [Character], start: Int) -> Int? {
+        var stack: [Character] = []
+        var inString = false
+        var escaped = false
+
+        for index in start..<chars.count {
+            let ch = chars[index]
+            if inString {
+                if escaped {
+                    escaped = false
+                    continue
+                }
+                if ch == "\\" {
+                    escaped = true
+                    continue
+                }
+                if ch == "\"" {
+                    inString = false
+                }
+                continue
+            }
+
+            if ch == "\"" {
+                inString = true
+                continue
+            }
+
+            if ch == "{" || ch == "[" {
+                stack.append(ch)
+                continue
+            }
+
+            if ch == "}" || ch == "]" {
+                guard let last = stack.last else { return nil }
+                let expectedOpen: Character = ch == "}" ? "{" : "["
+                guard last == expectedOpen else { return nil }
+                stack.removeLast()
+                if stack.isEmpty {
+                    return index
+                }
+            }
+        }
+        return nil
     }
 }

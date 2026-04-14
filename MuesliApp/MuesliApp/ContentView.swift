@@ -284,7 +284,7 @@ struct NewMeetingView: View {
                         }
                     }
 
-                    Text("Changing the mic applies to the live input preview and active meeting.")
+                    Text("Changing it here switches Muesli to that microphone and also asks macOS to make it the default input.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

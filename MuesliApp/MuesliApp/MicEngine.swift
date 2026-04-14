@@ -1,11 +1,14 @@
 @preconcurrency import AVFoundation
 import AudioToolbox
 import CoreAudio
+import Foundation
 
 actor MicEngine {
     private var engine: AVAudioEngine?
     private var isRunning = false
     private var onAudioData: ((Data) -> Void)?
+    private var retiredEngines: [UUID: AVAudioEngine] = [:]
+    private let engineRetainDurationNs: UInt64 = 2_000_000_000
 
     func start(preferredInputDeviceID: UInt32? = nil, onAudioData: @escaping (Data) -> Void) throws {
         guard !isRunning else { return }
@@ -28,27 +31,6 @@ actor MicEngine {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
 
-        if let preferredInputDeviceID {
-            if let audioUnit = inputNode.audioUnit {
-                var deviceID = AudioDeviceID(preferredInputDeviceID)
-                let status = AudioUnitSetProperty(
-                    audioUnit,
-                    kAudioOutputUnitProperty_CurrentDevice,
-                    kAudioUnitScope_Global,
-                    0,
-                    &deviceID,
-                    UInt32(MemoryLayout<AudioDeviceID>.size)
-                )
-                if status != noErr {
-                    print("[MicEngine] Failed to bind preferred input device \(preferredInputDeviceID): \(status)")
-                } else {
-                    print("[MicEngine] Bound input device \(preferredInputDeviceID)")
-                }
-            } else {
-                print("[MicEngine] Input audio unit unavailable; cannot bind preferred input device \(preferredInputDeviceID)")
-            }
-        }
-
         if enableVoiceProcessing {
             do {
                 try inputNode.setVoiceProcessingEnabled(true)
@@ -65,6 +47,10 @@ actor MicEngine {
             } catch {
                 print("[MicEngine] Failed to configure voice processing: \(error)")
             }
+        }
+
+        if let preferredInputDeviceID {
+            bindPreferredInputDevice(preferredInputDeviceID, on: inputNode)
         }
 
         let nativeFormat = inputNode.outputFormat(forBus: 0)
@@ -97,17 +83,57 @@ actor MicEngine {
     func stop() async {
         guard isRunning else { return }
 
-        let engine = engine
+        let runningEngine = engine
         self.engine = nil
         isRunning = false
         onAudioData = nil
 
-        DispatchQueue.global(qos: .userInitiated).async { [engine] in
-            engine?.inputNode.removeTap(onBus: 0)
-            engine?.stop()
+        guard let runningEngine else {
+            print("[MicEngine] Stopped")
+            return
+        }
+
+        runningEngine.inputNode.removeTap(onBus: 0)
+        runningEngine.stop()
+
+        // Keep the engine alive briefly after stop; AVFAudio can dispatch late
+        // property-listener callbacks during teardown.
+        let retiredID = UUID()
+        retiredEngines[retiredID] = runningEngine
+        Task { [retiredID, engineRetainDurationNs] in
+            try? await Task.sleep(nanoseconds: engineRetainDurationNs)
+            self.releaseRetiredEngine(id: retiredID)
         }
 
         print("[MicEngine] Stopped")
+    }
+
+    private func releaseRetiredEngine(id: UUID) {
+        retiredEngines.removeValue(forKey: id)
+    }
+
+    private func bindPreferredInputDevice(_ preferredInputDeviceID: UInt32, on inputNode: AVAudioInputNode) {
+        guard let audioUnit = inputNode.audioUnit else {
+            print("[MicEngine] Input audio unit unavailable; cannot bind preferred input device \(preferredInputDeviceID)")
+            return
+        }
+
+        var deviceID = AudioDeviceID(preferredInputDeviceID)
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+
+        if status != noErr {
+            print("[MicEngine] Failed to bind preferred input device \(preferredInputDeviceID): \(status)")
+            return
+        }
+
+        print("[MicEngine] Bound input device \(preferredInputDeviceID)")
     }
 
     private func emitAudio(_ data: Data) {

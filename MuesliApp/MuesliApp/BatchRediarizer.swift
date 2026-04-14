@@ -116,6 +116,7 @@ actor BatchRediarizer {
 
             var capturedResult: Result?
             var capturedError: String?
+            var recentStderr: [String] = []
 
             backend.onJSONLine = { line in
                 guard let data = line.data(using: .utf8) else { return }
@@ -134,6 +135,14 @@ actor BatchRediarizer {
                 if let result = try? JSONDecoder().decode(ResultEnvelope.self, from: data),
                    result.type == "result" {
                     capturedResult = Result(turns: result.turns, speakers: result.speakers, duration: result.duration)
+                }
+            }
+            backend.onStderrLine = { line in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                recentStderr.append(trimmed)
+                if recentStderr.count > 20 {
+                    recentStderr.removeFirst(recentStderr.count - 20)
                 }
             }
 
@@ -164,10 +173,19 @@ actor BatchRediarizer {
             }
 
             guard exitStatus == 0 else {
+                let stderrMessage = recentStderr.reversed().first { line in
+                    line != "Traceback (most recent call last):"
+                }
+                let description: String
+                if let stderrMessage {
+                    description = "Batch reprocess failed (\(stderrMessage))"
+                } else {
+                    description = "Batch reprocess failed."
+                }
                 throw NSError(
                     domain: "BatchRediarizer",
                     code: Int(exitStatus),
-                    userInfo: [NSLocalizedDescriptionKey: "Batch reprocess failed."]
+                    userInfo: [NSLocalizedDescriptionKey: description]
                 )
             }
 
@@ -189,6 +207,9 @@ actor BatchRediarizer {
     private func backendEnvironment(root: URL) -> [String: String] {
         let baseEnv = ProcessInfo.processInfo.environment
         let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let numbaCacheDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("muesli-numba-cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: numbaCacheDir, withIntermediateDirectories: true)
         let mergedPath: String
         if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
             mergedPath = "\(defaultPath):\(existingPath)"
@@ -198,6 +219,7 @@ actor BatchRediarizer {
         return [
             "PYTHONPATH": root.appendingPathComponent("src").path,
             "PATH": mergedPath,
+            "NUMBA_CACHE_DIR": numbaCacheDir.path,
         ]
     }
 }
