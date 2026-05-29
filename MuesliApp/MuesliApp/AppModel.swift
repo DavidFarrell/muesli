@@ -686,7 +686,7 @@ final class AppModel: ObservableObject {
             let engine = MicEngine()
             previewMicEngine = engine
             do {
-                try await engine.start(preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+                try await engine.start(enableVoiceProcessing: true, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
                     Task { @MainActor in
                         self?.handlePreviewMicAudio(data)
                     }
@@ -762,7 +762,7 @@ final class AppModel: ObservableObject {
         micEngine = engine
 
         do {
-            try await engine.start(preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+            try await engine.start(enableVoiceProcessing: true, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
                 Task { @MainActor in
                     self?.handleMicAudio(data)
                 }
