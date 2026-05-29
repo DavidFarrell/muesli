@@ -101,6 +101,9 @@ final class AppModel: ObservableObject {
     @Published var selectedWindowID: CGWindowID?
     @Published var inputDevices: [AudioDevice] = []
     @Published var selectedInputDeviceID: UInt32 = 0
+    @Published var aecMode: AECMode = .auto {
+        didSet { UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey) }
+    }
     @Published var backendLogTail: [String] = []
     @Published var micLevel: Float = 0
     @Published var isPreviewingLevels = false
@@ -142,6 +145,7 @@ final class AppModel: ObservableObject {
     private var backendAccessURL: URL?
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
+    private let aecModeKey = "aecMode"
     private var defaultBackendProjectRoot: URL? {
         if let envPath = ProcessInfo.processInfo.environment["MUESLI_BACKEND_ROOT"],
            !envPath.isEmpty {
@@ -201,6 +205,10 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        if let stored = UserDefaults.standard.string(forKey: aecModeKey),
+           let mode = AECMode(rawValue: stored) {
+            aecMode = mode
+        }
         captureEngine.onLevelsUpdated = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.objectWillChange.send()
@@ -686,7 +694,7 @@ final class AppModel: ObservableObject {
             let engine = MicEngine()
             previewMicEngine = engine
             do {
-                try await engine.start(enableVoiceProcessing: true, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+                try await engine.start(enableVoiceProcessing: shouldEnableVoiceProcessing(), preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
                     Task { @MainActor in
                         self?.handlePreviewMicAudio(data)
                     }
@@ -750,6 +758,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func shouldEnableVoiceProcessing() -> Bool {
+        let outputIsBuiltIn = AudioDeviceManager.defaultOutputDeviceID().map(AudioDeviceManager.isBuiltInSpeaker) ?? false
+        return shouldRequestVoiceProcessing(mode: aecMode, outputIsBuiltInSpeaker: outputIsBuiltIn)
+    }
+
     private func startMeetingMicEngine() async {
         guard transcribeMic else {
             micEngine = nil
@@ -762,7 +775,7 @@ final class AppModel: ObservableObject {
         micEngine = engine
 
         do {
-            try await engine.start(enableVoiceProcessing: true, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+            try await engine.start(enableVoiceProcessing: shouldEnableVoiceProcessing(), preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
                 Task { @MainActor in
                     self?.handleMicAudio(data)
                 }
