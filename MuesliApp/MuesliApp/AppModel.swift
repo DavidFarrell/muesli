@@ -102,7 +102,16 @@ final class AppModel: ObservableObject {
     @Published var inputDevices: [AudioDevice] = []
     @Published var selectedInputDeviceID: UInt32 = 0
     @Published var aecMode: AECMode = .auto {
-        didSet { UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey) }
+        didSet {
+            UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey)
+            // A mode change is a fresh chance for VPIO; restart so it takes effect.
+            micVoiceProcessingDowngraded = false
+            if isCapturing {
+                Task { @MainActor [weak self] in
+                    await self?.restartMeetingMicEngineForInputSwitch()
+                }
+            }
+        }
     }
     @Published var backendLogTail: [String] = []
     @Published var micLevel: Float = 0
@@ -128,8 +137,10 @@ final class AppModel: ObservableObject {
     private var micStartupHealthTask: Task<Void, Never>?
     private var micStartTime: Date?
     private var micOutputEnabled = false
-    private var micStartupRecoveryAttempts = 0
-    private let maxMicStartupRecoveryAttempts = 1
+    // Effective VPIO state the current meeting-mic start requested, and whether a
+    // VPIO->plain downgrade has already fired this generation (gates it to once).
+    private var micVoiceProcessingRequested = false
+    private var micVoiceProcessingDowngraded = false
     private var pendingMicAudio: [PendingAudio] = []
     private let maxPendingMicAudio = 200
     private let screenshotScheduler = ScreenshotScheduler()
@@ -221,6 +232,9 @@ final class AppModel: ObservableObject {
         }
         AudioDeviceManager.observeInputDeviceChanges { [weak self] in
             self?.loadInputDevices()
+        }
+        AudioDeviceManager.observeOutputDeviceChanges { [weak self] in
+            Task { @MainActor in self?.handleOutputDeviceChange() }
         }
         refreshPermissions()
         loadInputDevices()
@@ -622,6 +636,8 @@ final class AppModel: ObservableObject {
         }
 
         if isCapturing {
+            // An input-device change is a fresh chance for VPIO.
+            micVoiceProcessingDowngraded = false
             await restartMeetingMicEngineForInputSwitch()
         } else if previewMicEngine != nil {
             await restartPreviewMicEngineForInputSwitch()
@@ -774,8 +790,12 @@ final class AppModel: ObservableObject {
         let engine = MicEngine()
         micEngine = engine
 
+        // Effective VPIO drops to off once a downgrade has fired this generation.
+        let enableVPIO = shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded
+        micVoiceProcessingRequested = enableVPIO
+
         do {
-            try await engine.start(enableVoiceProcessing: shouldEnableVoiceProcessing(), preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+            try await engine.start(enableVoiceProcessing: enableVPIO, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
                 Task { @MainActor in
                     self?.handleMicAudio(data)
                 }
@@ -785,14 +805,28 @@ final class AppModel: ObservableObject {
             if isCapturing {
                 scheduleMicStartupHealthCheck()
             }
+        } catch let error as MicEngineError {
+            // A VPIO-format failure is not a hard failure: downgrade to plain
+            // capture once and restart rather than leaving the mic dead.
+            if case .invalidInputFormat(_, _, _, let vpioRequested) = error, vpioRequested, !micVoiceProcessingDowngraded {
+                micVoiceProcessingDowngraded = true
+                appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
+                await restartMeetingMicEngineForInputSwitch()
+                return
+            }
+            handleMicStartFailure(error)
         } catch {
-            micEngine = nil
-            micOutputEnabled = false
-            cancelMicStartupHealthCheck()
-            debugMicErrors += 1
-            debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
-            appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
+            handleMicStartFailure(error)
         }
+    }
+
+    private func handleMicStartFailure(_ error: Error) {
+        micEngine = nil
+        micOutputEnabled = false
+        cancelMicStartupHealthCheck()
+        debugMicErrors += 1
+        debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
+        appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
     }
 
     private func restartMeetingMicEngineForInputSwitch() async {
@@ -850,15 +884,37 @@ final class AppModel: ObservableObject {
             guard micEngine != nil else { return }
             guard debugMicBuffers == 0 else { return }
 
-            guard micStartupRecoveryAttempts < maxMicStartupRecoveryAttempts else {
-                appendBackendLog("Mic health check: still no audio after automatic retry.", toTail: true)
+            // A VPIO route that delivered no audio is the silent-failure case:
+            // downgrade once to plain capture and health-check that too.
+            if micVoiceProcessingRequested && !micVoiceProcessingDowngraded {
+                micVoiceProcessingDowngraded = true
+                appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
+                await restartMeetingMicEngineForInputSwitch()
+                scheduleMicStartupHealthCheck()
                 return
             }
 
-            micStartupRecoveryAttempts += 1
-            appendBackendLog("Mic health check: no audio detected after start; restarting microphone capture.", toTail: true)
-            await restartMeetingMicEngineForInputSwitch()
-            scheduleMicStartupHealthCheck()
+            // Plain capture with no audio is a genuine mic problem, not VPIO.
+            appendBackendLog("Mic health check: still no audio.", toTail: true)
+        }
+    }
+
+    @MainActor
+    private func handleOutputDeviceChange() {
+        // No active mic generation means nothing to re-evaluate; the next start
+        // resets the downgrade flag itself.
+        guard isCapturing, transcribeMic else { return }
+
+        // An output change is a fresh chance for VPIO, in any mode.
+        micVoiceProcessingDowngraded = false
+
+        // Only Auto's decision depends on the output route; manual On/Off keep
+        // their decision (the reset above still lets a later restart retry VPIO).
+        guard aecMode == .auto else { return }
+        guard shouldEnableVoiceProcessing() != micVoiceProcessingRequested else { return }
+
+        Task { @MainActor [weak self] in
+            await self?.restartMeetingMicEngineForInputSwitch()
         }
     }
 
@@ -1274,7 +1330,7 @@ final class AppModel: ObservableObject {
         isStartingMeeting = true
         defer { isStartingMeeting = false }
         cancelMicStartupHealthCheck()
-        micStartupRecoveryAttempts = 0
+        micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
         refreshMeetingTitleForDateRollover()
         refreshPermissions()
@@ -1607,7 +1663,6 @@ final class AppModel: ObservableObject {
 
         isFinalizing = true
         cancelMicStartupHealthCheck()
-        micStartupRecoveryAttempts = 0
 
         screenshotScheduler.stop()
         await captureEngine.stopCapture()
