@@ -6,16 +6,37 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		AA0000010000000000000008 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 636552C72F1D175D0042F2C9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 636552CE2F1D175D0042F2C9;
+			remoteInfo = MuesliApp;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		636552CF2F1D175D0042F2C9 /* MuesliApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MuesliApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000010000000000000001 /* MuesliAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MuesliAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AA000001000000000000000B /* Exceptions for "MuesliApp" folder in "MuesliAppTests" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				AECMode.swift,
+				MicAudioFormat.swift,
+			);
+			target = AA0000010000000000000005 /* MuesliAppTests */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		636552D12F1D175D0042F2C9 /* MuesliApp */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				AA000001000000000000000B /* PBXFileSystemSynchronizedBuildFileExceptionSet */,
+				AA000001000000000000000B /* Exceptions for "MuesliApp" folder in "MuesliAppTests" target */,
 			);
 			path = MuesliApp;
 			sourceTree = "<group>";
@@ -26,16 +47,6 @@
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
-
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		AA000001000000000000000B /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				MicAudioFormat.swift,
-			);
-			target = AA0000010000000000000005 /* MuesliAppTests */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		636552CC2F1D175D0042F2C9 /* Frameworks */ = {
@@ -122,24 +133,6 @@
 		};
 /* End PBXNativeTarget section */
 
-/* Begin PBXTargetDependency section */
-		AA0000010000000000000007 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 636552CE2F1D175D0042F2C9 /* MuesliApp */;
-			targetProxy = AA0000010000000000000008 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
-
-/* Begin PBXContainerItemProxy section */
-		AA0000010000000000000008 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 636552C72F1D175D0042F2C9 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 636552CE2F1D175D0042F2C9;
-			remoteInfo = MuesliApp;
-		};
-/* End PBXContainerItemProxy section */
-
 /* Begin PBXProject section */
 		636552C72F1D175D0042F2C9 /* Project object */ = {
 			isa = PBXProject;
@@ -203,6 +196,14 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AA0000010000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 636552CE2F1D175D0042F2C9 /* MuesliApp */;
+			targetProxy = AA0000010000000000000008 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		636552D82F1D175E0042F2C9 /* Debug */ = {

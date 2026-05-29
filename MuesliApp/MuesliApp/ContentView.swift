@@ -287,6 +287,17 @@ struct NewMeetingView: View {
                     Text("Changing it here switches Muesli to that microphone and also asks macOS to make it the default input.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+
+                    Picker("Echo cancellation", selection: $model.aecMode) {
+                        Text("Auto").tag(AECMode.auto)
+                        Text("On").tag(AECMode.on)
+                        Text("Off").tag(AECMode.off)
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text("Auto turns echo cancellation on only with the built-in speakers.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(8)
             }
@@ -724,6 +735,8 @@ enum AudioDeviceManager {
     private static let observerQueue = DispatchQueue(label: "muesli.audio.device.observer", qos: .utility)
     private static var observerInstalled = false
     private static var observerHandler: (() -> Void)?
+    private static var outputObserverInstalled = false
+    private static var outputObserverHandler: (() -> Void)?
 
     static func observeInputDeviceChanges(_ onChange: @escaping () -> Void) {
         observerHandler = onChange
@@ -861,5 +874,132 @@ enum AudioDeviceManager {
                 mElement: kAudioObjectPropertyElementMain
             )
         ]
+    }
+
+    static func defaultOutputDeviceID() -> UInt32? {
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var deviceID = AudioObjectID(0)
+        var dataSize = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &dataSize, &deviceID)
+        if status != noErr {
+            return nil
+        }
+        return deviceID
+    }
+
+    /// Strict: true only for the internal MacBook speaker. Built-in transport
+    /// also covers the 3.5 mm headphone jack, so transport alone is not enough -
+    /// the active output data source must identify the internal speaker. Any
+    /// property that cannot be read returns false.
+    static func isBuiltInSpeaker(_ deviceID: UInt32) -> Bool {
+        let id = AudioObjectID(deviceID)
+        guard transportType(id) == kAudioDeviceTransportTypeBuiltIn else { return false }
+        guard hasOutputChannels(id) else { return false }
+        guard let source = outputDataSource(id) else { return false }
+        return source == fourCharCode("ispk")
+    }
+
+    static func observeOutputDeviceChanges(_ onChange: @escaping () -> Void) {
+        outputObserverHandler = onChange
+        guard !outputObserverInstalled else { return }
+        outputObserverInstalled = true
+
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        for addressTemplate in observedOutputAddresses {
+            var address = addressTemplate
+            let status = AudioObjectAddPropertyListenerBlock(systemObject, &address, observerQueue) { _, _ in
+                DispatchQueue.main.async {
+                    Self.outputObserverHandler?()
+                }
+            }
+            if status != noErr {
+                print("[AudioDeviceManager] Failed to add output observer (\(addressTemplate.mSelector)): \(status)")
+            }
+        }
+    }
+
+    private static var observedOutputAddresses: [AudioObjectPropertyAddress] {
+        [
+            AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            ),
+            AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+        ]
+    }
+
+    private static func fourCharCode(_ s: String) -> UInt32 {
+        s.utf8.reduce(0) { ($0 << 8) + UInt32($1) }
+    }
+
+    private static func transportType(_ id: AudioObjectID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var value: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(id, &address, 0, nil, &dataSize, &value)
+        if status != noErr {
+            return nil
+        }
+        return value
+    }
+
+    private static func outputDataSource(_ id: AudioObjectID) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDataSource,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var value: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(id, &address, 0, nil, &dataSize, &value)
+        if status != noErr {
+            return nil
+        }
+        return value
+    }
+
+    private static func hasOutputChannels(_ id: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        if AudioObjectGetPropertyDataSize(id, &address, 0, nil, &dataSize) != noErr {
+            return false
+        }
+
+        let bufferListPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { bufferListPointer.deallocate() }
+
+        let audioBufferList = bufferListPointer.bindMemory(to: AudioBufferList.self, capacity: 1)
+        if AudioObjectGetPropertyData(id, &address, 0, nil, &dataSize, audioBufferList) != noErr {
+            return false
+        }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        let channelCount = buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
+        return channelCount > 0
     }
 }
