@@ -12,28 +12,53 @@ enum AudioConverterHelper {
 
         let channels = max(1, Int(buffer.format.channelCount))
         let interleaved = buffer.format.isInterleaved
-        let sourceFloats: [Float]
 
+        // Read sample (frame, channel) as a Float in [-1, 1], abstracting over the
+        // buffer's layout (interleaved vs planar) and sample type.
+        //   planar:      data[channel][frame]
+        //   interleaved: data[0][frame * channels + channel]
+        let read: (Int, Int) -> Float
         if let floatData = buffer.floatChannelData {
-            let sourcePtr = floatData[0]
-            sourceFloats = (0..<frameCount).map { frameIndex in
-                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
-                return sourcePtr[sampleIndex]
-            }
+            read = { f, c in interleaved ? floatData[0][f * channels + c] : floatData[c][f] }
         } else if let int16Data = buffer.int16ChannelData {
-            let sourcePtr = int16Data[0]
-            sourceFloats = (0..<frameCount).map { frameIndex in
-                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
-                return Float(sourcePtr[sampleIndex]) / 32768.0
+            read = { f, c in
+                let v = interleaved ? int16Data[0][f * channels + c] : int16Data[c][f]
+                return Float(v) / 32768.0
             }
         } else if let int32Data = buffer.int32ChannelData {
-            let sourcePtr = int32Data[0]
-            sourceFloats = (0..<frameCount).map { frameIndex in
-                let sampleIndex = interleaved ? (frameIndex * channels) : frameIndex
-                return Float(sourcePtr[sampleIndex]) / 2147483648.0
+            read = { f, c in
+                let v = interleaved ? int32Data[0][f * channels + c] : int32Data[c][f]
+                return Float(v) / 2147483648.0
             }
         } else {
             return nil
+        }
+
+        // Downmix across channels rather than blindly taking channel 0. Some
+        // multi-channel USB mics (e.g. the DJI wireless receiver, 4 channels)
+        // leave channel 0 permanently silent and carry the voice on another
+        // channel. Mix only the channels that actually carry signal in this
+        // buffer: mean-of-active preserves level when one channel is live
+        // (divide by 1) and behaves as a standard mono downmix for genuine
+        // stereo, while a mean can never clip beyond its loudest input.
+        let silenceFloor: Float = 1e-4  // ~ -80 dBFS; digital-silent channels are exactly 0
+        var activeChannels: [Int] = []
+        for c in 0..<channels {
+            var peak: Float = 0
+            for f in 0..<frameCount {
+                peak = max(peak, abs(read(f, c)))
+                if peak >= silenceFloor { break }
+            }
+            if peak >= silenceFloor { activeChannels.append(c) }
+        }
+        let mixChannels = activeChannels.isEmpty ? Array(0..<channels) : activeChannels
+        let invCount = 1.0 / Float(mixChannels.count)
+
+        var sourceFloats = [Float](repeating: 0, count: frameCount)
+        for f in 0..<frameCount {
+            var acc: Float = 0
+            for c in mixChannels { acc += read(f, c) }
+            sourceFloats[f] = acc * invCount
         }
 
         let step = Float(sourceRate / targetSampleRate)
