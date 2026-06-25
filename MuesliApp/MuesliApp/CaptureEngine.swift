@@ -227,6 +227,10 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     var debugAudioErrors: Int = 0
 
     var onLevelsUpdated: (() -> Void)?
+    /// Fired when the system stops the capture stream with an error (e.g. the OS
+    /// tears it down). Previously this delegate callback was unimplemented and
+    /// such stops were silently dropped (audit D13).
+    var onStreamStopped: ((Error) -> Void)?
 
     func startCapture(
         contentFilter: SCContentFilter,
@@ -426,6 +430,11 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             return
         }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        AudioLog.error("stream.stopped", ["error": String(describing: error)])
+        onStreamStopped?(error)
     }
 
     func streamConfigurationForScreenshots() -> SCStreamConfiguration {

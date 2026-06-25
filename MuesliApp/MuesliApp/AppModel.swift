@@ -68,6 +68,42 @@ enum AppScreen {
     case viewing(MeetingHistoryItem)
 }
 
+/// Single source of truth for the input-device policy.
+///
+/// `followSystem` adopts whatever macOS makes the default input (the launch
+/// default). `pinned` holds one specific device, identified by its STABLE UID,
+/// and survives the OS moving the default underneath us. A pin resets back to
+/// `followSystem` only on the three reset conditions: the user re-picks a
+/// different device, the pinned device disappears, or the user explicitly
+/// selects "System default".
+enum InputSelection: Equatable {
+    case followSystem
+    case pinned(uid: String)
+
+    var logDescription: String {
+        switch self {
+        case .followSystem: return "follow"
+        case .pinned(let uid): return "pinned(\(uid))"
+        }
+    }
+}
+
+/// Output-device policy. Mirrors `InputSelection`. The recording path is
+/// device-independent (system audio is captured via ScreenCaptureKit), so this
+/// governs the user-facing chosen playback device and the VPIO/built-in-speaker
+/// echo-cancellation decision, not what gets recorded.
+enum OutputSelection: Equatable {
+    case followSystem
+    case pinned(uid: String)
+
+    var logDescription: String {
+        switch self {
+        case .followSystem: return "follow"
+        case .pinned(let uid): return "pinned(\(uid))"
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     private let captureSampleRate = 16000
@@ -100,16 +136,20 @@ final class AppModel: ObservableObject {
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
     @Published var inputDevices: [AudioDevice] = []
+    // Source of truth for the input-device policy. `selectedInputDeviceID` is a
+    // DERIVED display mirror for the picker (0 == "System default" / following).
+    @Published private(set) var inputSelection: InputSelection = .followSystem
     @Published var selectedInputDeviceID: UInt32 = 0
+    @Published var outputDevices: [AudioDevice] = []
+    @Published private(set) var outputSelection: OutputSelection = .followSystem
+    @Published var selectedOutputDeviceID: UInt32 = 0
     @Published var aecMode: AECMode = .auto {
         didSet {
             UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey)
             // A mode change is a fresh chance for VPIO; restart so it takes effect.
             micVoiceProcessingDowngraded = false
             if isCapturing {
-                Task { @MainActor [weak self] in
-                    await self?.restartMeetingMicEngineForInputSwitch()
-                }
+                enqueueMicLifecycle("aec-change") { await $0.restartMeetingMicEngineForInputSwitch() }
             }
         }
     }
@@ -133,8 +173,22 @@ final class AppModel: ObservableObject {
     private var previewMicEngine: MicEngine?
     private var isPreviewCaptureRunning = false
     private var previewLifecycleTask: Task<Void, Never>?
-    private var inputDeviceSelectionTask: Task<Void, Never>?
+    // Single serializer for ALL mic engine start/stop/restart operations so two
+    // device events can't interleave at an await suspension and orphan the engine
+    // (audit D2/D8). Plus a monotonic generation token as belt-and-braces against
+    // any stray start completing into a superseded generation.
+    private var micLifecycleTask: Task<Void, Never>?
+    private var micEngineGeneration: Int = 0
+    // The device the running engine is actually bound to / started on. The
+    // restart decision compares the DESIRED device to this, not a bare ID delta
+    // on the display mirror (audit D1/D3).
+    private var micEngineBoundDeviceID: UInt32 = 0
     private var micStartupHealthTask: Task<Void, Never>?
+    private var micFramesWatchdogTask: Task<Void, Never>?
+    private let micWatchdogIntervalNs: UInt64 = 2_000_000_000
+    private let micStallThresholdSeconds: Double = 4.0
+    private var lastMicAudioAt: Date?
+    private var micFrameCount: Int = 0
     private var micStartTime: Date?
     private var micOutputEnabled = false
     // Effective VPIO state the current meeting-mic start requested, and whether a
@@ -157,6 +211,10 @@ final class AppModel: ObservableObject {
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let aecModeKey = "aecMode"
+    private let inputSelectionModeKey = "inputSelectionMode"
+    private let inputSelectionUIDKey = "inputSelectionUID"
+    private let outputSelectionModeKey = "outputSelectionMode"
+    private let outputSelectionUIDKey = "outputSelectionUID"
     private var defaultBackendProjectRoot: URL? {
         if let envPath = ProcessInfo.processInfo.environment["MUESLI_BACKEND_ROOT"],
            !envPath.isEmpty {
@@ -220,9 +278,32 @@ final class AppModel: ObservableObject {
            let mode = AECMode(rawValue: stored) {
             aecMode = mode
         }
+
+        // Mirror the unified audio log into the in-app backend log tail so the
+        // failure timeline is visible without Console. The sink fires on
+        // arbitrary queues, so hop to the main actor.
+        AudioLog.sink = { [weak self] line in
+            Task { @MainActor [weak self] in
+                self?.appendBackendLog("[audio] \(line)", toTail: true)
+            }
+        }
+
+        // Restore the persisted device policy (a pin survives relaunch by UID).
+        inputSelection = Self.persistedSelection(
+            modeKey: inputSelectionModeKey, uidKey: inputSelectionUIDKey
+        ).map(InputSelection.pinned) ?? .followSystem
+        outputSelection = Self.persistedSelection(
+            modeKey: outputSelectionModeKey, uidKey: outputSelectionUIDKey
+        ).map(OutputSelection.pinned) ?? .followSystem
+
         captureEngine.onLevelsUpdated = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.objectWillChange.send()
+            }
+        }
+        captureEngine.onStreamStopped = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.appendBackendLog("System audio capture stopped: \(error.localizedDescription)", toTail: true)
             }
         }
         transcriptCancellable = transcriptModel.objectWillChange.sink { [weak self] _ in
@@ -231,13 +312,16 @@ final class AppModel: ObservableObject {
             }
         }
         AudioDeviceManager.observeInputDeviceChanges { [weak self] in
+            AudioLog.event("listener.input.fired", ["snap": AudioDeviceManager.snapshot()])
             self?.loadInputDevices()
         }
         AudioDeviceManager.observeOutputDeviceChanges { [weak self] in
+            AudioLog.event("listener.output.fired", ["snap": AudioDeviceManager.snapshot()])
             Task { @MainActor in self?.handleOutputDeviceChange() }
         }
         refreshPermissions()
         loadInputDevices()
+        loadOutputDevices()
         loadBackendBookmark()
         validateBackendFolder()
         migrateLegacyMeetingsIfNeeded()
@@ -538,6 +622,8 @@ final class AppModel: ObservableObject {
         debugMicFormat = "-"
         debugMicErrorMessage = "-"
         debugMicErrors = 0
+        micFrameCount = 0
+        lastMicAudioAt = nil
     }
 
     private func handleMicAudio(_ data: Data) {
@@ -553,6 +639,10 @@ final class AppModel: ObservableObject {
         debugMicBuffers += 1
         debugMicFrames = data.count / 2
         debugMicPTS = elapsed
+        // Liveness signals for the frames watchdog (debugMicFrames is per-buffer,
+        // not cumulative, so it can't serve this).
+        lastMicAudioAt = now
+        micFrameCount += 1
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
 
         let payload = data
@@ -593,64 +683,83 @@ final class AppModel: ObservableObject {
         await task.value
     }
 
-    private func queueInputDeviceSelectionChange(to newValue: UInt32, updateSystemDefault: Bool) {
-        let previousTask = inputDeviceSelectionTask
+    /// Serialize ALL mic engine start/stop/restart work through one chained task
+    /// so two device events cannot interleave at an await and orphan the engine
+    /// (audit D2/D8). Fire-and-forget; ordering is preserved. NEVER call this
+    /// from within an op already running on this chain - that self-awaits and
+    /// deadlocks; call `restartMeetingMicEngineForInputSwitch()` directly there.
+    private func enqueueMicLifecycle(_ reason: String, _ op: @escaping @MainActor (AppModel) async -> Void) {
+        let previous = micLifecycleTask
         let task = Task { @MainActor [weak self] in
-            await previousTask?.value
-            await Task.yield()
+            await previous?.value
             guard let self else { return }
-            await self.applyInputDeviceSelectionChange(
-                to: newValue,
-                updateSystemDefault: updateSystemDefault
-            )
+            AudioLog.event("lifecycle.run", ["reason": reason])
+            await op(self)
         }
-        inputDeviceSelectionTask = task
+        micLifecycleTask = task
     }
 
-    private func applyInputDeviceSelectionChange(
-        to newValue: UInt32,
-        updateSystemDefault: Bool
-    ) async {
-        guard newValue != 0 else { return }
-        guard selectedInputDeviceID == newValue else { return }
+    // MARK: Selection persistence
 
-        isSwitchingInputDevice = true
-        defer { isSwitchingInputDevice = false }
-
-        if updateSystemDefault {
-            guard AudioDeviceManager.setDefaultInputDevice(newValue) else {
-                debugMicErrors += 1
-                debugMicErrorMessage = "mic_device_switch_failed"
-                loadInputDevices()
-                appendBackendLog("Failed to switch microphone to \(inputDeviceName(for: newValue)).", toTail: true)
-                return
-            }
-
-            await waitForDefaultInputDevice(newValue, timeoutSeconds: 1.0)
-            appendBackendLog("Microphone switched to \(inputDeviceName(for: newValue)).", toTail: isCapturing)
-        } else {
-            appendBackendLog(
-                "Microphone followed system default: \(inputDeviceName(for: newValue)).",
-                toTail: isCapturing
-            )
+    private static func persistedSelection(modeKey: String, uidKey: String) -> String? {
+        guard UserDefaults.standard.string(forKey: modeKey) == "pinned",
+              let uid = UserDefaults.standard.string(forKey: uidKey), !uid.isEmpty else {
+            return nil
         }
+        return uid
+    }
 
-        if isCapturing {
-            // An input-device change is a fresh chance for VPIO.
-            micVoiceProcessingDowngraded = false
-            await restartMeetingMicEngineForInputSwitch()
-        } else if previewMicEngine != nil {
-            await restartPreviewMicEngineForInputSwitch()
+    private func persistInputSelection() {
+        switch inputSelection {
+        case .followSystem:
+            UserDefaults.standard.set("follow", forKey: inputSelectionModeKey)
+            UserDefaults.standard.removeObject(forKey: inputSelectionUIDKey)
+        case .pinned(let uid):
+            UserDefaults.standard.set("pinned", forKey: inputSelectionModeKey)
+            UserDefaults.standard.set(uid, forKey: inputSelectionUIDKey)
         }
     }
 
-    private func waitForDefaultInputDevice(_ id: UInt32, timeoutSeconds: Double) async {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if AudioDeviceManager.defaultInputDeviceID() == id {
-                return
+    private func persistOutputSelection() {
+        switch outputSelection {
+        case .followSystem:
+            UserDefaults.standard.set("follow", forKey: outputSelectionModeKey)
+            UserDefaults.standard.removeObject(forKey: outputSelectionUIDKey)
+        case .pinned(let uid):
+            UserDefaults.standard.set("pinned", forKey: outputSelectionModeKey)
+            UserDefaults.standard.set(uid, forKey: outputSelectionUIDKey)
+        }
+    }
+
+    private func setInputSelection(_ newValue: InputSelection) {
+        guard inputSelection != newValue else { return }
+        inputSelection = newValue
+        persistInputSelection()
+    }
+
+    private func setOutputSelection(_ newValue: OutputSelection) {
+        guard outputSelection != newValue else { return }
+        outputSelection = newValue
+        persistOutputSelection()
+    }
+
+    // MARK: Resolution
+
+    /// The device the input engine should currently be on, per policy. In follow
+    /// mode this is the live OS default; in pinned mode it's the pinned UID
+    /// re-resolved to its current id, falling back to follow (RESET #2) if the
+    /// pinned device has disappeared.
+    private func resolvedInputDeviceID() -> (id: UInt32, pinned: Bool) {
+        switch inputSelection {
+        case .followSystem:
+            return (AudioDeviceManager.defaultInputDeviceID() ?? 0, false)
+        case .pinned(let uid):
+            if let id = AudioDeviceManager.deviceID(forUID: uid) {
+                return (id, true)
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            setInputSelection(.followSystem)
+            AudioLog.event("resolve.pin-vanished", ["uid": uid])
+            return (AudioDeviceManager.defaultInputDeviceID() ?? 0, false)
         }
     }
 
@@ -658,18 +767,73 @@ final class AppModel: ObservableObject {
         if let name = inputDevices.first(where: { $0.id == id })?.name {
             return name
         }
-        return "Device \(id)"
+        return AudioDeviceManager.name(for: id) ?? "Device \(id)"
     }
 
+    func loadOutputDevices() {
+        outputDevices = AudioDeviceManager.outputDevices()
+        switch outputSelection {
+        case .followSystem:
+            selectedOutputDeviceID = 0
+        case .pinned(let uid):
+            if let id = AudioDeviceManager.deviceID(forUID: uid),
+               outputDevices.contains(where: { $0.id == id }) {
+                selectedOutputDeviceID = id
+            } else {
+                setOutputSelection(.followSystem)
+                selectedOutputDeviceID = 0
+            }
+        }
+    }
+
+    // MARK: User picks
+
+    /// `id == 0` is the "System default" sentinel row (RESET #3 -> resume follow).
     func selectInputDevice(_ id: UInt32) {
-        guard id != 0 else { return }
-        guard id != selectedInputDeviceID else { return }
-        selectedInputDeviceID = id
-        let selectedID = id
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard self.selectedInputDeviceID == selectedID else { return }
-            self.queueInputDeviceSelectionChange(to: selectedID, updateSystemDefault: true)
+        if id == 0 {
+            guard inputSelection != .followSystem else { return }
+            AudioLog.event("user.pick.input", ["choice": "system-default"])
+            setInputSelection(.followSystem)
+        } else {
+            guard let uid = inputDevices.first(where: { $0.id == id })?.uid else { return }
+            if case .pinned(let current) = inputSelection, current == uid { return }
+            AudioLog.event("user.pick.input", [
+                "toID": id, "toUID": uid, "toName": inputDeviceName(for: id)
+            ])
+            setInputSelection(.pinned(uid: uid))
+        }
+        applyInputSelectionChange()
+    }
+
+    func selectOutputDevice(_ id: UInt32) {
+        if id == 0 {
+            guard outputSelection != .followSystem else { return }
+            AudioLog.event("user.pick.output", ["choice": "system-default"])
+            setOutputSelection(.followSystem)
+        } else {
+            guard let uid = outputDevices.first(where: { $0.id == id })?.uid else { return }
+            if case .pinned(let current) = outputSelection, current == uid { return }
+            AudioLog.event("user.pick.output", ["toID": id, "toUID": uid])
+            setOutputSelection(.pinned(uid: uid))
+            // A manual output pin is the user choosing the playback device; make
+            // it the system default output so playback actually moves there.
+            _ = AudioDeviceManager.setDefaultOutputDevice(id)
+        }
+        loadOutputDevices()
+        // An output change is a fresh chance for VPIO; let the engine re-evaluate.
+        if isCapturing {
+            micVoiceProcessingDowngraded = false
+            enqueueMicLifecycle("output-pick") { await $0.restartMeetingMicEngineForInputSwitch() }
+        }
+    }
+
+    /// Apply an input policy change: re-resolve + (if capturing) restart the
+    /// meeting engine when the device actually differs, else refresh the preview.
+    private func applyInputSelectionChange() {
+        micVoiceProcessingDowngraded = false
+        loadInputDevices()   // refreshes the mirror + enqueues a restart if the device changed
+        if !isCapturing, previewMicEngine != nil {
+            enqueueMicLifecycle("input-pick-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
         }
     }
 
@@ -709,8 +873,13 @@ final class AppModel: ObservableObject {
         if previewMicEngine == nil {
             let engine = MicEngine()
             previewMicEngine = engine
+            let (resolvedID, pinned) = resolvedInputDeviceID()
             do {
-                try await engine.start(enableVoiceProcessing: shouldEnableVoiceProcessing(), preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+                try await engine.start(
+                    enableVoiceProcessing: shouldEnableVoiceProcessing(),
+                    preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
+                    pinned: pinned
+                ) { [weak self] data in
                     Task { @MainActor in
                         self?.handlePreviewMicAudio(data)
                     }
@@ -787,19 +956,50 @@ final class AppModel: ObservableObject {
             return
         }
 
+        micEngineGeneration += 1
+        let generation = micEngineGeneration
         let engine = MicEngine()
-        micEngine = engine
 
         // Effective VPIO drops to off once a downgrade has fired this generation.
         let enableVPIO = shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded
         micVoiceProcessingRequested = enableVPIO
 
+        // Re-resolve the device at the moment of start so a steal that happened
+        // between the trigger and here is honoured. A pinned device binds
+        // unconditionally; follow mode lets the engine track the default.
+        let (resolvedID, pinned) = resolvedInputDeviceID()
+        micEngineBoundDeviceID = resolvedID
+        AudioLog.event("engine.start.begin", [
+            "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID
+        ])
+
         do {
-            try await engine.start(enableVoiceProcessing: enableVPIO, preferredInputDeviceID: selectedInputDeviceID == 0 ? nil : selectedInputDeviceID) { [weak self] data in
+            try await engine.start(
+                enableVoiceProcessing: enableVPIO,
+                preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
+                pinned: pinned,
+                onConfigurationChange: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        AudioLog.event("engine.configchange", ["snap": AudioDeviceManager.snapshot()])
+                        // Re-resolve under the new route; restarts only if the
+                        // device the engine should be on actually moved.
+                        self.loadInputDevices()
+                    }
+                }
+            ) { [weak self] data in
                 Task { @MainActor in
                     self?.handleMicAudio(data)
                 }
             }
+            // Serialization should prevent overlap, but bail if a newer start
+            // superseded this one before it completed (audit D2 belt-and-braces).
+            guard generation == micEngineGeneration else {
+                AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
+                await engine.stop()
+                return
+            }
+            micEngine = engine
             micOutputEnabled = true
             debugMicErrorMessage = "-"
             if isCapturing {
@@ -811,7 +1011,13 @@ final class AppModel: ObservableObject {
             if case .invalidInputFormat(_, _, _, let vpioRequested) = error, vpioRequested, !micVoiceProcessingDowngraded {
                 micVoiceProcessingDowngraded = true
                 appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
-                await restartMeetingMicEngineForInputSwitch()
+                AudioLog.event("engine.start.vpio-downgrade-retry")
+                // The start threw, so nothing was assigned/needs teardown - just
+                // retry the start (downgraded flag now forces VPIO off). NB this
+                // path runs at first-start too, BEFORE isCapturing is set, so it
+                // must not route through restartMeetingMicEngineForInputSwitch
+                // (which guards on isCapturing and would no-op here).
+                await startMeetingMicEngine()
                 return
             }
             handleMicStartFailure(error)
@@ -822,21 +1028,30 @@ final class AppModel: ObservableObject {
 
     private func handleMicStartFailure(_ error: Error) {
         micEngine = nil
+        micEngineBoundDeviceID = 0
         micOutputEnabled = false
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
         debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
+        AudioLog.error("engine.start.fail.surfaced", ["error": String(describing: error)])
         appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
     }
 
+    /// Stop-then-start the meeting mic engine. MUST run on the mic lifecycle
+    /// serializer (via `enqueueMicLifecycle`) - never spawn it in a bare Task.
     private func restartMeetingMicEngineForInputSwitch() async {
         guard isCapturing else { return }
         guard transcribeMic else { return }
+
+        // A restart supersedes any pending startup health check (audit D15).
+        cancelMicStartupHealthCheck()
+        AudioLog.event("engine.restart.begin", ["boundID": micEngineBoundDeviceID])
 
         if let engine = micEngine {
             await engine.stop()
             micEngine = nil
         }
+        micEngineBoundDeviceID = 0
 
         pendingMicAudio.removeAll()
         micOutputEnabled = false
@@ -844,7 +1059,9 @@ final class AppModel: ObservableObject {
         debugMicBuffers = 0
         debugMicFrames = 0
         debugMicPTS = 0
+        lastMicAudioAt = nil
         await startMeetingMicEngine()
+        AudioLog.event("engine.restart.end", ["boundID": micEngineBoundDeviceID])
     }
 
     private func restartPreviewMicEngineForInputSwitch() async {
@@ -871,6 +1088,74 @@ final class AppModel: ObservableObject {
         micStartupHealthTask = nil
     }
 
+    /// Continuous frames-flowing watchdog for the whole meeting (the startup
+    /// health check is one-shot and can't catch a mic that dies mid-meeting -
+    /// audit D9). Logs a heartbeat every interval and force-restarts on a stall
+    /// once frames have actually been flowing. This is the recovery for the
+    /// silent-dead-mic-on-device-change symptom.
+    private func startMicFramesWatchdog() {
+        stopMicFramesWatchdog()
+        micFramesWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: self?.micWatchdogIntervalNs ?? 2_000_000_000)
+                guard let self else { return }
+                guard !Task.isCancelled else { return }
+                guard self.isCapturing, self.transcribeMic else { continue }
+
+                let reference = self.lastMicAudioAt ?? self.micStartTime
+                let since = reference.map { Date().timeIntervalSince($0) }
+                AudioLog.event("heartbeat", [
+                    "frames": self.micFrameCount,
+                    "sinceLastFrameMs": since.map { Int($0 * 1000) } ?? -1,
+                    "micLevel": String(format: "%.3f", self.micLevel),
+                    "engineAlive": self.micEngine != nil,
+                    "boundID": self.micEngineBoundDeviceID,
+                    "snap": AudioDeviceManager.snapshot()
+                ])
+
+                // Only treat as a stall once at least one frame has arrived; the
+                // never-delivered-at-startup case is the startup health check's
+                // job, so the two don't fight.
+                guard let last = self.lastMicAudioAt, self.micEngine != nil else { continue }
+                if Date().timeIntervalSince(last) > self.micStallThresholdSeconds {
+                    AudioLog.error("heartbeat.STALL", [
+                        "sinceLastFrameMs": Int(Date().timeIntervalSince(last) * 1000),
+                        "snap": AudioDeviceManager.snapshot()
+                    ])
+                    self.appendBackendLog("Mic stopped delivering audio - restarting capture.", toTail: true)
+                    // Debounce so we don't re-fire every tick before the new
+                    // engine starts delivering.
+                    self.lastMicAudioAt = Date()
+                    self.enqueueMicLifecycle("watchdog-stall") { await $0.restartMeetingMicEngineForInputSwitch() }
+                }
+            }
+        }
+    }
+
+    private func stopMicFramesWatchdog() {
+        micFramesWatchdogTask?.cancel()
+        micFramesWatchdogTask = nil
+    }
+
+    /// User-triggered recovery (the Refresh button). Re-enumerates devices AND
+    /// force-restarts a dead/stale meeting engine even when the resolved device
+    /// id has not changed - the old Refresh only restarted on an id delta and so
+    /// could not rescue a dead-but-present mic (audit D3).
+    func refreshMicrophones() {
+        AudioLog.event("user.refresh", ["snap": AudioDeviceManager.snapshot()])
+        loadInputDevices()
+        loadOutputDevices()
+        guard isCapturing, transcribeMic, !isSwitchingInputDevice else { return }
+        let stale = lastMicAudioAt.map { Date().timeIntervalSince($0) > micStallThresholdSeconds } ?? true
+        if micEngine == nil || debugMicBuffers == 0 || stale {
+            AudioLog.event("user.refresh.force-restart", [
+                "engineAlive": micEngine != nil, "buffers": debugMicBuffers
+            ])
+            micVoiceProcessingDowngraded = false
+            enqueueMicLifecycle("refresh") { await $0.restartMeetingMicEngineForInputSwitch() }
+        }
+    }
+
     private func scheduleMicStartupHealthCheck() {
         cancelMicStartupHealthCheck()
         guard transcribeMic else { return }
@@ -885,22 +1170,39 @@ final class AppModel: ObservableObject {
             guard debugMicBuffers == 0 else { return }
 
             // A VPIO route that delivered no audio is the silent-failure case:
-            // downgrade once to plain capture and health-check that too.
+            // downgrade once to plain capture and health-check that too. The
+            // restart reschedules the health check itself on success.
             if micVoiceProcessingRequested && !micVoiceProcessingDowngraded {
                 micVoiceProcessingDowngraded = true
                 appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
-                await restartMeetingMicEngineForInputSwitch()
-                scheduleMicStartupHealthCheck()
+                AudioLog.event("healthcheck.no-audio.vpio-downgrade")
+                enqueueMicLifecycle("vpio-downgrade") { await $0.restartMeetingMicEngineForInputSwitch() }
                 return
             }
 
             // Plain capture with no audio is a genuine mic problem, not VPIO.
+            AudioLog.error("healthcheck.no-audio")
             appendBackendLog("Mic health check: still no audio.", toTail: true)
         }
     }
 
     @MainActor
     private func handleOutputDeviceChange() {
+        // Honour the output policy: a pin re-asserts itself if the OS moved the
+        // default output away from it; a vanished pin resets to follow.
+        if case .pinned(let uid) = outputSelection {
+            if let id = AudioDeviceManager.deviceID(forUID: uid) {
+                if AudioDeviceManager.defaultOutputDeviceID() != id {
+                    _ = AudioDeviceManager.setDefaultOutputDevice(id)
+                    AudioLog.event("output.reassert-pin", ["uid": uid, "id": id])
+                }
+            } else {
+                setOutputSelection(.followSystem)
+                AudioLog.event("output.pin-vanished", ["uid": uid])
+            }
+        }
+        loadOutputDevices()
+
         // No active mic generation means nothing to re-evaluate; the next start
         // resets the downgrade flag itself.
         guard isCapturing, transcribeMic else { return }
@@ -913,9 +1215,7 @@ final class AppModel: ObservableObject {
         guard aecMode == .auto else { return }
         guard shouldEnableVoiceProcessing() != micVoiceProcessingRequested else { return }
 
-        Task { @MainActor [weak self] in
-            await self?.restartMeetingMicEngineForInputSwitch()
-        }
+        enqueueMicLifecycle("output-change") { await $0.restartMeetingMicEngineForInputSwitch() }
     }
 
     private func rmsLevelInt16(_ data: Data) -> Float {
@@ -1174,35 +1474,35 @@ final class AppModel: ObservableObject {
         let available = AudioDeviceManager.inputDevices()
         inputDevices = available
 
-        let availableIDs = Set(available.map(\.id))
-        let defaultID = AudioDeviceManager.defaultInputDeviceID()
-        let previousSelection = selectedInputDeviceID
-        let resolvedSelection: UInt32
+        let previousID = selectedInputDeviceID
+        let (desiredID, pinned) = resolvedInputDeviceID()
 
-        if availableIDs.contains(selectedInputDeviceID) {
-            resolvedSelection = selectedInputDeviceID
-        } else if let defaultID, availableIDs.contains(defaultID) {
-            resolvedSelection = defaultID
-        } else {
-            resolvedSelection = available.first?.id ?? 0
-        }
+        // The picker mirror: 0 == "System default" row when following; the pinned
+        // device id otherwise.
+        selectedInputDeviceID = pinned ? desiredID : 0
 
-        if selectedInputDeviceID != resolvedSelection {
-            selectedInputDeviceID = resolvedSelection
-        }
+        // Restart only when capturing and the device the engine SHOULD be on
+        // differs from what it's actually bound to. This is liveness/identity
+        // aware, not a bare ID delta on the display mirror (audit D1/D3): a
+        // follow-mode steal moves `desiredID` off `micEngineBoundDeviceID` and so
+        // fires, where the old `previousSelection != 0` guard silently returned.
+        let willRestart = isCapturing && transcribeMic && !isSwitchingInputDevice
+            && desiredID != 0 && desiredID != micEngineBoundDeviceID
 
-        guard resolvedSelection != 0 else { return }
-        guard previousSelection != 0 else { return }
-        guard previousSelection != resolvedSelection else { return }
-        guard !isSwitchingInputDevice else { return }
-        guard isCapturing else { return }
+        AudioLog.event("resolve.input", [
+            "mode": inputSelection.logDescription,
+            "previousID": previousID,
+            "desiredID": desiredID,
+            "boundID": micEngineBoundDeviceID,
+            "pinned": pinned,
+            "isCapturing": isCapturing,
+            "willRestart": willRestart,
+            "snap": AudioDeviceManager.snapshot()
+        ])
 
-        let selectedID = resolvedSelection
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard self.selectedInputDeviceID == selectedID else { return }
-            self.queueInputDeviceSelectionChange(to: selectedID, updateSystemDefault: false)
-        }
+        guard willRestart else { return }
+        micVoiceProcessingDowngraded = false
+        enqueueMicLifecycle("input-resolve") { await $0.restartMeetingMicEngineForInputSwitch() }
     }
 
     private func updateScreenPermissionFromShareableContent() async {
@@ -1645,6 +1945,7 @@ final class AppModel: ObservableObject {
             isCapturing = true
             activeScreen = .session
             scheduleMicStartupHealthCheck()
+            startMicFramesWatchdog()
         } catch {
             let pythonPath = backendPythonCandidatePath ?? "(unknown)"
             let nsError = error as NSError
@@ -1663,6 +1964,8 @@ final class AppModel: ObservableObject {
 
         isFinalizing = true
         cancelMicStartupHealthCheck()
+        stopMicFramesWatchdog()
+        micEngineBoundDeviceID = 0
 
         screenshotScheduler.stop()
         await captureEngine.stopCapture()

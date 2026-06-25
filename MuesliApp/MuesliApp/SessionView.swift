@@ -82,6 +82,7 @@ struct SessionView: View {
                                 get: { model.selectedInputDeviceID },
                                 set: { model.selectInputDevice($0) }
                             )) {
+                                Text("System default").tag(UInt32(0))
                                 ForEach(model.inputDevices, id: \.id) { device in
                                     Text(device.name)
                                         .tag(device.id)
@@ -89,8 +90,20 @@ struct SessionView: View {
                             }
                             .disabled(model.isSwitchingInputDevice)
 
-                            Button("Refresh microphones") {
-                                model.loadInputDevices()
+                            Picker("Output", selection: Binding(
+                                get: { model.selectedOutputDeviceID },
+                                set: { model.selectOutputDevice($0) }
+                            )) {
+                                Text("System default").tag(UInt32(0))
+                                ForEach(model.outputDevices, id: \.id) { device in
+                                    Text(device.name)
+                                        .tag(device.id)
+                                }
+                            }
+                            .disabled(model.isSwitchingInputDevice)
+
+                            Button("Refresh devices") {
+                                model.refreshMicrophones()
                             }
                             .buttonStyle(.link)
                             .disabled(model.isSwitchingInputDevice)
@@ -105,7 +118,7 @@ struct SessionView: View {
                                 }
                             }
 
-                            Text("Muesli follows the macOS default input. Changing it in System Settings restarts mic capture briefly and continues recording.")
+                            Text("Muesli follows your Mac's default input/output and auto-recovers if a device changes mid-meeting. Pick a device to pin it; it sticks until you change it or choose System default. Refresh forces recovery if audio ever stops.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }

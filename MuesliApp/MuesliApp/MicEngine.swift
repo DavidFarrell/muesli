@@ -13,35 +13,73 @@ actor MicEngine {
     private var engine: AVAudioEngine?
     private var isRunning = false
     private var onAudioData: ((Data) -> Void)?
+    private var onConfigurationChange: (() -> Void)?
+    private var configChangeObserver: NSObjectProtocol?
+    private var convertFailures = 0
     private var retiredEngines: [UUID: AVAudioEngine] = [:]
     private let engineRetainDurationNs: UInt64 = 2_000_000_000
 
     /// The caller decides voice processing. Escalation is the caller's job: on a
     /// failure it can restart with `enableVoiceProcessing: false`.
+    ///
+    /// - `pinned`: when true the device is bound UNCONDITIONALLY (a deliberate
+    ///   user pick must take effect even if it currently equals the default).
+    ///   When false (auto-follow) we keep the skip-on-equal-default heuristic so
+    ///   the engine tracks the system default route.
+    /// - `onConfigurationChange`: fired when the OS moves the audio route under a
+    ///   running engine (e.g. a Bluetooth headset connects). The caller restarts.
     func start(
         enableVoiceProcessing: Bool,
         preferredInputDeviceID: UInt32?,
+        pinned: Bool = false,
+        onConfigurationChange: (@Sendable () -> Void)? = nil,
         onAudioData: @escaping (Data) -> Void
     ) throws {
         guard !isRunning else { return }
 
         self.onAudioData = onAudioData
-        try startEngine(preferredInputDeviceID: preferredInputDeviceID, enableVoiceProcessing: enableVoiceProcessing)
-        print("[MicEngine] Started with voice processing \(enableVoiceProcessing ? "enabled" : "disabled")")
+        self.onConfigurationChange = onConfigurationChange
+        do {
+            try startEngine(
+                preferredInputDeviceID: preferredInputDeviceID,
+                enableVoiceProcessing: enableVoiceProcessing,
+                pinned: pinned
+            )
+        } catch {
+            AudioLog.error("engine.start.fail", [
+                "vpio": enableVoiceProcessing,
+                "pinned": pinned,
+                "preferredID": preferredInputDeviceID ?? 0,
+                "error": String(describing: error)
+            ])
+            throw error
+        }
+        AudioLog.event("engine.start.ok", [
+            "vpio": enableVoiceProcessing,
+            "pinned": pinned,
+            "preferredID": preferredInputDeviceID ?? 0
+        ])
         isRunning = true
     }
 
-    private func startEngine(preferredInputDeviceID: UInt32?, enableVoiceProcessing: Bool) throws {
+    private func startEngine(preferredInputDeviceID: UInt32?, enableVoiceProcessing: Bool, pinned: Bool) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
 
-        // Skip the bind only when the requested device is confirmed to be the
-        // current default - the unconditional bind is the risky call implicated
-        // in the dead-mic bug. If the default cannot be read, honour the
-        // explicit selection and bind rather than silently drop it (nil default
-        // is not equal to the requested id, so this binds).
-        if let preferredInputDeviceID, currentDefaultInputDeviceID() != preferredInputDeviceID {
-            try bindPreferredInputDevice(preferredInputDeviceID, on: inputNode)
+        // A pinned device binds unconditionally - a deliberate pick must win even
+        // when it equals the current (possibly just-stolen) default. In
+        // auto-follow we skip the bind when the requested device IS the live
+        // default, leaving the engine to track the default route. The
+        // unconditional bind in the wrong case is the call implicated in the
+        // dead-mic bug, so it is now gated on `pinned`.
+        if let preferredInputDeviceID {
+            let liveDefault = currentDefaultInputDeviceID()
+            if pinned || liveDefault != preferredInputDeviceID {
+                try bindPreferredInputDevice(preferredInputDeviceID, on: inputNode)
+                AudioLog.event("engine.bind", ["deviceID": preferredInputDeviceID, "pinned": pinned])
+            } else {
+                AudioLog.event("engine.bind.skip", ["deviceID": preferredInputDeviceID, "reason": "equals-default-follow"])
+            }
         }
 
         // The caller controls VPIO. If it was requested and cannot be enabled,
@@ -84,10 +122,30 @@ actor MicEngine {
             format: nativeFormat
         ) { [weak self] buffer, _ in
             guard let data = AudioConverterHelper.convertToInt16(buffer: buffer) else {
+                // A tap that fires but fails to convert looks identical to a dead
+                // mic from the outside and silently defeats the no-audio health
+                // check - so count and log it (first failure carries the format).
+                Task { [weak self] in
+                    await self?.noteConversionFailure(format: "\(nativeFormat)")
+                }
                 return
             }
             Task { [weak self] in
                 await self?.emitAudio(data)
+            }
+        }
+
+        // Fire when the OS moves the route under a running engine (the event we
+        // previously could not see at all - e.g. a Bluetooth headset connecting).
+        if let onConfigurationChange {
+            let callback = onConfigurationChange
+            configChangeObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: nil
+            ) { _ in
+                AudioLog.event("engine.configchange.notify")
+                callback()
             }
         }
 
@@ -98,17 +156,36 @@ actor MicEngine {
         } catch {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            if let observer = configChangeObserver {
+                NotificationCenter.default.removeObserver(observer)
+                configChangeObserver = nil
+            }
             throw error
+        }
+    }
+
+    private func noteConversionFailure(format: String) {
+        convertFailures += 1
+        if convertFailures == 1 {
+            AudioLog.error("tap.convert.fail", ["inputFormat": format])
         }
     }
 
     func stop() async {
         guard isRunning else { return }
 
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
+        onConfigurationChange = nil
+        convertFailures = 0
+
         let runningEngine = engine
         self.engine = nil
         isRunning = false
         onAudioData = nil
+        AudioLog.event("engine.stop")
 
         guard let runningEngine else {
             print("[MicEngine] Stopped")

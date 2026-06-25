@@ -262,14 +262,26 @@ struct NewMeetingView: View {
                         get: { model.selectedInputDeviceID },
                         set: { model.selectInputDevice($0) }
                     )) {
+                        Text("System default").tag(UInt32(0))
                         ForEach(model.inputDevices, id: \.id) { device in
                             Text(device.name)
                                 .tag(device.id)
                         }
                     }
 
-                    Button("Refresh microphones") {
-                        model.loadInputDevices()
+                    Picker("Output", selection: Binding(
+                        get: { model.selectedOutputDeviceID },
+                        set: { model.selectOutputDevice($0) }
+                    )) {
+                        Text("System default").tag(UInt32(0))
+                        ForEach(model.outputDevices, id: \.id) { device in
+                            Text(device.name)
+                                .tag(device.id)
+                        }
+                    }
+
+                    Button("Refresh devices") {
+                        model.refreshMicrophones()
                     }
                     .buttonStyle(.link)
                     .disabled(model.isSwitchingInputDevice)
@@ -284,7 +296,7 @@ struct NewMeetingView: View {
                         }
                     }
 
-                    Text("Changing it here switches Muesli to that microphone and also asks macOS to make it the default input.")
+                    Text("Muesli follows your Mac's default input and output. Pick a specific device to pin it - it sticks through Bluetooth changes until you change it again or choose System default.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 
@@ -727,7 +739,13 @@ enum ScreenCaptureKitHelpers {
 // MARK: - Audio Devices
 
 struct AudioDevice: Identifiable, Hashable {
+    /// Transient CoreAudio AudioObjectID. NOT stable across disconnect/reconnect
+    /// or reboot - never persist or compare across a device change. Re-resolve
+    /// from `uid` at the moment of use.
     let id: UInt32
+    /// Stable identity (`kAudioDevicePropertyDeviceUID`). This is the source of
+    /// truth for "is this the same device" and is what gets persisted/pinned.
+    let uid: String
     let name: String
 }
 
@@ -780,10 +798,100 @@ enum AudioDeviceManager {
         for id in deviceIDs {
             guard hasInputChannels(id) else { continue }
             let name = deviceName(id) ?? "Unknown"
-            devices.append(AudioDevice(id: id, name: name))
+            let uid = deviceUID(id) ?? "id:\(id)"
+            devices.append(AudioDevice(id: id, uid: uid, name: name))
         }
 
         return devices.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    /// Output devices, by stable UID. Mirrors `inputDevices()`.
+    static func outputDevices() -> [AudioDevice] {
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &dataSize) == noErr else {
+            return []
+        }
+
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &dataSize, &deviceIDs) == noErr else {
+            return []
+        }
+
+        var devices: [AudioDevice] = []
+        for id in deviceIDs {
+            guard hasOutputChannels(id) else { continue }
+            let name = deviceName(id) ?? "Unknown"
+            let uid = deviceUID(id) ?? "id:\(id)"
+            devices.append(AudioDevice(id: id, uid: uid, name: name))
+        }
+
+        return devices.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    /// Stable device UID (`kAudioDevicePropertyDeviceUID`).
+    static func deviceUID(_ id: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var uid: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(id, &address, 0, nil, &dataSize, &uid)
+        guard status == noErr else { return nil }
+        return uid?.takeRetainedValue() as String?
+    }
+
+    /// Re-resolve a stable UID to its CURRENT transient AudioObjectID by scanning
+    /// the live device list. Returns nil if the device is not currently present.
+    static func deviceID(forUID uid: String) -> UInt32? {
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &dataSize) == noErr else {
+            return nil
+        }
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var deviceIDs = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &dataSize, &deviceIDs) == noErr else {
+            return nil
+        }
+        for id in deviceIDs where deviceUID(id) == uid {
+            return id
+        }
+        return nil
+    }
+
+    /// Public name lookup for an arbitrary device id (used by logging snapshots).
+    static func name(for id: UInt32) -> String? {
+        deviceName(AudioObjectID(id))
+    }
+
+    /// One-line snapshot of the current default input + output (id, uid, name)
+    /// for the unified audio log. Logging IDs, UIDs and names together makes a
+    /// transient-ID reuse visible (same name, different id; or same id, new uid).
+    static func snapshot() -> String {
+        func describe(_ id: UInt32?) -> String {
+            guard let id, id != 0 else { return "id=- uid=- name=-" }
+            let uid = deviceUID(AudioObjectID(id)) ?? "-"
+            let name = deviceName(AudioObjectID(id)) ?? "-"
+            return "id=\(id) uid=\(uid) name='\(name)'"
+        }
+        return "in[\(describe(defaultInputDeviceID()))] out[\(describe(defaultOutputDeviceID()))]"
     }
 
     static func defaultInputDeviceID() -> UInt32? {
@@ -874,6 +982,20 @@ enum AudioDeviceManager {
                 mElement: kAudioObjectPropertyElementMain
             )
         ]
+    }
+
+    static func setDefaultOutputDevice(_ id: UInt32) -> Bool {
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var deviceID = AudioObjectID(id)
+        let dataSize = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectSetPropertyData(systemObject, &address, 0, nil, dataSize, &deviceID)
+        return status == noErr
     }
 
     static func defaultOutputDeviceID() -> UInt32? {
