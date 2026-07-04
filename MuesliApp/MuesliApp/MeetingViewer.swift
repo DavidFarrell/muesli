@@ -5,6 +5,7 @@ import AppKit
 
 struct MeetingViewer: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var transcript: TranscriptModel
     let meeting: MeetingHistoryItem
     @State private var showSpeakers = false
     @State private var autoScroll = true
@@ -242,7 +243,7 @@ struct MeetingViewer: View {
                 Button {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
-                    pasteboard.setString(model.transcriptModel.asPlainText(), forType: .string)
+                    pasteboard.setString(transcript.asPlainText(), forType: .string)
                     copyIconName = "checkmark.circle.fill"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                         copyIconName = "doc.on.clipboard"
@@ -268,9 +269,13 @@ struct MeetingViewer: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.transcriptModel.segments.filter { !$0.isPartial }) { segment in
-                        TranscriptRow(segment: segment)
-                            .id(segment.id)
+                    ForEach(transcript.segments.filter { !$0.isPartial }) { segment in
+                        TranscriptRow(
+                            segment: segment,
+                            displayName: transcript.displayName(for: segment.speakerID),
+                            onRename: { model.renameSpeaker(id: segment.speakerID, to: $0) }
+                        )
+                        .id(segment.id)
                     }
                 }
                 .padding(.vertical, 8)
@@ -278,8 +283,8 @@ struct MeetingViewer: View {
             }
             .background(.thinMaterial)
             .cornerRadius(12)
-            .onChange(of: model.transcriptModel.segments.count) { _, _ in
-                guard autoScroll, let last = model.transcriptModel.segments.last else { return }
+            .onChange(of: transcript.segments.count) { _, _ in
+                guard autoScroll, let last = transcript.segments.last else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }
@@ -422,7 +427,7 @@ struct MeetingViewer: View {
                     screenshots: screenshots,
                     transcript: transcript,
                     speakerIds: speakerIds,
-                    existingSpeakerNames: model.transcriptModel.speakerNames,
+                    existingSpeakerNames: self.transcript.speakerNames,
                     userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in
@@ -477,14 +482,14 @@ struct MeetingViewer: View {
 
     private func speakerIdsForIdentification() -> [String] {
         var ids = Set<String>()
-        for segment in model.transcriptModel.segments where !segment.isPartial {
+        for segment in transcript.segments where !segment.isPartial {
             ids.insert(segment.speakerID)
         }
         return ids.sorted()
     }
 
     private func transcriptForIdentification() -> String {
-        model.transcriptModel.segments
+        transcript.segments
             .filter { !$0.isPartial }
             .map { segment in
                 let stream = segment.stream == "unknown" ? "" : "[\(segment.stream)] "

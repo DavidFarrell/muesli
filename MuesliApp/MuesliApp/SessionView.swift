@@ -5,6 +5,8 @@ import AppKit
 
 struct SessionView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var meters: AudioMetersModel
+    @EnvironmentObject var transcript: TranscriptModel
     @State private var showSpeakers = false
     @State private var autoScroll = true
     @State private var showDebug = false
@@ -27,18 +29,18 @@ struct SessionView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     GroupBox("Audio levels") {
                         VStack(alignment: .leading, spacing: 10) {
-                            LevelMeter(label: "System", level: model.systemLevel)
-                            LevelMeter(label: "Microphone", level: model.micLevel)
+                            LevelMeter(label: "System", level: meters.systemLevel)
+                            LevelMeter(label: "Microphone", level: meters.micLevel)
 
-                            if !model.debugMicErrorMessage.isEmpty && model.debugMicErrorMessage != "-" {
+                            if !meters.debugMicErrorMessage.isEmpty && meters.debugMicErrorMessage != "-" {
                                 HStack(spacing: 4) {
                                     Image(systemName: "exclamationmark.triangle.fill")
                                         .foregroundStyle(.red)
-                                    Text(model.debugMicErrorMessage)
+                                    Text(meters.debugMicErrorMessage)
                                         .foregroundStyle(.red)
                                 }
                                 .font(.footnote)
-                            } else if model.transcribeMic && model.debugMicBuffers == 0 {
+                            } else if model.transcribeMic && meters.debugMicBuffers == 0 {
                                 HStack(spacing: 4) {
                                     Image(systemName: "exclamationmark.triangle.fill")
                                         .foregroundStyle(.orange)
@@ -136,30 +138,30 @@ struct SessionView: View {
                                 .buttonStyle(.bordered)
                                 Spacer()
                             }
-                            Text("System buffers: \(model.debugSystemBuffers) frames: \(model.debugSystemFrames)")
-                            Text("System PTS: \(String(format: "%.3f", model.debugSystemPTS))")
-                            Text("System format: \(model.debugSystemFormat)")
-                            Text("System errors: \(model.debugAudioErrors)")
-                            if model.debugSystemErrorMessage != "-" {
-                                Text("System error: \(model.debugSystemErrorMessage)")
+                            Text("System buffers: \(meters.debugSystemBuffers) frames: \(meters.debugSystemFrames)")
+                            Text("System PTS: \(String(format: "%.3f", meters.debugSystemPTS))")
+                            Text("System format: \(meters.debugSystemFormat)")
+                            Text("System errors: \(meters.debugAudioErrors)")
+                            if meters.debugSystemErrorMessage != "-" {
+                                Text("System error: \(meters.debugSystemErrorMessage)")
                                     .foregroundStyle(.red)
                             }
                             Divider()
-                            Text("Mic buffers: \(model.debugMicBuffers) frames: \(model.debugMicFrames)")
-                            Text("Mic PTS: \(String(format: "%.3f", model.debugMicPTS))")
-                            Text("Mic format: \(model.debugMicFormat)")
-                            Text("Mic errors: \(model.debugMicErrors)")
-                            if model.debugMicErrorMessage != "-" {
-                                Text("Mic error: \(model.debugMicErrorMessage)")
+                            Text("Mic buffers: \(meters.debugMicBuffers) frames: \(meters.debugMicFrames)")
+                            Text("Mic PTS: \(String(format: "%.3f", meters.debugMicPTS))")
+                            Text("Mic format: \(meters.debugMicFormat)")
+                            Text("Mic errors: \(meters.debugMicErrors)")
+                            if meters.debugMicErrorMessage != "-" {
+                                Text("Mic error: \(meters.debugMicErrorMessage)")
                                     .foregroundStyle(.red)
                             }
                             Divider()
-                            Text("Transcript segments: \(model.transcriptModel.segments.count)")
-                            if let last = model.transcriptModel.lastTranscriptAt {
+                            Text("Transcript segments: \(transcript.segments.count)")
+                            if let last = transcript.lastTranscriptAt {
                                 Text("Last transcript: \(timeFormatter.string(from: last))")
                             }
-                            if !model.transcriptModel.lastTranscriptText.isEmpty {
-                                let snippet = model.transcriptModel.lastTranscriptText.prefix(120)
+                            if !transcript.lastTranscriptText.isEmpty {
+                                let snippet = transcript.lastTranscriptText.prefix(120)
                                 Text("Last text: \(snippet)")
                             }
                         }
@@ -283,16 +285,20 @@ struct SessionView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 10) {
-                        ForEach(model.transcriptModel.segments) { seg in
-                            TranscriptRow(segment: seg)
-                                .id(seg.id)
+                        ForEach(transcript.segments) { seg in
+                            TranscriptRow(
+                                segment: seg,
+                                displayName: transcript.displayName(for: seg.speakerID),
+                                onRename: { model.renameSpeaker(id: seg.speakerID, to: $0) }
+                            )
+                            .id(seg.id)
                         }
 
                         Color.clear.frame(height: 1).id("BOTTOM")
                     }
                     .padding(8)
                 }
-                .onChange(of: model.transcriptModel.segments.count) { _, _ in
+                .onChange(of: transcript.segments.count) { _, _ in
                     guard autoScroll else { return }
                     withAnimation(.easeOut(duration: 0.2)) {
                         proxy.scrollTo("BOTTOM", anchor: .bottom)
@@ -305,7 +311,7 @@ struct SessionView: View {
                 Text("Live transcript")
                 Spacer()
                 Button {
-                    let text = model.transcriptModel.asPlainText()
+                    let text = transcript.asPlainText()
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(text, forType: .string)

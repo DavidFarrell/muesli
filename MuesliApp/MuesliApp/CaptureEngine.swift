@@ -226,7 +226,10 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     var debugSystemErrorMessage: String = "-"
     var debugAudioErrors: Int = 0
 
-    var onLevelsUpdated: (() -> Void)?
+    /// Throttled display mirror for the system level meter + its debug
+    /// counters. Fed directly from the per-buffer callback below instead of
+    /// invalidating the whole AppModel view tree (audit A1).
+    var metersModel: AudioMetersModel?
     /// Fired when the system stops the capture stream with an error (e.g. the OS
     /// tears it down). Previously this delegate callback was unimplemented and
     /// such stops were silently dropped (audit D13).
@@ -374,8 +377,14 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.debugSystemFrames = pcm.frameCount
                     self.debugSystemPTS = ptsSeconds
                     self.debugSystemFormat = formatInfo
+                    self.metersModel?.updateSystem(
+                        level: self.systemLevel,
+                        buffers: self.debugSystemBuffers,
+                        frames: self.debugSystemFrames,
+                        pts: self.debugSystemPTS,
+                        format: self.debugSystemFormat
+                    )
                 }
-                self.onLevelsUpdated?()
             }
 
             if type == .screen {
@@ -426,6 +435,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.debugAudioErrors += 1
                     self.debugSystemFormat = formatInfo
                     self.debugSystemErrorMessage = errorMessage
+                    self.metersModel?.setSystemError(message: errorMessage, errorCount: self.debugAudioErrors)
                 }
             }
             return

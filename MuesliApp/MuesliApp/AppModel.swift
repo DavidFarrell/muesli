@@ -154,16 +154,22 @@ final class AppModel: ObservableObject {
         }
     }
     @Published var backendLogTail: [String] = []
-    @Published var micLevel: Float = 0
     @Published var isPreviewingLevels = false
     @Published private(set) var isStartingMeeting = false
     @Published private(set) var isSwitchingInputDevice = false
-    @Published var debugMicBuffers: Int = 0
-    @Published var debugMicFrames: Int = 0
-    @Published var debugMicPTS: Double = 0
-    @Published var debugMicFormat: String = "-"
-    @Published var debugMicErrorMessage: String = "-"
-    @Published var debugMicErrors: Int = 0
+
+    // Per-buffer-accurate mic level/debug state. NOT @Published - the startup
+    // health check and watchdog need these exact on every buffer, but the UI
+    // must not invalidate at buffer rate. `meters` is the throttled display
+    // mirror views actually observe (audit A1).
+    private var micLevel: Float = 0
+    private var debugMicBuffers: Int = 0
+    private var debugMicFrames: Int = 0
+    private var debugMicPTS: Double = 0
+    private var debugMicFormat: String = "-"
+    private var debugMicErrorMessage: String = "-"
+    private var debugMicErrors: Int = 0
+    let meters = AudioMetersModel()
 
     let transcriptModel = TranscriptModel()
     @Published var currentAttachments: [Attachment] = []
@@ -232,8 +238,6 @@ final class AppModel: ObservableObject {
         #endif
         return nil
     }
-    private var transcriptCancellable: AnyCancellable?
-
     @Published var backendFolderURL: URL?
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
@@ -296,19 +300,10 @@ final class AppModel: ObservableObject {
             modeKey: outputSelectionModeKey, uidKey: outputSelectionUIDKey
         ).map(OutputSelection.pinned) ?? .followSystem
 
-        captureEngine.onLevelsUpdated = { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.objectWillChange.send()
-            }
-        }
+        captureEngine.metersModel = meters
         captureEngine.onStreamStopped = { [weak self] error in
             Task { @MainActor [weak self] in
                 self?.appendBackendLog("System audio capture stopped: \(error.localizedDescription)", toTail: true)
-            }
-        }
-        transcriptCancellable = transcriptModel.objectWillChange.sink { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.objectWillChange.send()
             }
         }
         AudioDeviceManager.observeInputDeviceChanges { [weak self] in
@@ -614,6 +609,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Mirrors the current internal mic level/debug state into the throttled
+    /// `meters` display model. Call after any mutation of the internal vars
+    /// above (per-buffer callers get coalesced automatically by `meters`).
+    /// One-shot callers (reset/stop/restart) pass `force: true` - a dropped
+    /// publish there is never retried, so it must bypass the throttle.
+    private func publishMicMeters(force: Bool = false) {
+        meters.updateMic(
+            level: micLevel,
+            buffers: debugMicBuffers,
+            frames: debugMicFrames,
+            pts: debugMicPTS,
+            format: debugMicFormat,
+            force: force
+        )
+    }
+
+    /// Mic error/status changes aren't per-buffer-rate; publish immediately.
+    private func publishMicError() {
+        meters.setMicError(message: debugMicErrorMessage, errorCount: debugMicErrors)
+    }
+
     private func resetMicDebugState() {
         micLevel = 0
         debugMicBuffers = 0
@@ -624,6 +640,8 @@ final class AppModel: ObservableObject {
         debugMicErrors = 0
         micFrameCount = 0
         lastMicAudioAt = nil
+        publishMicMeters(force: true)
+        publishMicError()
     }
 
     private func handleMicAudio(_ data: Data) {
@@ -644,6 +662,7 @@ final class AppModel: ObservableObject {
         lastMicAudioAt = now
         micFrameCount += 1
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
+        publishMicMeters()
 
         let payload = data
         if micOutputEnabled {
@@ -663,6 +682,7 @@ final class AppModel: ObservableObject {
 
     private func handlePreviewMicAudio(_ data: Data) {
         micLevel = rmsLevelInt16(data)
+        publishMicMeters()
     }
 
     private var isStartScreenActive: Bool {
@@ -894,6 +914,7 @@ final class AppModel: ObservableObject {
                 previewMicEngine = nil
                 debugMicErrors += 1
                 debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
+                publishMicError()
             }
         }
 
@@ -921,7 +942,15 @@ final class AppModel: ObservableObject {
         isPreviewingLevels = false
         micLevel = 0
         captureEngine.systemLevel = 0
-        objectWillChange.send()
+        publishMicMeters(force: true)
+        meters.updateSystem(
+            level: captureEngine.systemLevel,
+            buffers: captureEngine.debugSystemBuffers,
+            frames: captureEngine.debugSystemFrames,
+            pts: captureEngine.debugSystemPTS,
+            format: captureEngine.debugSystemFormat,
+            force: true
+        )
     }
 
     func startHomeLevelPreview() async {
@@ -1002,6 +1031,7 @@ final class AppModel: ObservableObject {
             micEngine = engine
             micOutputEnabled = true
             debugMicErrorMessage = "-"
+            publishMicError()
             if isCapturing {
                 scheduleMicStartupHealthCheck()
             }
@@ -1033,6 +1063,7 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
         debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
+        publishMicError()
         AudioLog.error("engine.start.fail.surfaced", ["error": String(describing: error)])
         appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
     }
@@ -1060,6 +1091,7 @@ final class AppModel: ObservableObject {
         debugMicFrames = 0
         debugMicPTS = 0
         lastMicAudioAt = nil
+        publishMicMeters(force: true)
         await startMeetingMicEngine()
         AudioLog.event("engine.restart.end", ["boundID": micEngineBoundDeviceID])
     }

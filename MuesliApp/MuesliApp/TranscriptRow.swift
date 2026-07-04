@@ -1,8 +1,9 @@
 import SwiftUI
 
 struct TranscriptRow: View {
-    @EnvironmentObject var model: AppModel
     let segment: TranscriptSegment
+    let displayName: String
+    let onRename: (String) -> Void
     @State private var showRename = false
     @State private var proposedName = ""
 
@@ -16,8 +17,8 @@ struct TranscriptRow: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 10) {
-                    Button(model.transcriptModel.displayName(for: segment.speakerID)) {
-                        proposedName = model.transcriptModel.displayName(for: segment.speakerID)
+                    Button(displayName) {
+                        proposedName = displayName
                         showRename = true
                     }
                     .buttonStyle(.link)
@@ -62,7 +63,7 @@ struct TranscriptRow: View {
                         Button("Cancel") { showRename = false }
                         Button("Save") {
                             let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
-                            model.renameSpeaker(id: segment.speakerID, to: trimmed)
+                            onRename(trimmed)
                             showRename = false
                         }
                         .keyboardShortcut(.defaultAction)
