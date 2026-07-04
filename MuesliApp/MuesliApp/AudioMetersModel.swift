@@ -10,9 +10,10 @@ import Combine
 /// per-buffer-accurate counters stay on the feeders as internal state; this
 /// model only holds the throttled values views actually render.
 ///
-/// A level of exactly 0 always publishes immediately (bypassing the
+/// A TRANSITION to a level of exactly 0 publishes immediately (bypassing the
 /// throttle) so meters visibly zero out on stop/reset instead of freezing at
-/// their last nonzero value for up to one throttle window.
+/// their last nonzero value for up to one throttle window. Sustained zero
+/// levels (digital silence) stay throttled like any other value.
 @MainActor
 final class AudioMetersModel: ObservableObject {
     @Published private(set) var micLevel: Float = 0
@@ -36,10 +37,14 @@ final class AudioMetersModel: ObservableObject {
     private var lastMicPublishAt: Date = .distantPast
     private var lastSystemPublishAt: Date = .distantPast
 
-    /// Feed a mic-buffer tick. Throttled unless `level == 0`.
+    /// Feed a mic-buffer tick. Throttled, except a TRANSITION to zero
+    /// publishes immediately (so the meter visibly resets on stop). A bare
+    /// `level == 0` bypass would defeat the throttle entirely during digital
+    /// silence, where every buffer's RMS is exactly 0.
     func updateMic(level: Float, buffers: Int, frames: Int, pts: Double, format: String) {
         let now = Date()
-        guard level == 0 || now.timeIntervalSince(lastMicPublishAt) >= minPublishInterval else { return }
+        let transitionToZero = level == 0 && micLevel != 0
+        guard transitionToZero || now.timeIntervalSince(lastMicPublishAt) >= minPublishInterval else { return }
         lastMicPublishAt = now
         micLevel = level
         debugMicBuffers = buffers
@@ -54,10 +59,13 @@ final class AudioMetersModel: ObservableObject {
         debugMicErrors = errorCount
     }
 
-    /// Feed a system-audio-buffer tick. Throttled unless `level == 0`.
+    /// Feed a system-audio-buffer tick. Throttled, except a TRANSITION to
+    /// zero publishes immediately - see `updateMic`. This matters most here:
+    /// the system stream sits at exactly-zero RMS whenever no audio plays.
     func updateSystem(level: Float, buffers: Int, frames: Int, pts: Double, format: String) {
         let now = Date()
-        guard level == 0 || now.timeIntervalSince(lastSystemPublishAt) >= minPublishInterval else { return }
+        let transitionToZero = level == 0 && systemLevel != 0
+        guard transitionToZero || now.timeIntervalSince(lastSystemPublishAt) >= minPublishInterval else { return }
         lastSystemPublishAt = now
         systemLevel = level
         debugSystemBuffers = buffers
