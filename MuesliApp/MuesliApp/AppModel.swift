@@ -1813,6 +1813,7 @@ final class AppModel: ObservableObject {
                     audioDir.path
                 ]
                 command.append("--keep-wav")
+                command.append("--live-asr-only")
                 #if DEBUG
                 command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
                 #endif
