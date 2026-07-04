@@ -315,7 +315,11 @@ def run_pipeline(
             log(f"Running diarisation with Sortformer {diar_model}...", verbose)
             diarizer = SortformerDiarizer(model_name=diar_model)
             segments = diarizer.diarise(temp_wav)
-        if timestamp_offset:
+        # Diariser segments are in chunk-local time and need shifting into
+        # meeting time. Synthetic live-asr-only segments are built from the
+        # ALREADY-shifted words above - shifting them again would double the
+        # offset, lose all word overlap, and label every turn UNKNOWN.
+        if timestamp_offset and not live_asr_only:
             for seg in segments:
                 seg.start += timestamp_offset
                 seg.end += timestamp_offset
@@ -510,14 +514,17 @@ class LiveProcessor:
         fast_finalize = finalize and self._live_asr_only
 
         if not finalize or fast_finalize:
-            new_bytes = snapshot.size_bytes - self._last_processed_byte
             if not finalize:
+                new_bytes = snapshot.size_bytes - self._last_processed_byte
                 if duration < self._live_min_seconds:
                     return False
                 if (new_bytes / float(bytes_per_sec)) < self._live_interval:
                     return False
-            elif new_bytes <= 0:
-                return False
+            # Fast finalize runs even with ZERO new bytes: the previous live
+            # pass held back the last `finalize_lag` seconds as a partial, so
+            # the tail window must be reprocessed with finalize semantics to
+            # promote that held-back speech to final segments. The emitter's
+            # last_emitted_t1 dedupe suppresses re-emission of earlier turns.
             read_start_byte, timestamp_offset = compute_incremental_window(
                 self._last_processed_byte, bytes_per_sec
             )

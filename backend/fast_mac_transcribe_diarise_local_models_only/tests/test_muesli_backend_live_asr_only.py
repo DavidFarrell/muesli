@@ -106,6 +106,10 @@ def test_run_pipeline_live_asr_only_applies_timestamp_offset(tmp_path, monkeypat
 
     assert merged.turns[0].start == 100.0
     assert merged.turns[-1].end == 103.5
+    # The synthetic segment must NOT be shifted a second time (it is built
+    # from already-offset words) - a double offset loses word overlap and
+    # labels every turn UNKNOWN.
+    assert all(turn.speaker == "System" for turn in merged.turns)
 
 
 def test_emit_transcript_live_asr_only_speaker_id_has_no_stream_prefix():
@@ -360,3 +364,57 @@ def test_maybe_process_finalize_in_live_asr_only_skips_live_gates(tmp_path, monk
 
     assert handled is True
     assert len(calls) == 1
+
+
+def test_maybe_process_finalize_runs_with_zero_new_bytes_in_live_asr_only(tmp_path, monkeypatch):
+    """Stop right after a live pass leaves zero new bytes, but the previous
+    pass held back the last finalize_lag seconds as a partial - finalize must
+    still reprocess the tail window to promote it to final segments."""
+    sample_rate = 100
+    writer = _make_writer(tmp_path, seconds=40.0, sample_rate=sample_rate)
+    state = _FakeState(writer, sample_rate, 1, "mic")
+
+    calls = []
+
+    def _fake_write_wav_chunk(snapshot, temp_dir, start_byte=0):
+        calls.append(start_byte)
+        dummy = tmp_path / "dummy.wav"
+        _write_silent_wav(dummy, seconds=0.1)
+        return dummy
+
+    def _fake_run_pipeline(**kwargs):
+        class _Merged:
+            turns = []
+
+        return _Merged()
+
+    monkeypatch.setattr(mb, "write_wav_chunk", _fake_write_wav_chunk)
+    monkeypatch.setattr(mb, "run_pipeline", _fake_run_pipeline)
+
+    processor = mb.LiveProcessor(
+        stream_name="mic",
+        state=state,
+        emitter=mb.TranscriptEmitter(_NullWriter(), finalize_lag=5.0),
+        output_dir=tmp_path,
+        diar_backend="senko",
+        diar_model="default",
+        asr_model="fake",
+        language=None,
+        gap_threshold=0.8,
+        speaker_tolerance=0.25,
+        live_interval=15.0,
+        live_min_seconds=10.0,
+        verbose=False,
+        live_asr_only=True,
+    )
+    bytes_per_sec = sample_rate * mb.BYTES_PER_SAMPLE
+    # The last live pass consumed everything: zero new bytes since.
+    processor._last_processed_byte = int(40 * bytes_per_sec)
+
+    handled = processor._maybe_process(finalize=True)
+
+    assert handled is True
+    expected_start, _ = mb.compute_incremental_window(
+        processor._last_processed_byte, float(bytes_per_sec)
+    )
+    assert calls == [expected_start]
