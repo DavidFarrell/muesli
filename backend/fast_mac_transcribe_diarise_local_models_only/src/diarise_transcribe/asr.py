@@ -4,10 +4,19 @@ ASR module using parakeet-mlx on Apple Silicon.
 Provides word-level timestamps for alignment with diarisation.
 """
 
+import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from parakeet_mlx import from_pretrained
+
+
+# Cache of loaded parakeet-mlx models keyed by model_id, so repeated
+# ASRModel instances for the same model id reuse one in-memory model
+# instead of re-deserialising it from disk each time. Bounded by the
+# number of distinct model ids used in a process - in practice 1.
+_model_cache: dict[str, Any] = {}
+_model_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -51,11 +60,19 @@ class ASRModel:
         self._model = None
 
     def _ensure_loaded(self):
-        """Lazy load the model on first use."""
-        if self._model is None:
-            print(f"Loading ASR model: {self.model_id}")
-            self._model = from_pretrained(self.model_id)
-            print("ASR model loaded.")
+        """Lazy load the model on first use, reusing a process-wide cache."""
+        if self._model is not None:
+            return
+
+        with _model_cache_lock:
+            cached = _model_cache.get(self.model_id)
+            if cached is None:
+                print(f"Loading ASR model: {self.model_id}")
+                cached = from_pretrained(self.model_id)
+                _model_cache[self.model_id] = cached
+                print("ASR model loaded.")
+
+            self._model = cached
 
     def transcribe(
         self,
