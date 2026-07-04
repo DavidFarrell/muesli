@@ -41,10 +41,15 @@ final class AudioMetersModel: ObservableObject {
     /// publishes immediately (so the meter visibly resets on stop). A bare
     /// `level == 0` bypass would defeat the throttle entirely during digital
     /// silence, where every buffer's RMS is exactly 0.
-    func updateMic(level: Float, buffers: Int, frames: Int, pts: Double, format: String) {
+    ///
+    /// `force` bypasses the throttle for NON-buffer callers (reset/stop/
+    /// restart status changes). Those fire once, so a dropped publish would
+    /// never be retried - the counters could display stale values forever if
+    /// the mic never delivers another buffer.
+    func updateMic(level: Float, buffers: Int, frames: Int, pts: Double, format: String, force: Bool = false) {
         let now = Date()
         let transitionToZero = level == 0 && micLevel != 0
-        guard transitionToZero || now.timeIntervalSince(lastMicPublishAt) >= minPublishInterval else { return }
+        guard force || transitionToZero || now.timeIntervalSince(lastMicPublishAt) >= minPublishInterval else { return }
         lastMicPublishAt = now
         micLevel = level
         debugMicBuffers = buffers
@@ -62,10 +67,11 @@ final class AudioMetersModel: ObservableObject {
     /// Feed a system-audio-buffer tick. Throttled, except a TRANSITION to
     /// zero publishes immediately - see `updateMic`. This matters most here:
     /// the system stream sits at exactly-zero RMS whenever no audio plays.
-    func updateSystem(level: Float, buffers: Int, frames: Int, pts: Double, format: String) {
+    /// `force` is for one-shot non-buffer callers, as on the mic side.
+    func updateSystem(level: Float, buffers: Int, frames: Int, pts: Double, format: String, force: Bool = false) {
         let now = Date()
         let transitionToZero = level == 0 && systemLevel != 0
-        guard transitionToZero || now.timeIntervalSince(lastSystemPublishAt) >= minPublishInterval else { return }
+        guard force || transitionToZero || now.timeIntervalSince(lastSystemPublishAt) >= minPublishInterval else { return }
         lastSystemPublishAt = now
         systemLevel = level
         debugSystemBuffers = buffers

@@ -612,13 +612,16 @@ final class AppModel: ObservableObject {
     /// Mirrors the current internal mic level/debug state into the throttled
     /// `meters` display model. Call after any mutation of the internal vars
     /// above (per-buffer callers get coalesced automatically by `meters`).
-    private func publishMicMeters() {
+    /// One-shot callers (reset/stop/restart) pass `force: true` - a dropped
+    /// publish there is never retried, so it must bypass the throttle.
+    private func publishMicMeters(force: Bool = false) {
         meters.updateMic(
             level: micLevel,
             buffers: debugMicBuffers,
             frames: debugMicFrames,
             pts: debugMicPTS,
-            format: debugMicFormat
+            format: debugMicFormat,
+            force: force
         )
     }
 
@@ -637,7 +640,7 @@ final class AppModel: ObservableObject {
         debugMicErrors = 0
         micFrameCount = 0
         lastMicAudioAt = nil
-        publishMicMeters()
+        publishMicMeters(force: true)
         publishMicError()
     }
 
@@ -939,13 +942,14 @@ final class AppModel: ObservableObject {
         isPreviewingLevels = false
         micLevel = 0
         captureEngine.systemLevel = 0
-        publishMicMeters()
+        publishMicMeters(force: true)
         meters.updateSystem(
             level: captureEngine.systemLevel,
             buffers: captureEngine.debugSystemBuffers,
             frames: captureEngine.debugSystemFrames,
             pts: captureEngine.debugSystemPTS,
-            format: captureEngine.debugSystemFormat
+            format: captureEngine.debugSystemFormat,
+            force: true
         )
     }
 
@@ -1087,7 +1091,7 @@ final class AppModel: ObservableObject {
         debugMicFrames = 0
         debugMicPTS = 0
         lastMicAudioAt = nil
-        publishMicMeters()
+        publishMicMeters(force: true)
         await startMeetingMicEngine()
         AudioLog.event("engine.restart.end", ["boundID": micEngineBoundDeviceID])
     }
