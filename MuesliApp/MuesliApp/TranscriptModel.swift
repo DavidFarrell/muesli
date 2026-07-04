@@ -4,13 +4,31 @@ import Combine
 // MARK: - Transcript Model
 
 struct TranscriptSegment: Identifiable {
-    let id: UUID = UUID()
+    let id: UUID
     let speakerID: String
     let stream: String
     let t0: Double
     let t1: Double?
     let text: String
     let isPartial: Bool
+
+    init(
+        id: UUID = UUID(),
+        speakerID: String,
+        stream: String,
+        t0: Double,
+        t1: Double?,
+        text: String,
+        isPartial: Bool
+    ) {
+        self.id = id
+        self.speakerID = speakerID
+        self.stream = stream
+        self.t0 = t0
+        self.t1 = t1
+        self.text = text
+        self.isPartial = isPartial
+    }
 
     var logicKey: String { "\(stream)_\(Int(round(t0 * 1000)))" }
 }
@@ -178,14 +196,35 @@ final class TranscriptModel: ObservableObject {
             if segment.stream == "system" {
                 removeEchoes(causedBy: segment)
             }
-            let existing = segments.filter { !$0.isPartial }
-            let lastT0 = existing.last?.t0 ?? -Double.infinity
-            let updated = mergeSegment(segment, into: existing)
-            if segment.t0 >= lastT0 {
-                segments = updated
-            } else {
-                segments = sortedSegments(updated)
+
+            // A final only supersedes a same-stream partial once it covers the
+            // audio the partial was describing; partials from other streams -
+            // and same-stream partials describing later audio - must survive.
+            let finalEnd = segment.t1 ?? segment.t0
+            if let supersededIdx = segments.firstIndex(where: {
+                $0.isPartial && $0.stream == segment.stream && finalEnd >= $0.t0
+            }) {
+                segments.remove(at: supersededIdx)
             }
+
+            let finals = segments.filter { !$0.isPartial }
+            let lastFinalT0 = finals.last?.t0 ?? -Double.infinity
+            let inOrder = segment.t0 >= lastFinalT0
+            let mergedFinals = mergeSegment(segment, into: finals)
+
+            if inOrder && mergedFinals.count == finals.count + 1 {
+                // Common case: in-order final, nothing to dedupe. Insert right
+                // after the existing finals instead of rebuilding the array.
+                let insertIndex = segments.lastIndex(where: { !$0.isPartial }).map { $0 + 1 } ?? 0
+                segments.insert(segment, at: insertIndex)
+            } else {
+                // Rare case: overlap dedupe or out-of-order arrival - rebuild,
+                // keeping any surviving partials after the (re-ordered) finals.
+                let survivingPartials = segments.filter { $0.isPartial }
+                let orderedFinals = inOrder ? mergedFinals : sortedSegments(mergedFinals)
+                segments = orderedFinals + survivingPartials
+            }
+
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text
@@ -196,26 +235,40 @@ final class TranscriptModel: ObservableObject {
             let stream = (obj["stream"] as? String) ?? "unknown"
             let t0 = ((obj["t0"] as? Double) ?? 0) + timestampOffset
             let text = (obj["text"] as? String) ?? ""
-            let segment = TranscriptSegment(
-                speakerID: speakerID,
-                stream: stream,
-                t0: t0,
-                t1: nil,
-                text: text,
-                isPartial: true
-            )
             let lastT0 = segments.last?.t0 ?? -Double.infinity
-            var updated = segments
-            if let idx = updated.lastIndex(where: { $0.isPartial && $0.stream == stream }) {
-                updated[idx] = segment
+
+            if let idx = segments.lastIndex(where: { $0.isPartial && $0.stream == stream }) {
+                // Keep the existing row's identity so SwiftUI treats this as an
+                // update, not a remove+insert (avoids row-identity churn).
+                let segment = TranscriptSegment(
+                    id: segments[idx].id,
+                    speakerID: speakerID,
+                    stream: stream,
+                    t0: t0,
+                    t1: nil,
+                    text: text,
+                    isPartial: true
+                )
+                segments[idx] = segment
+                if segment.t0 < lastT0 {
+                    segments = sortedSegments(segments)
+                }
             } else {
-                updated.append(segment)
+                let segment = TranscriptSegment(
+                    speakerID: speakerID,
+                    stream: stream,
+                    t0: t0,
+                    t1: nil,
+                    text: text,
+                    isPartial: true
+                )
+                if t0 >= lastT0 {
+                    segments.append(segment)
+                } else {
+                    segments = sortedSegments(segments + [segment])
+                }
             }
-            if segment.t0 >= lastT0 {
-                segments = updated
-            } else {
-                segments = sortedSegments(updated)
-            }
+
             lastTranscriptAt = Date()
             if !text.isEmpty {
                 lastTranscriptText = text
