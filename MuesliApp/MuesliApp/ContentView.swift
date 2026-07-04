@@ -139,6 +139,7 @@ Muesli needs:
 
 struct NewMeetingView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var meters: AudioMetersModel
     @State private var rolloverTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
     @State private var showAllMeetings = false
     @State private var pendingDelete: MeetingHistoryItem?
@@ -316,8 +317,8 @@ struct NewMeetingView: View {
 
             GroupBox("Live input check") {
                 VStack(alignment: .leading, spacing: 10) {
-                    LevelMeter(label: "System", level: model.systemLevel)
-                    LevelMeter(label: "Microphone", level: model.micLevel)
+                    LevelMeter(label: "System", level: meters.systemLevel)
+                    LevelMeter(label: "Microphone", level: meters.micLevel)
                     Text(model.isPreviewingLevels
                          ? "Previewing live levels before recording."
                          : "Level preview unavailable. Check permissions and selected source.")

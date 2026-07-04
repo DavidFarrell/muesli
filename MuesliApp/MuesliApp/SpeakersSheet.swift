@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SpeakersSheet: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var transcript: TranscriptModel
     @Environment(\.dismiss) var dismiss
     @FocusState private var focusedSpeakerID: String?
 
@@ -25,7 +26,7 @@ struct SpeakersSheet: View {
                             .frame(width: 80, alignment: .leading)
 
                         TextField("Name", text: Binding(
-                            get: { model.transcriptModel.displayName(for: id) },
+                            get: { transcript.displayName(for: id) },
                             set: { model.renameSpeaker(id: id, to: $0) }
                         ))
                         .focused($focusedSpeakerID, equals: id)
@@ -60,8 +61,8 @@ struct SpeakersSheet: View {
     }
 
     private func allSpeakerIDs() -> [String] {
-        var ids = Set(model.transcriptModel.speakerNames.keys)
-        for s in model.transcriptModel.segments {
+        var ids = Set(transcript.speakerNames.keys)
+        for s in transcript.segments {
             ids.insert(s.speakerID)
         }
         return ids.sorted()

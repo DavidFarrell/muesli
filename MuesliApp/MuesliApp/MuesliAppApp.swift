@@ -12,6 +12,8 @@ struct MuesliAppApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(model)
+                .environmentObject(model.meters)
+                .environmentObject(model.transcriptModel)
                 .frame(minWidth: 980, minHeight: 640)
         }
     }
