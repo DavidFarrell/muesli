@@ -27,6 +27,7 @@
 			membershipExceptions = (
 				AECMode.swift,
 				MicAudioFormat.swift,
+				TranscriptModel.swift,
 			);
 			target = AA0000010000000000000005 /* MuesliAppTests */;
 		};
