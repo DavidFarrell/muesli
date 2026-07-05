@@ -1997,9 +1997,7 @@ final class AppModel: ObservableObject {
 
             guard startBackendAccess(for: backendProjectRoot) else {
                 shareableContentError = "Backend folder access denied. Re-select the folder."
-                closeBackendLog()
-                closeTranscriptEventsLog()
-                currentSession = nil
+                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                 return
             }
 
@@ -2010,10 +2008,7 @@ final class AppModel: ObservableObject {
                     let message = "Backend python not found at \(backendPython)."
                     shareableContentError = message
                     backendFolderError = message
-                    closeBackendLog()
-                    closeTranscriptEventsLog()
-                    stopBackendAccess()
-                    currentSession = nil
+                    await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                     return
                 }
                 let transcribeStream: String
@@ -2112,10 +2107,7 @@ final class AppModel: ObservableObject {
                 shareableContentError = error.message
                 backendFolderError = error.message
                 appendBackendLog("Backend start blocked: \(error.message)", toTail: true)
-                closeBackendLog()
-                closeTranscriptEventsLog()
-                stopBackendAccess()
-                currentSession = nil
+                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                 return
             }
 
