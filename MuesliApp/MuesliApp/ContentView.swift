@@ -367,8 +367,14 @@ struct NewMeetingView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Toggle("System audio", isOn: $model.transcribeSystem)
                         .disabled(!model.transcribeMic)
+                        .help(model.transcribeMic
+                              ? "Include system audio in the transcript."
+                              : "At least one source must stay selected - turn on Microphone first.")
                     Toggle("Microphone", isOn: $model.transcribeMic)
                         .disabled(!model.transcribeSystem)
+                        .help(model.transcribeSystem
+                              ? "Include microphone audio in the transcript."
+                              : "At least one source must stay selected - turn on System audio first.")
                     if model.transcribeSystem && model.transcribeMic {
                         HStack(spacing: 8) {
                             Image(systemName: "speaker.wave.2.bubble.left")
@@ -393,6 +399,7 @@ struct NewMeetingView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(model.shouldShowOnboarding || model.isStartingMeeting || model.isFinalizing)
+                .help(model.isFinalizing ? "Finishing up the previous meeting first." : "Start recording this meeting.")
             }
 
             GroupBox("Recent meetings") {
@@ -440,7 +447,7 @@ struct NewMeetingView: View {
                                         }
                                         .buttonStyle(.borderless)
                                     }
-                                    Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
+                                    Text("\(DurationFormatting.compact(item.durationSeconds)) • \(item.segmentCount) segments")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                     if rowRenameErrorID == item.id, let rowRenameError {
@@ -547,19 +554,6 @@ struct NewMeetingView: View {
         return Array(model.meetingHistory.prefix(maxVisibleMeetings))
     }
 
-    private func formatDuration(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let hrs = total / 3600
-        let mins = (total % 3600) / 60
-        let secs = total % 60
-        if hrs > 0 {
-            return String(format: "%dh %dm", hrs, mins)
-        }
-        if mins > 0 {
-            return String(format: "%dm %ds", mins, secs)
-        }
-        return "\(secs)s"
-    }
 }
 
 // MARK: - Permissions Sheet

@@ -53,6 +53,7 @@ struct MeetingViewer: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(!canRediarize)
+                            .help(rediarizeDisabledReason ?? "Re-run the speaker diarizer on this meeting's audio.")
 
                             Picker("Stream", selection: $rediarizeStream) {
                                 Text("System").tag(BatchRediarizer.Stream.system)
@@ -117,6 +118,7 @@ struct MeetingViewer: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(!canIdentifySpeakers)
+                            .help(identifySpeakersDisabledReason ?? "Identify speakers using Ollama and the hint below.")
 
                             if isIdentifyingSpeakers {
                                 HStack(spacing: 8) {
@@ -214,7 +216,7 @@ struct MeetingViewer: View {
                         return "Couldn't rename: \(error.localizedDescription)"
                     }
                 }
-                Text("\(formatDuration(meeting.durationSeconds)) • \(meeting.segmentCount) segments")
+                Text("\(DurationFormatting.compact(meeting.durationSeconds)) • \(meeting.segmentCount) segments")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -236,13 +238,13 @@ struct MeetingViewer: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(model.isCapturing || model.isFinalizing || meeting.status == .recording)
-                .help("Resume this meeting")
+                .help(resumeDisabledReason ?? "Resume this meeting")
 
                 Button {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(transcript.asPlainText(), forType: .string)
-                    copyIconName = "checkmark.circle.fill"
+                    copyIconName = "checkmark"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                         copyIconName = "doc.on.clipboard"
                     }
@@ -255,7 +257,7 @@ struct MeetingViewer: View {
                 Button {
                     model.exportTranscriptFiles(for: meeting)
                 } label: {
-                    Image(systemName: "square.and.arrow.up")
+                    Image(systemName: "square.and.arrow.down")
                 }
                 .buttonStyle(.borderless)
                 .help("Export transcript")
@@ -290,18 +292,17 @@ struct MeetingViewer: View {
         }
     }
 
-    private func formatDuration(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let hrs = total / 3600
-        let mins = (total % 3600) / 60
-        let secs = total % 60
-        if hrs > 0 {
-            return String(format: "%dh %dm", hrs, mins)
+    private var resumeDisabledReason: String? {
+        if model.isCapturing {
+            return "Stop the current recording before resuming this one."
         }
-        if mins > 0 {
-            return String(format: "%dm %ds", mins, secs)
+        if model.isFinalizing {
+            return "Wait for the current meeting to finish finalizing."
         }
-        return "\(secs)s"
+        if meeting.status == .recording {
+            return "This meeting is already marked as recording."
+        }
+        return nil
     }
 
     private var canIdentifySpeakers: Bool {
@@ -316,6 +317,13 @@ struct MeetingViewer: View {
         }
     }
 
+    private var identifySpeakersDisabledReason: String? {
+        if isIdentifyingSpeakers || isRediarizing {
+            return "Wait for the current speaker operation to finish."
+        }
+        return model.speakerIdStatusMessage
+    }
+
     private var canRediarize: Bool {
         if isRediarizing || isIdentifyingSpeakers {
             return false
@@ -327,6 +335,19 @@ struct MeetingViewer: View {
             return false
         }
         return true
+    }
+
+    private var rediarizeDisabledReason: String? {
+        if isRediarizing || isIdentifyingSpeakers {
+            return "Wait for the current speaker operation to finish."
+        }
+        if meeting.status == .recording || model.isCapturing {
+            return "Stop the meeting before re-running the diarizer."
+        }
+        if model.backendFolderURL == nil || !model.backendPythonExists {
+            return "Select the backend folder before re-running the diarizer."
+        }
+        return nil
     }
 
     private var progressText: String {

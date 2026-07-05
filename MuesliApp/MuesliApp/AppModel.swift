@@ -356,6 +356,17 @@ final class AppModel: ObservableObject {
         migrateLegacyMeetingsIfNeeded()
         loadMeetingHistory()
         Task { await loadShareableContent() }
+
+        Task.detached(priority: .background) { [weak self] in
+            let removed = TempTranscriptCleanup.sweep(temporaryDirectory: FileManager.default.temporaryDirectory)
+            guard removed > 0 else { return }
+            await MainActor.run {
+                self?.appendBackendLog(
+                    "Cleaned up \(removed) stale transcript temp folder(s) from previous launches.",
+                    toTail: false
+                )
+            }
+        }
     }
 
     var systemLevel: Float { captureEngine.systemLevel }
@@ -1653,7 +1664,8 @@ final class AppModel: ObservableObject {
         )
 
         let tempBase = FileManager.default.temporaryDirectory
-        let tempFolder = tempBase.appendingPathComponent("Muesli-\(session.title)-\(UUID().uuidString)")
+            .appendingPathComponent(TempTranscriptCleanup.stagingDirectoryName, isDirectory: true)
+        let tempFolder = tempBase.appendingPathComponent("\(session.title)-\(UUID().uuidString)")
         do {
             try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
             if let jsonlData {
