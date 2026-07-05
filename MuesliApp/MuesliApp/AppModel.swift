@@ -156,7 +156,6 @@ final class AppModel: ObservableObject {
     @Published var backendLogTail: [String] = []
     @Published var isPreviewingLevels = false
     @Published private(set) var isStartingMeeting = false
-    @Published private(set) var isSwitchingInputDevice = false
 
     // Per-buffer-accurate mic level/debug state. NOT @Published - the startup
     // health check and watchdog need these exact on every buffer, but the UI
@@ -189,6 +188,10 @@ final class AppModel: ObservableObject {
     // restart decision compares the DESIRED device to this, not a bare ID delta
     // on the display mirror (audit D1/D3).
     private var micEngineBoundDeviceID: UInt32 = 0
+    // Same idea, for the start-screen preview engine (audit A2/D preview
+    // parity: previously the preview had no bound-device bookkeeping at all,
+    // so a device swap while sat on the start screen never re-resolved it).
+    private var previewMicEngineBoundDeviceID: UInt32 = 0
     private var micStartupHealthTask: Task<Void, Never>?
     private var micFramesWatchdogTask: Task<Void, Never>?
     private let micWatchdogIntervalNs: UInt64 = 2_000_000_000
@@ -935,11 +938,22 @@ final class AppModel: ObservableObject {
             let engine = MicEngine()
             previewMicEngine = engine
             let (resolvedID, pinned) = resolvedInputDeviceID()
+            previewMicEngineBoundDeviceID = resolvedID
             do {
                 try await engine.start(
                     enableVoiceProcessing: shouldEnableVoiceProcessing(),
                     preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
-                    pinned: pinned
+                    pinned: pinned,
+                    onConfigurationChange: { [weak self] in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            AudioLog.event("preview.engine.configchange", ["snap": AudioDeviceManager.snapshot()])
+                            // Same re-resolve the meeting engine's hook does;
+                            // loadInputDevices() restarts the preview itself
+                            // if the resolved device actually moved.
+                            self.loadInputDevices()
+                        }
+                    }
                 ) { [weak self] data in
                     Task { @MainActor in
                         self?.handlePreviewMicAudio(data)
@@ -948,11 +962,13 @@ final class AppModel: ObservableObject {
                 guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
                     await engine.stop()
                     previewMicEngine = nil
+                    previewMicEngineBoundDeviceID = 0
                     isPreviewingLevels = isPreviewCaptureRunning
                     return
                 }
             } catch {
                 previewMicEngine = nil
+                previewMicEngineBoundDeviceID = 0
                 debugMicErrors += 1
                 debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
                 publishMicError()
@@ -966,6 +982,7 @@ final class AppModel: ObservableObject {
         if let engine = previewMicEngine {
             await engine.stop()
             previewMicEngine = nil
+            previewMicEngineBoundDeviceID = 0
         }
 
         if isCapturing {
@@ -1168,6 +1185,7 @@ final class AppModel: ObservableObject {
             if let engine = model.previewMicEngine {
                 await engine.stop()
                 model.previewMicEngine = nil
+                model.previewMicEngineBoundDeviceID = 0
             }
             await model.startHomeLevelPreviewNow()
         }
@@ -1329,7 +1347,24 @@ final class AppModel: ObservableObject {
         AudioLog.event("user.refresh", ["snap": AudioDeviceManager.snapshot()])
         loadInputDevices()
         loadOutputDevices()
-        guard isCapturing, transcribeMic, !isSwitchingInputDevice else { return }
+
+        guard isCapturing else {
+            // Not in a meeting: this is the fix for "Refresh does nothing" on
+            // the start screen (audit A3) - re-enumerating devices alone never
+            // touched the preview engine driving the meters, so a dead/stale
+            // preview meter had nothing to bring it back except a manual
+            // device pick. No `previewMicEngine != nil` gate here on purpose:
+            // the dead-preview case a user actually hits is the engine having
+            // FAILED to start and been nilled (mic_preview_start_failed), and
+            // restartPreviewMicEngineForInputSwitch already handles a nil
+            // engine fine (skips the stop, goes straight to
+            // startHomeLevelPreviewNow, which has its own guards).
+            if isStartScreenActive {
+                enqueueMicLifecycle("refresh-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
+            }
+            return
+        }
+        guard transcribeMic else { return }
         let stale = lastMicAudioAt.map { Date().timeIntervalSince($0) > micStallThresholdSeconds } ?? true
         if micEngine == nil || debugMicBuffers == 0 || stale {
             AudioLog.event("user.refresh.force-restart", [
@@ -1340,6 +1375,15 @@ final class AppModel: ObservableObject {
             resetMicRecoveryLadder()
             enqueueMicLifecycle("refresh") { await $0.restartMeetingMicEngineForInputSwitch() }
         }
+    }
+
+    /// Runs `refreshMicrophones()` and waits for whatever lifecycle work it
+    /// enqueued (a meeting-engine restart, a preview restart, or nothing) so
+    /// the Refresh button can show feedback tied to real completion rather
+    /// than a guessed delay.
+    func refreshMicrophonesAwaitingCompletion() async {
+        refreshMicrophones()
+        await micLifecycleTask?.value
     }
 
     private func scheduleMicStartupHealthCheck() {
@@ -1675,8 +1719,13 @@ final class AppModel: ObservableObject {
         // aware, not a bare ID delta on the display mirror (audit D1/D3): a
         // follow-mode steal moves `desiredID` off `micEngineBoundDeviceID` and so
         // fires, where the old `previousSelection != 0` guard silently returned.
-        let willRestart = isCapturing && transcribeMic && !isSwitchingInputDevice && !isFinalizing
+        let willRestart = isCapturing && transcribeMic && !isFinalizing
             && desiredID != 0 && desiredID != micEngineBoundDeviceID
+        // Same liveness check for the start-screen preview engine (audit A2
+        // preview parity) - only meaningful when there's no meeting running
+        // and a preview engine actually exists to be stale.
+        let willRestartPreview = !isCapturing && previewMicEngine != nil
+            && desiredID != 0 && desiredID != previewMicEngineBoundDeviceID
 
         AudioLog.event("resolve.input", [
             "mode": inputSelection.logDescription,
@@ -1686,12 +1735,16 @@ final class AppModel: ObservableObject {
             "pinned": pinned,
             "isCapturing": isCapturing,
             "willRestart": willRestart,
+            "willRestartPreview": willRestartPreview,
             "snap": AudioDeviceManager.snapshot()
         ])
 
-        guard willRestart else { return }
-        micVoiceProcessingDowngraded = false
-        enqueueMicLifecycle("input-resolve") { await $0.restartMeetingMicEngineForInputSwitch() }
+        if willRestart {
+            micVoiceProcessingDowngraded = false
+            enqueueMicLifecycle("input-resolve") { await $0.restartMeetingMicEngineForInputSwitch() }
+        } else if willRestartPreview {
+            enqueueMicLifecycle("input-resolve-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
+        }
     }
 
     private func updateScreenPermissionFromShareableContent() async {
@@ -1944,9 +1997,7 @@ final class AppModel: ObservableObject {
 
             guard startBackendAccess(for: backendProjectRoot) else {
                 shareableContentError = "Backend folder access denied. Re-select the folder."
-                closeBackendLog()
-                closeTranscriptEventsLog()
-                currentSession = nil
+                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                 return
             }
 
@@ -1957,10 +2008,7 @@ final class AppModel: ObservableObject {
                     let message = "Backend python not found at \(backendPython)."
                     shareableContentError = message
                     backendFolderError = message
-                    closeBackendLog()
-                    closeTranscriptEventsLog()
-                    stopBackendAccess()
-                    currentSession = nil
+                    await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                     return
                 }
                 let transcribeStream: String
@@ -2059,10 +2107,7 @@ final class AppModel: ObservableObject {
                 shareableContentError = error.message
                 backendFolderError = error.message
                 appendBackendLog("Backend start blocked: \(error.message)", toTail: true)
-                closeBackendLog()
-                closeTranscriptEventsLog()
-                stopBackendAccess()
-                currentSession = nil
+                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
                 return
             }
 
@@ -2155,11 +2200,101 @@ final class AppModel: ObservableObject {
             let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
             shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
-            closeBackendLog()
-            closeTranscriptEventsLog()
-            stopBackendAccess()
-            await stopMeeting()
+            await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
+    }
+
+    /// Explicit teardown for a startMeeting() attempt that threw partway
+    /// through. Only some prefix of the happy path above may have actually
+    /// run by the time the throw happened - backend log/transcript-events log
+    /// always have (they're the first statements in the do block), but the
+    /// backend process, writer, mic engine and system capture may or may not
+    /// have started depending on where the failure occurred. Previously the
+    /// catch called `stopMeeting()`, which no-ops on its `guard isCapturing`
+    /// since isCapturing is never set true before this catch runs - so
+    /// whatever had already started (backend process, writer, capture engine,
+    /// mic engine, log handles) leaked until the next Start (2026-07-04
+    /// review, GPT-5 finding). Every step below is nil-safe/idempotent so it's
+    /// harmless to run regardless of how far the failed attempt got; this
+    /// hard-kills the backend rather than waiting for a graceful exit since
+    /// there is no meeting transcript to finalize.
+    private func teardownFailedMeetingStart(
+        session: MeetingSession,
+        wasResume: Bool,
+        priorMetadata: MeetingMetadata?
+    ) async {
+        cancelMicStartupHealthCheck()
+        stopMicFramesWatchdog()
+        screenshotScheduler.stop()
+        await captureEngine.stopCapture()
+
+        enqueueMicLifecycle("start-failure-cleanup") { model in
+            if let engine = model.micEngine {
+                await engine.stop()
+            }
+            model.micEngine = nil
+            model.micEngineStartedAt = nil
+            model.micEngineBoundDeviceID = 0
+        }
+        await micLifecycleTask?.value
+        micOutputEnabled = false
+        pendingMicAudio.removeAll()
+        micStartTime = nil
+        resetMicRecoveryLadder()
+
+        backend?.stop()
+        backend = nil
+        stdoutTask?.cancel()
+        stdoutTask = nil
+        writer = nil
+
+        closeBackendLog()
+        closeTranscriptEventsLog()
+        stopBackendAccess()
+
+        rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
+
+        clearAttachments()
+        currentSession = nil
+    }
+
+    /// Undoes whatever createInitialMeetingMetadata/appendResumeSessionMetadata
+    /// wrote to meeting.json before the failure - both run early in the do
+    /// block, well before any of the throwing steps that follow, so by the
+    /// time a start attempt lands in the catch the on-disk status may already
+    /// be the mid-write `.recording` value with nothing to ever flip it back.
+    /// Left alone, that permanently disables Resume and rediarize for the
+    /// folder (both gate on `status == .recording` in MeetingViewer) until
+    /// someone hand-edits the file (2026-07 gate finding). Every write here is
+    /// `try?` and safe to call even when the corresponding metadata write
+    /// never actually happened - idempotent against the "threw before
+    /// touching meeting.json" case.
+    private func rollBackFailedMeetingMetadata(
+        for session: MeetingSession,
+        wasResume: Bool,
+        priorMetadata: MeetingMetadata?
+    ) {
+        if wasResume {
+            // appendResumeSessionMetadata (if it got that far) flipped status
+            // to .recording and appended a new, now-phantom session entry.
+            // Restore exactly what was on disk before this attempt touched
+            // it - the meeting must be exactly as resumable/rediarizable as
+            // it was before Resume was tapped.
+            guard let priorMetadata else { return }
+            try? writeMeetingMetadata(priorMetadata, to: session.folderURL)
+            return
+        }
+        // Fresh start: there was no prior metadata to restore. If
+        // createInitialMeetingMetadata got far enough to write status =
+        // .recording, mark it .completed instead - an empty/failed meeting,
+        // but no longer bricked. If the write never happened, there's
+        // nothing to fix here (buildMeetingHistoryItem's legacy fallback
+        // already defaults a folder with no meeting.json to .completed).
+        guard var metadata = try? readMeetingMetadata(from: session.folderURL) else { return }
+        guard metadata.status == .recording else { return }
+        metadata.status = .completed
+        metadata.updatedAt = Date()
+        try? writeMeetingMetadata(metadata, to: session.folderURL)
     }
 
     func stopMeeting() async {

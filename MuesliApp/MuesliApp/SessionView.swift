@@ -98,7 +98,6 @@ struct SessionView: View {
                                         .tag(device.id)
                                 }
                             }
-                            .disabled(model.isSwitchingInputDevice)
 
                             Picker("Output", selection: Binding(
                                 get: { model.selectedOutputDeviceID },
@@ -110,22 +109,12 @@ struct SessionView: View {
                                         .tag(device.id)
                                 }
                             }
-                            .disabled(model.isSwitchingInputDevice)
 
-                            Button("Refresh devices") {
-                                model.refreshMicrophones()
-                            }
-                            .buttonStyle(.link)
-                            .disabled(model.isSwitchingInputDevice)
-
-                            if model.isSwitchingInputDevice {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                    Text("Switching input...")
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                }
+                            RefreshFeedbackButton(
+                                title: "Refresh audio devices",
+                                help: "Re-scan input/output devices and restart microphone capture if it has stopped delivering audio."
+                            ) {
+                                await model.refreshMicrophonesAwaitingCompletion()
                             }
 
                             Text("Muesli follows your Mac's default input/output and auto-recovers if a device changes mid-meeting. Pick a device to pin it; it sticks until you change it or choose System default. Refresh forces recovery if audio ever stops.")
@@ -373,5 +362,58 @@ struct LevelMeter: View {
             }
             .frame(height: 12)
         }
+    }
+}
+
+// MARK: - Refresh Feedback Button
+
+/// A link-style button that briefly shows a spinner then a checkmark once its
+/// action completes, so a click that finishes near-instantly still reads as
+/// having done something (audit A3 - "Refresh does nothing" was partly a
+/// feedback problem, not just a functionality one).
+struct RefreshFeedbackButton: View {
+    let title: String
+    let help: String
+    let action: () async -> Void
+
+    private enum FeedbackState {
+        case idle
+        case working
+        case done
+    }
+
+    @State private var state: FeedbackState = .idle
+
+    var body: some View {
+        Button {
+            guard state == .idle else { return }
+            // Set synchronously, before spawning the Task - a fast double
+            // click can fire twice before SwiftUI re-renders `.disabled`, and
+            // only a synchronous flip here makes the `guard` above actually
+            // exclude the second click.
+            state = .working
+            Task {
+                await action()
+                state = .done
+                try? await Task.sleep(nanoseconds: 900_000_000)
+                state = .idle
+            }
+        } label: {
+            HStack(spacing: 4) {
+                switch state {
+                case .idle:
+                    Text(title)
+                case .working:
+                    ProgressView().controlSize(.small)
+                    Text(title)
+                case .done:
+                    Image(systemName: "checkmark")
+                    Text(title)
+                }
+            }
+        }
+        .buttonStyle(.link)
+        .disabled(state != .idle)
+        .help(help)
     }
 }
