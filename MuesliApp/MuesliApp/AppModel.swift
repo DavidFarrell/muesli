@@ -210,6 +210,11 @@ final class AppModel: ObservableObject {
     // Debounces requestMicRecovery so the watchdog and the startup health
     // check can't both fire a rebuild for the same stall.
     private var micRecoveryPending = false
+    // Set once the ladder gives up (attempt 3+ with nothing to fall back to,
+    // or attempt 4+). Stops the watchdog re-detecting the same dead stall
+    // every tick and re-logging/re-attempting for the rest of the meeting.
+    // Cleared only where the ladder itself resets (see resetMicRecoveryLadder).
+    private var micRecoveryParked = false
     private var micOutputEnabled = false
     // Effective VPIO state the current meeting-mic start requested, and whether a
     // VPIO->plain downgrade has already fired this generation (gates it to once).
@@ -676,9 +681,8 @@ final class AppModel: ObservableObject {
                 AudioLog.event("mic.first-frame", ["msSinceStart": Int(now.timeIntervalSince(startedAt) * 1000)])
             }
         }
-        if lastMicAudioAt == nil || micNoAudioRecoveryAttempts > 0 {
-            micNoAudioRecoveryAttempts = 0
-            meters.clearMicAlert()
+        if lastMicAudioAt == nil || micNoAudioRecoveryAttempts > 0 || micRecoveryParked {
+            resetMicRecoveryLadder()
         }
 
         micLevel = rmsLevelInt16(data)
@@ -879,6 +883,15 @@ final class AppModel: ObservableObject {
     /// meeting engine when the device actually differs, else refresh the preview.
     private func applyInputSelectionChange() {
         micVoiceProcessingDowngraded = false
+        // A manual device pick is fresh user intent - same rationale as
+        // Refresh. But requestMicRecovery's own fallback step calls
+        // selectInputDevice(0) internally, setting micRecoveryPending = true
+        // just before doing so precisely so this reset doesn't stomp on its
+        // in-flight bookkeeping (the alert it just set, the attempt count) -
+        // only reset when nothing is already pending.
+        if !micRecoveryPending {
+            resetMicRecoveryLadder()
+        }
         loadInputDevices()   // refreshes the mirror + enqueues a restart if the device changed
         if !isCapturing, previewMicEngine != nil {
             enqueueMicLifecycle("input-pick-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
@@ -1047,13 +1060,27 @@ final class AppModel: ObservableObject {
                 }
             ) { [weak self] data in
                 Task { @MainActor in
-                    self?.handleMicAudio(data)
+                    // A buffer posted from an already-superseded engine (e.g.
+                    // one last callback landing just after a restart) must not
+                    // reset the new generation's recovery-ladder bookkeeping -
+                    // drop it before any state changes.
+                    guard let self, self.micEngineGeneration == generation else { return }
+                    self.handleMicAudio(data)
                 }
             }
             // Serialization should prevent overlap, but bail if a newer start
             // superseded this one before it completed (audit D2 belt-and-braces).
             guard generation == micEngineGeneration else {
                 AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
+                await engine.stop()
+                return
+            }
+            // A stop() that ran concurrently with this start (e.g. a recovery
+            // rebuild in flight when the user hit Stop) must not have this
+            // start assign a live engine after the meeting has ended - stop
+            // what we just started and leave micEngine untouched instead.
+            guard !isFinalizing else {
+                AudioLog.event("engine.start.superseded-by-stop", ["gen": generation])
                 await engine.stop()
                 return
             }
@@ -1095,6 +1122,10 @@ final class AppModel: ObservableObject {
         debugMicErrors += 1
         debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
         publishMicError()
+        // The red debugMicErrorMessage line takes precedence in SessionView,
+        // but a stale "reconnecting..." alert must not be left to resurface
+        // after a later successful start, before the first frame arrives.
+        meters.clearMicAlert()
         AudioLog.error("engine.start.fail.surfaced", ["error": String(describing: error)])
         appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
     }
@@ -1104,6 +1135,10 @@ final class AppModel: ObservableObject {
     private func restartMeetingMicEngineForInputSwitch() async {
         guard isCapturing else { return }
         guard transcribeMic else { return }
+        // A stop in progress poisons any queued/in-flight restart - the
+        // belt-and-braces check in startMeetingMicEngine also catches a
+        // restart that was already past this guard when stop began.
+        guard !isFinalizing else { return }
 
         // A restart supersedes any pending startup health check (audit D15).
         cancelMicStartupHealthCheck()
@@ -1178,6 +1213,11 @@ final class AppModel: ObservableObject {
                 ])
 
                 guard self.micEngine != nil else { continue }
+                // Once the ladder has given up, stop re-detecting the same
+                // dead stall every tick - that would re-log heartbeat.STALL
+                // and re-announce "attempting recovery" for the rest of the
+                // meeting even though requestMicRecovery itself would no-op.
+                guard !self.micRecoveryParked else { continue }
                 if let last = self.lastMicAudioAt {
                     // Delivered-then-stopped: frames were flowing and died.
                     guard Date().timeIntervalSince(last) > self.micStallThresholdSeconds else { continue }
@@ -1230,7 +1270,9 @@ final class AppModel: ObservableObject {
     /// other into a double rebuild for the same stall.
     private func requestMicRecovery(reason: String) {
         guard !micRecoveryPending else { return }
+        guard !micRecoveryParked else { return }
         guard isCapturing, transcribeMic else { return }
+        guard !isFinalizing else { return }
 
         micNoAudioRecoveryAttempts += 1
         let attempt = micNoAudioRecoveryAttempts
@@ -1265,7 +1307,18 @@ final class AppModel: ObservableObject {
             }
         case .giveUp:
             meters.setMicAlert("Microphone is not delivering audio. Try Refresh or pick a different input.")
+            micRecoveryParked = true
         }
+    }
+
+    /// Resets all recovery-ladder bookkeeping in lockstep. Called wherever a
+    /// fresh success or a fresh user intent invalidates the old state: a
+    /// frame arriving, Refresh, a manual device pick, or the meeting stopping.
+    private func resetMicRecoveryLadder() {
+        micNoAudioRecoveryAttempts = 0
+        micRecoveryPending = false
+        micRecoveryParked = false
+        meters.clearMicAlert()
     }
 
     /// User-triggered recovery (the Refresh button). Re-enumerates devices AND
@@ -1284,9 +1337,7 @@ final class AppModel: ObservableObject {
             ])
             micVoiceProcessingDowngraded = false
             // A manual refresh is a fresh user intent - the ladder starts over.
-            micNoAudioRecoveryAttempts = 0
-            micRecoveryPending = false
-            meters.clearMicAlert()
+            resetMicRecoveryLadder()
             enqueueMicLifecycle("refresh") { await $0.restartMeetingMicEngineForInputSwitch() }
         }
     }
@@ -1624,7 +1675,7 @@ final class AppModel: ObservableObject {
         // aware, not a bare ID delta on the display mirror (audit D1/D3): a
         // follow-mode steal moves `desiredID` off `micEngineBoundDeviceID` and so
         // fires, where the old `previousSelection != 0` guard silently returned.
-        let willRestart = isCapturing && transcribeMic && !isSwitchingInputDevice
+        let willRestart = isCapturing && transcribeMic && !isSwitchingInputDevice && !isFinalizing
             && desiredID != 0 && desiredID != micEngineBoundDeviceID
 
         AudioLog.event("resolve.input", [
@@ -2106,6 +2157,17 @@ final class AppModel: ObservableObject {
         stopMicFramesWatchdog()
         micEngineBoundDeviceID = 0
 
+        // Drain any in-flight/queued mic lifecycle op before reading micEngine
+        // below. Without this, a suspended restart (which already nilled
+        // micEngine and is awaiting a new engine's start) can complete AFTER
+        // this function has already read micEngine as nil, skipped the stop,
+        // and torn down - then assign a live engine into a meeting that has
+        // already ended (orphan engine holding the mic). isFinalizing (set
+        // above) makes any newly-queued op a no-op, and the belt-and-braces
+        // check in startMeetingMicEngine stops an already-in-flight start's
+        // engine instead of assigning it once this awaits through.
+        await micLifecycleTask?.value
+
         screenshotScheduler.stop()
         await captureEngine.stopCapture()
         if let engine = micEngine {
@@ -2116,9 +2178,7 @@ final class AppModel: ObservableObject {
         micOutputEnabled = false
         pendingMicAudio.removeAll()
         micStartTime = nil
-        micNoAudioRecoveryAttempts = 0
-        micRecoveryPending = false
-        meters.clearMicAlert()
+        resetMicRecoveryLadder()
 
         writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer?.closeStdinAfterDraining()
