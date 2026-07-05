@@ -9,7 +9,7 @@ enum MicEngineError: Error {
     case deviceBindFailed(deviceID: UInt32, status: Int32)
 }
 
-actor MicEngine {
+actor MicEngine: MicCapturing {
     private var engine: AVAudioEngine?
     private var isRunning = false
     private var onAudioData: ((Data) -> Void)?

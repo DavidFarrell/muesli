@@ -174,8 +174,11 @@ final class AppModel: ObservableObject {
     @Published var currentAttachments: [Attachment] = []
 
     private let captureEngine = CaptureEngine()
-    private var micEngine: MicEngine?
-    private var previewMicEngine: MicEngine?
+    // `any MicCapturing` rather than `MicEngine?`: this can hold either the
+    // AVAudioEngine-backed MicEngine or CaptureSessionMicEngine, chosen per
+    // start by `makeMicEngine` (see shouldUseCaptureSessionEngine).
+    private var micEngine: (any MicCapturing)?
+    private var previewMicEngine: (any MicCapturing)?
     private var isPreviewCaptureRunning = false
     private var previewLifecycleTask: Task<Void, Never>?
     // Single serializer for ALL mic engine start/stop/restart operations so two
@@ -188,10 +191,19 @@ final class AppModel: ObservableObject {
     // restart decision compares the DESIRED device to this, not a bare ID delta
     // on the display mirror (audit D1/D3).
     private var micEngineBoundDeviceID: UInt32 = 0
+    // Which engine KIND the running engine actually is - kept in lockstep
+    // with micEngineBoundDeviceID everywhere that's set/cleared. Needed
+    // because the same device id can require a different engine as the
+    // system default moves away from / back onto a pinned device (audit: 5
+    // Jul 2026 incident - an id-only restart compare left AVAudioEngine
+    // bound to a route it could no longer capture; see
+    // shouldRestartForSelection).
+    private var micEngineUsesCaptureSession: Bool = false
     // Same idea, for the start-screen preview engine (audit A2/D preview
     // parity: previously the preview had no bound-device bookkeeping at all,
     // so a device swap while sat on the start screen never re-resolved it).
     private var previewMicEngineBoundDeviceID: UInt32 = 0
+    private var previewMicEngineUsesCaptureSession: Bool = false
     private var micStartupHealthTask: Task<Void, Never>?
     private var micFramesWatchdogTask: Task<Void, Never>?
     private let micWatchdogIntervalNs: UInt64 = 2_000_000_000
@@ -818,6 +830,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// One decision point for which mic-capture engine to instantiate. Always
+    /// logs the choice (and why) so a support log tail proves which path a
+    /// given start actually took.
+    private func makeMicEngine(usesCaptureSession: Bool, context: String, resolvedID: UInt32, pinned: Bool) -> any MicCapturing {
+        if usesCaptureSession {
+            AudioLog.event("engine.select", [
+                "engine": "capturesession", "context": context, "resolvedID": resolvedID
+            ])
+            return CaptureSessionMicEngine()
+        }
+        AudioLog.event("engine.select", [
+            "engine": "avaudioengine", "context": context, "resolvedID": resolvedID, "pinned": pinned
+        ])
+        return MicEngine()
+    }
+
     private func inputDeviceName(for id: UInt32) -> String {
         if let name = inputDevices.first(where: { $0.id == id })?.name {
             return name
@@ -935,47 +963,80 @@ final class AppModel: ObservableObject {
         }
 
         if previewMicEngine == nil {
-            let engine = MicEngine()
-            previewMicEngine = engine
             let (resolvedID, pinned) = resolvedInputDeviceID()
             previewMicEngineBoundDeviceID = resolvedID
+            let usesCaptureSession = shouldUseCaptureSessionEngine(
+                resolvedID: resolvedID, pinned: pinned, liveDefaultInputID: AudioDeviceManager.defaultInputDeviceID() ?? 0
+            )
+            previewMicEngineUsesCaptureSession = usesCaptureSession
             do {
-                try await engine.start(
-                    enableVoiceProcessing: shouldEnableVoiceProcessing(),
-                    preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
-                    pinned: pinned,
-                    onConfigurationChange: { [weak self] in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            AudioLog.event("preview.engine.configchange", ["snap": AudioDeviceManager.snapshot()])
-                            // Same re-resolve the meeting engine's hook does;
-                            // loadInputDevices() restarts the preview itself
-                            // if the resolved device actually moved.
-                            self.loadInputDevices()
-                        }
-                    }
-                ) { [weak self] data in
-                    Task { @MainActor in
-                        self?.handlePreviewMicAudio(data)
-                    }
-                }
-                guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
-                    await engine.stop()
-                    previewMicEngine = nil
-                    previewMicEngineBoundDeviceID = 0
-                    isPreviewingLevels = isPreviewCaptureRunning
-                    return
+                try await attemptPreviewMicEngineStart(usesCaptureSession: usesCaptureSession, resolvedID: resolvedID, pinned: pinned)
+            } catch is CaptureSessionMicEngineError where usesCaptureSession {
+                // Same fallback as the meeting engine - see startMeetingMicEngine.
+                AudioLog.event("engine.select.capturesession-fallback", ["context": "preview", "resolvedID": resolvedID])
+                previewMicEngineUsesCaptureSession = false
+                do {
+                    try await attemptPreviewMicEngineStart(usesCaptureSession: false, resolvedID: resolvedID, pinned: pinned)
+                } catch {
+                    handlePreviewMicStartFailure(error)
                 }
             } catch {
-                previewMicEngine = nil
-                previewMicEngineBoundDeviceID = 0
-                debugMicErrors += 1
-                debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
-                publishMicError()
+                handlePreviewMicStartFailure(error)
             }
         }
 
         isPreviewingLevels = isPreviewCaptureRunning || (previewMicEngine != nil)
+    }
+
+    /// One start attempt for the start-screen preview mic engine - the
+    /// preview's analogue of `attemptMeetingMicEngineStart`. Assigns
+    /// `previewMicEngine` up front (a concurrent guard elsewhere expects a
+    /// non-nil engine while starting) and clears it back to nil if it throws.
+    private func attemptPreviewMicEngineStart(usesCaptureSession: Bool, resolvedID: UInt32, pinned: Bool) async throws {
+        let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "preview", resolvedID: resolvedID, pinned: pinned)
+        previewMicEngine = engine
+        do {
+            try await engine.start(
+                // CaptureSessionMicEngine has no VPIO equivalent - never request it there.
+                enableVoiceProcessing: usesCaptureSession ? false : shouldEnableVoiceProcessing(),
+                preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
+                pinned: pinned,
+                onConfigurationChange: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        AudioLog.event("preview.engine.configchange", ["snap": AudioDeviceManager.snapshot()])
+                        // Same re-resolve the meeting engine's hook does;
+                        // loadInputDevices() restarts the preview itself
+                        // if the resolved device actually moved.
+                        self.loadInputDevices()
+                    }
+                }
+            ) { [weak self] data in
+                Task { @MainActor in
+                    self?.handlePreviewMicAudio(data)
+                }
+            }
+        } catch {
+            previewMicEngine = nil
+            throw error
+        }
+
+        guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
+            await engine.stop()
+            previewMicEngine = nil
+            previewMicEngineBoundDeviceID = 0
+            previewMicEngineUsesCaptureSession = false
+            isPreviewingLevels = isPreviewCaptureRunning
+            return
+        }
+    }
+
+    private func handlePreviewMicStartFailure(_ error: Error) {
+        previewMicEngineBoundDeviceID = 0
+        previewMicEngineUsesCaptureSession = false
+        debugMicErrors += 1
+        debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
+        publishMicError()
     }
 
     private func stopHomeLevelPreviewNow() async {
@@ -983,6 +1044,7 @@ final class AppModel: ObservableObject {
             await engine.stop()
             previewMicEngine = nil
             previewMicEngineBoundDeviceID = 0
+            previewMicEngineUsesCaptureSession = false
         }
 
         if isCapturing {
@@ -1046,94 +1108,139 @@ final class AppModel: ObservableObject {
 
         micEngineGeneration += 1
         let generation = micEngineGeneration
-        let engine = MicEngine()
-
-        // Effective VPIO drops to off once a downgrade has fired this generation.
-        let enableVPIO = shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded
-        micVoiceProcessingRequested = enableVPIO
 
         // Re-resolve the device at the moment of start so a steal that happened
         // between the trigger and here is honoured. A pinned device binds
         // unconditionally; follow mode lets the engine track the default.
         let (resolvedID, pinned) = resolvedInputDeviceID()
         micEngineBoundDeviceID = resolvedID
-        AudioLog.event("engine.start.begin", [
-            "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID
-        ])
+        let usesCaptureSession = shouldUseCaptureSessionEngine(
+            resolvedID: resolvedID, pinned: pinned, liveDefaultInputID: AudioDeviceManager.defaultInputDeviceID() ?? 0
+        )
+        micEngineUsesCaptureSession = usesCaptureSession
 
         do {
-            try await engine.start(
-                enableVoiceProcessing: enableVPIO,
-                preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
-                pinned: pinned,
-                onConfigurationChange: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        AudioLog.event("engine.configchange", ["snap": AudioDeviceManager.snapshot()])
-                        // Re-resolve under the new route; restarts only if the
-                        // device the engine should be on actually moved.
-                        self.loadInputDevices()
-                    }
-                }
-            ) { [weak self] data in
-                Task { @MainActor in
-                    // A buffer posted from an already-superseded engine (e.g.
-                    // one last callback landing just after a restart) must not
-                    // reset the new generation's recovery-ladder bookkeeping -
-                    // drop it before any state changes.
-                    guard let self, self.micEngineGeneration == generation else { return }
-                    self.handleMicAudio(data)
-                }
+            try await attemptMeetingMicEngineStart(
+                usesCaptureSession: usesCaptureSession, resolvedID: resolvedID, pinned: pinned, generation: generation
+            )
+        } catch is CaptureSessionMicEngineError where usesCaptureSession {
+            // The capture-session engine could not even start (e.g. the CoreAudio
+            // UID -> AVCaptureDevice mapping did not hold on this hardware - the
+            // one unverified assumption in that path). Degrade to AVAudioEngine
+            // for the SAME device rather than a hard dead end: at worst this
+            // reproduces the OLD silent-zero-frames failure mode, which the
+            // watchdog + recovery ladder already rescue (MicRecoveryLadder) -
+            // a capture session that throws on every attempt would otherwise
+            // leave a broken pin permanently dead, surviving even Refresh.
+            AudioLog.event("engine.select.capturesession-fallback", ["gen": generation, "resolvedID": resolvedID])
+            micEngineUsesCaptureSession = false
+            do {
+                try await attemptMeetingMicEngineStart(
+                    usesCaptureSession: false, resolvedID: resolvedID, pinned: pinned, generation: generation
+                )
+            } catch {
+                await handleMeetingMicEngineStartFailure(error)
             }
-            // Serialization should prevent overlap, but bail if a newer start
-            // superseded this one before it completed (audit D2 belt-and-braces).
-            guard generation == micEngineGeneration else {
-                AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
-                await engine.stop()
-                return
-            }
-            // A stop() that ran concurrently with this start (e.g. a recovery
-            // rebuild in flight when the user hit Stop) must not have this
-            // start assign a live engine after the meeting has ended - stop
-            // what we just started and leave micEngine untouched instead.
-            guard !isFinalizing else {
-                AudioLog.event("engine.start.superseded-by-stop", ["gen": generation])
-                await engine.stop()
-                return
-            }
-            micEngine = engine
-            micEngineStartedAt = Date()
-            micOutputEnabled = true
-            debugMicErrorMessage = "-"
-            publishMicError()
-            if isCapturing {
-                scheduleMicStartupHealthCheck()
-            }
-        } catch let error as MicEngineError {
-            // A VPIO-format failure is not a hard failure: downgrade to plain
-            // capture once and restart rather than leaving the mic dead.
-            if case .invalidInputFormat(_, _, _, let vpioRequested) = error, vpioRequested, !micVoiceProcessingDowngraded {
-                micVoiceProcessingDowngraded = true
-                appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
-                AudioLog.event("engine.start.vpio-downgrade-retry")
-                // The start threw, so nothing was assigned/needs teardown - just
-                // retry the start (downgraded flag now forces VPIO off). NB this
-                // path runs at first-start too, BEFORE isCapturing is set, so it
-                // must not route through restartMeetingMicEngineForInputSwitch
-                // (which guards on isCapturing and would no-op here).
-                await startMeetingMicEngine()
-                return
-            }
-            handleMicStartFailure(error)
         } catch {
-            handleMicStartFailure(error)
+            await handleMeetingMicEngineStartFailure(error)
         }
+    }
+
+    /// One start attempt for the meeting mic engine: builds the engine for the
+    /// given choice, starts it, and on success runs the usual post-start
+    /// bookkeeping (generation/isFinalizing guards, micEngine assignment,
+    /// health check). Throws without touching `micEngine` on failure - the
+    /// caller decides how to react (VPIO retry, capture-session fallback, or
+    /// surfacing the failure).
+    private func attemptMeetingMicEngineStart(
+        usesCaptureSession: Bool, resolvedID: UInt32, pinned: Bool, generation: Int
+    ) async throws {
+        let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "meeting", resolvedID: resolvedID, pinned: pinned)
+
+        // Effective VPIO drops to off once a downgrade has fired this
+        // generation, and unconditionally for the capture-session path (it
+        // has no VPIO equivalent - see CaptureSessionMicEngine's header).
+        let enableVPIO = usesCaptureSession ? false : (shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded)
+        micVoiceProcessingRequested = enableVPIO
+
+        AudioLog.event("engine.start.begin", [
+            "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID, "captureSession": usesCaptureSession
+        ])
+
+        try await engine.start(
+            enableVoiceProcessing: enableVPIO,
+            preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
+            pinned: pinned,
+            onConfigurationChange: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    AudioLog.event("engine.configchange", ["snap": AudioDeviceManager.snapshot()])
+                    // Re-resolve under the new route; restarts only if the
+                    // device the engine should be on actually moved.
+                    self.loadInputDevices()
+                }
+            }
+        ) { [weak self] data in
+            Task { @MainActor in
+                // A buffer posted from an already-superseded engine (e.g.
+                // one last callback landing just after a restart) must not
+                // reset the new generation's recovery-ladder bookkeeping -
+                // drop it before any state changes.
+                guard let self, self.micEngineGeneration == generation else { return }
+                self.handleMicAudio(data)
+            }
+        }
+        // Serialization should prevent overlap, but bail if a newer start
+        // superseded this one before it completed (audit D2 belt-and-braces).
+        guard generation == micEngineGeneration else {
+            AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
+            await engine.stop()
+            return
+        }
+        // A stop() that ran concurrently with this start (e.g. a recovery
+        // rebuild in flight when the user hit Stop) must not have this
+        // start assign a live engine after the meeting has ended - stop
+        // what we just started and leave micEngine untouched instead.
+        guard !isFinalizing else {
+            AudioLog.event("engine.start.superseded-by-stop", ["gen": generation])
+            await engine.stop()
+            return
+        }
+        micEngine = engine
+        micEngineStartedAt = Date()
+        micOutputEnabled = true
+        debugMicErrorMessage = "-"
+        publishMicError()
+        if isCapturing {
+            scheduleMicStartupHealthCheck()
+        }
+    }
+
+    private func handleMeetingMicEngineStartFailure(_ error: Error) async {
+        // A VPIO-format failure is not a hard failure: downgrade to plain
+        // capture once and restart rather than leaving the mic dead.
+        if let micEngineError = error as? MicEngineError,
+           case .invalidInputFormat(_, _, _, let vpioRequested) = micEngineError,
+           vpioRequested, !micVoiceProcessingDowngraded {
+            micVoiceProcessingDowngraded = true
+            appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
+            AudioLog.event("engine.start.vpio-downgrade-retry")
+            // The start threw, so nothing was assigned/needs teardown - just
+            // retry the start (downgraded flag now forces VPIO off). NB this
+            // path runs at first-start too, BEFORE isCapturing is set, so it
+            // must not route through restartMeetingMicEngineForInputSwitch
+            // (which guards on isCapturing and would no-op here).
+            await startMeetingMicEngine()
+            return
+        }
+        handleMicStartFailure(error)
     }
 
     private func handleMicStartFailure(_ error: Error) {
         micEngine = nil
         micEngineStartedAt = nil
         micEngineBoundDeviceID = 0
+        micEngineUsesCaptureSession = false
         micOutputEnabled = false
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
@@ -1166,6 +1273,7 @@ final class AppModel: ObservableObject {
             micEngine = nil
         }
         micEngineBoundDeviceID = 0
+        micEngineUsesCaptureSession = false
         micEngineStartedAt = nil
 
         pendingMicAudio.removeAll()
@@ -1186,6 +1294,7 @@ final class AppModel: ObservableObject {
                 await engine.stop()
                 model.previewMicEngine = nil
                 model.previewMicEngineBoundDeviceID = 0
+                model.previewMicEngineUsesCaptureSession = false
             }
             await model.startHomeLevelPreviewNow()
         }
@@ -1714,18 +1823,35 @@ final class AppModel: ObservableObject {
         // device id otherwise.
         selectedInputDeviceID = pinned ? desiredID : 0
 
-        // Restart only when capturing and the device the engine SHOULD be on
-        // differs from what it's actually bound to. This is liveness/identity
-        // aware, not a bare ID delta on the display mirror (audit D1/D3): a
-        // follow-mode steal moves `desiredID` off `micEngineBoundDeviceID` and so
-        // fires, where the old `previousSelection != 0` guard silently returned.
+        let liveDefaultInputID = AudioDeviceManager.defaultInputDeviceID() ?? 0
+        let desiredUsesCaptureSession = shouldUseCaptureSessionEngine(
+            resolvedID: desiredID, pinned: pinned, liveDefaultInputID: liveDefaultInputID
+        )
+
+        // Restart only when capturing and EITHER the device the engine SHOULD
+        // be on differs from what it's actually bound to, OR the bound device
+        // is unchanged but now needs a different ENGINE KIND. The kind case
+        // is liveness/identity aware in the same spirit as the id-only check
+        // it replaces (audit D1/D3: a follow-mode steal moves `desiredID` off
+        // `micEngineBoundDeviceID`), but closes a gap that check left open
+        // (audit: 5 Jul 2026 incident) - pinned==default at start picks
+        // AVAudioEngine; the default then moves elsewhere; `desiredID` is
+        // UNCHANGED (still the pinned device) so an id-only compare never
+        // restarted, leaving AVAudioEngine bound to a route it can no longer
+        // capture. See `shouldRestartForSelection`.
         let willRestart = isCapturing && transcribeMic && !isFinalizing
-            && desiredID != 0 && desiredID != micEngineBoundDeviceID
+            && shouldRestartForSelection(
+                desiredID: desiredID, boundID: micEngineBoundDeviceID,
+                desiredUsesCaptureSession: desiredUsesCaptureSession, currentUsesCaptureSession: micEngineUsesCaptureSession
+            )
         // Same liveness check for the start-screen preview engine (audit A2
         // preview parity) - only meaningful when there's no meeting running
         // and a preview engine actually exists to be stale.
         let willRestartPreview = !isCapturing && previewMicEngine != nil
-            && desiredID != 0 && desiredID != previewMicEngineBoundDeviceID
+            && shouldRestartForSelection(
+                desiredID: desiredID, boundID: previewMicEngineBoundDeviceID,
+                desiredUsesCaptureSession: desiredUsesCaptureSession, currentUsesCaptureSession: previewMicEngineUsesCaptureSession
+            )
 
         AudioLog.event("resolve.input", [
             "mode": inputSelection.logDescription,
@@ -1736,6 +1862,8 @@ final class AppModel: ObservableObject {
             "isCapturing": isCapturing,
             "willRestart": willRestart,
             "willRestartPreview": willRestartPreview,
+            "desiredCaptureSession": desiredUsesCaptureSession,
+            "boundCaptureSession": micEngineUsesCaptureSession,
             "snap": AudioDeviceManager.snapshot()
         ])
 
@@ -2235,6 +2363,7 @@ final class AppModel: ObservableObject {
             model.micEngine = nil
             model.micEngineStartedAt = nil
             model.micEngineBoundDeviceID = 0
+            model.micEngineUsesCaptureSession = false
         }
         await micLifecycleTask?.value
         micOutputEnabled = false
@@ -2304,6 +2433,7 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         micEngineBoundDeviceID = 0
+        micEngineUsesCaptureSession = false
 
         // Drain any in-flight/queued mic lifecycle op before reading micEngine
         // below. Without this, a suspended restart (which already nilled
