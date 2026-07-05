@@ -27,6 +27,7 @@
 			membershipExceptions = (
 				AECMode.swift,
 				MicAudioFormat.swift,
+				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
 				TranscriptModel.swift,
 			);

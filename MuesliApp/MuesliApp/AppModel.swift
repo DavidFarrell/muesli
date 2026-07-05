@@ -174,8 +174,11 @@ final class AppModel: ObservableObject {
     @Published var currentAttachments: [Attachment] = []
 
     private let captureEngine = CaptureEngine()
-    private var micEngine: MicEngine?
-    private var previewMicEngine: MicEngine?
+    // `any MicCapturing` rather than `MicEngine?`: this can hold either the
+    // AVAudioEngine-backed MicEngine or CaptureSessionMicEngine, chosen per
+    // start by `makeMicEngine` (see shouldUseCaptureSessionEngine).
+    private var micEngine: (any MicCapturing)?
+    private var previewMicEngine: (any MicCapturing)?
     private var isPreviewCaptureRunning = false
     private var previewLifecycleTask: Task<Void, Never>?
     // Single serializer for ALL mic engine start/stop/restart operations so two
@@ -818,6 +821,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// One decision point for which mic-capture engine to instantiate. Always
+    /// logs the choice (and why) so a support log tail proves which path a
+    /// given start actually took.
+    private func makeMicEngine(usesCaptureSession: Bool, context: String, resolvedID: UInt32, pinned: Bool) -> any MicCapturing {
+        if usesCaptureSession {
+            AudioLog.event("engine.select", [
+                "engine": "capturesession", "context": context, "resolvedID": resolvedID
+            ])
+            return CaptureSessionMicEngine()
+        }
+        AudioLog.event("engine.select", [
+            "engine": "avaudioengine", "context": context, "resolvedID": resolvedID, "pinned": pinned
+        ])
+        return MicEngine()
+    }
+
     private func inputDeviceName(for id: UInt32) -> String {
         if let name = inputDevices.first(where: { $0.id == id })?.name {
             return name
@@ -935,13 +954,17 @@ final class AppModel: ObservableObject {
         }
 
         if previewMicEngine == nil {
-            let engine = MicEngine()
-            previewMicEngine = engine
             let (resolvedID, pinned) = resolvedInputDeviceID()
             previewMicEngineBoundDeviceID = resolvedID
+            let usesCaptureSession = shouldUseCaptureSessionEngine(
+                resolvedID: resolvedID, pinned: pinned, liveDefaultInputID: AudioDeviceManager.defaultInputDeviceID() ?? 0
+            )
+            let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "preview", resolvedID: resolvedID, pinned: pinned)
+            previewMicEngine = engine
             do {
                 try await engine.start(
-                    enableVoiceProcessing: shouldEnableVoiceProcessing(),
+                    // CaptureSessionMicEngine has no VPIO equivalent - never request it there.
+                    enableVoiceProcessing: usesCaptureSession ? false : shouldEnableVoiceProcessing(),
                     preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
                     pinned: pinned,
                     onConfigurationChange: { [weak self] in
@@ -1046,19 +1069,25 @@ final class AppModel: ObservableObject {
 
         micEngineGeneration += 1
         let generation = micEngineGeneration
-        let engine = MicEngine()
-
-        // Effective VPIO drops to off once a downgrade has fired this generation.
-        let enableVPIO = shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded
-        micVoiceProcessingRequested = enableVPIO
 
         // Re-resolve the device at the moment of start so a steal that happened
         // between the trigger and here is honoured. A pinned device binds
         // unconditionally; follow mode lets the engine track the default.
         let (resolvedID, pinned) = resolvedInputDeviceID()
         micEngineBoundDeviceID = resolvedID
+        let usesCaptureSession = shouldUseCaptureSessionEngine(
+            resolvedID: resolvedID, pinned: pinned, liveDefaultInputID: AudioDeviceManager.defaultInputDeviceID() ?? 0
+        )
+        let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "meeting", resolvedID: resolvedID, pinned: pinned)
+
+        // Effective VPIO drops to off once a downgrade has fired this
+        // generation, and unconditionally for the capture-session path (it
+        // has no VPIO equivalent - see CaptureSessionMicEngine's header).
+        let enableVPIO = usesCaptureSession ? false : (shouldEnableVoiceProcessing() && !micVoiceProcessingDowngraded)
+        micVoiceProcessingRequested = enableVPIO
+
         AudioLog.event("engine.start.begin", [
-            "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID
+            "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID, "captureSession": usesCaptureSession
         ])
 
         do {
