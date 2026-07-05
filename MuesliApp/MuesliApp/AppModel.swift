@@ -196,6 +196,20 @@ final class AppModel: ObservableObject {
     private var lastMicAudioAt: Date?
     private var micFrameCount: Int = 0
     private var micStartTime: Date?
+    // When the current engine's start() call succeeded - distinct from
+    // micStartTime (set on first frame). This is what lets the watchdog catch
+    // an engine that never delivers frame one at all (audit: 5 Jul 2026
+    // mic-dead-after-device-switch incident, MacBook Pro mic pinned=true but
+    // zero frames ever, invisible to the old frames-only watchdog).
+    private var micEngineStartedAt: Date?
+    // Shared recovery-ladder state (see requestMicRecovery). Reset to 0 when a
+    // frame actually arrives or the user hits Refresh; incremented once per
+    // recovery attempt regardless of which caller (watchdog or health check)
+    // triggered it.
+    private var micNoAudioRecoveryAttempts: Int = 0
+    // Debounces requestMicRecovery so the watchdog and the startup health
+    // check can't both fire a rebuild for the same stall.
+    private var micRecoveryPending = false
     private var micOutputEnabled = false
     // Effective VPIO state the current meeting-mic start requested, and whether a
     // VPIO->plain downgrade has already fired this generation (gates it to once).
@@ -653,6 +667,20 @@ final class AppModel: ObservableObject {
         let elapsed = now.timeIntervalSince(micStartTime ?? now)
         let ptsUs = Int64(elapsed * 1_000_000.0)
 
+        // A frame actually arriving is the ladder's success signal, whether
+        // this is the very first frame after a fresh start (lastMicAudioAt ==
+        // nil) or a frame landing mid-recovery (attempts > 0). Cheap
+        // diagnostic for the next incident: how long the engine ran silent.
+        if lastMicAudioAt == nil {
+            if let startedAt = micEngineStartedAt {
+                AudioLog.event("mic.first-frame", ["msSinceStart": Int(now.timeIntervalSince(startedAt) * 1000)])
+            }
+        }
+        if lastMicAudioAt == nil || micNoAudioRecoveryAttempts > 0 {
+            micNoAudioRecoveryAttempts = 0
+            meters.clearMicAlert()
+        }
+
         micLevel = rmsLevelInt16(data)
         debugMicBuffers += 1
         debugMicFrames = data.count / 2
@@ -980,6 +1008,7 @@ final class AppModel: ObservableObject {
     private func startMeetingMicEngine() async {
         guard transcribeMic else {
             micEngine = nil
+            micEngineStartedAt = nil
             micOutputEnabled = false
             cancelMicStartupHealthCheck()
             return
@@ -1029,6 +1058,7 @@ final class AppModel: ObservableObject {
                 return
             }
             micEngine = engine
+            micEngineStartedAt = Date()
             micOutputEnabled = true
             debugMicErrorMessage = "-"
             publishMicError()
@@ -1058,6 +1088,7 @@ final class AppModel: ObservableObject {
 
     private func handleMicStartFailure(_ error: Error) {
         micEngine = nil
+        micEngineStartedAt = nil
         micEngineBoundDeviceID = 0
         micOutputEnabled = false
         cancelMicStartupHealthCheck()
@@ -1083,6 +1114,7 @@ final class AppModel: ObservableObject {
             micEngine = nil
         }
         micEngineBoundDeviceID = 0
+        micEngineStartedAt = nil
 
         pendingMicAudio.removeAll()
         micOutputEnabled = false
@@ -1145,20 +1177,28 @@ final class AppModel: ObservableObject {
                     "snap": AudioDeviceManager.snapshot()
                 ])
 
-                // Only treat as a stall once at least one frame has arrived; the
-                // never-delivered-at-startup case is the startup health check's
-                // job, so the two don't fight.
-                guard let last = self.lastMicAudioAt, self.micEngine != nil else { continue }
-                if Date().timeIntervalSince(last) > self.micStallThresholdSeconds {
+                guard self.micEngine != nil else { continue }
+                if let last = self.lastMicAudioAt {
+                    // Delivered-then-stopped: frames were flowing and died.
+                    guard Date().timeIntervalSince(last) > self.micStallThresholdSeconds else { continue }
                     AudioLog.error("heartbeat.STALL", [
                         "sinceLastFrameMs": Int(Date().timeIntervalSince(last) * 1000),
                         "snap": AudioDeviceManager.snapshot()
                     ])
                     self.appendBackendLog("Mic stopped delivering audio - restarting capture.", toTail: true)
-                    // Debounce so we don't re-fire every tick before the new
-                    // engine starts delivering.
-                    self.lastMicAudioAt = Date()
-                    self.enqueueMicLifecycle("watchdog-stall") { await $0.restartMeetingMicEngineForInputSwitch() }
+                    self.requestMicRecovery(reason: "watchdog-stall")
+                } else if let startedAt = self.micEngineStartedAt,
+                          Date().timeIntervalSince(startedAt) > self.micStallThresholdSeconds {
+                    // Never-delivered-at-all: lastMicAudioAt only arms after a
+                    // first frame, so an engine that never delivers frame one
+                    // was previously invisible here (the 5 Jul 2026 incident -
+                    // engine.start.ok pinned=true but zero frames, ever).
+                    AudioLog.error("heartbeat.STALL.no-first-frame", [
+                        "sinceStartMs": Int(Date().timeIntervalSince(startedAt) * 1000),
+                        "snap": AudioDeviceManager.snapshot()
+                    ])
+                    self.appendBackendLog("Mic never delivered audio after switching input - attempting recovery.", toTail: true)
+                    self.requestMicRecovery(reason: "watchdog-no-first-frame")
                 }
             }
         }
@@ -1167,6 +1207,65 @@ final class AppModel: ObservableObject {
     private func stopMicFramesWatchdog() {
         micFramesWatchdogTask?.cancel()
         micFramesWatchdogTask = nil
+    }
+
+    /// True when the input is pinned to a specific device that is not
+    /// currently the live system default - i.e. there is somewhere sensible to
+    /// fall back to. Re-resolved fresh each call rather than cached, since the
+    /// OS default can move independently of our pin.
+    private func isPinnedAwayFromSystemDefaultInput() -> Bool {
+        guard case .pinned(let uid) = inputSelection else { return false }
+        guard let pinnedID = AudioDeviceManager.deviceID(forUID: uid) else { return false }
+        let defaultID = AudioDeviceManager.defaultInputDeviceID() ?? 0
+        return defaultID != 0 && pinnedID != defaultID
+    }
+
+    /// Single shared entry point for automatic mic-dead recovery. Called by
+    /// both frames-watchdog stall paths (delivered-then-stopped and
+    /// never-delivered) and the startup health check's no-VPIO no-audio
+    /// branch, which previously just logged and gave up (audit: the 5 Jul
+    /// 2026 incident - a pinned device switch left the tap silently dead with
+    /// no recovery until the user manually switched back). `micRecoveryPending`
+    /// is the debounce: it stops the watchdog and the health check racing each
+    /// other into a double rebuild for the same stall.
+    private func requestMicRecovery(reason: String) {
+        guard !micRecoveryPending else { return }
+        guard isCapturing, transcribeMic else { return }
+
+        micNoAudioRecoveryAttempts += 1
+        let attempt = micNoAudioRecoveryAttempts
+        let pinnedAway = isPinnedAwayFromSystemDefaultInput()
+        let step = MicRecoveryLadder.step(forAttempt: attempt, isPinnedAwayFromDefault: pinnedAway)
+        AudioLog.event("mic.recovery", ["reason": reason, "attempt": attempt, "step": String(describing: step)])
+
+        switch step {
+        case .rebuild:
+            meters.setMicAlert("Mic stopped delivering audio - reconnecting...")
+            micRecoveryPending = true
+            enqueueMicLifecycle(reason) { model in
+                await model.restartMeetingMicEngineForInputSwitch()
+                model.micRecoveryPending = false
+            }
+        case .fallbackToSystemDefault:
+            var deviceName = "the pinned input"
+            if case .pinned(let uid) = inputSelection, let id = AudioDeviceManager.deviceID(forUID: uid) {
+                deviceName = inputDeviceName(for: id)
+            }
+            let message = "No audio from \(deviceName) - switched back to the system default input"
+            appendBackendLog(message, toTail: true)
+            meters.setMicAlert(message)
+            micRecoveryPending = true
+            // The normal UI pathway: updates the picker AND, since the
+            // resolved device now differs from the dead-bound one, enqueues
+            // the rebuild itself via loadInputDevices - a second explicit
+            // restart here would just be a redundant extra rebuild.
+            selectInputDevice(0)
+            enqueueMicLifecycle(reason) { model in
+                model.micRecoveryPending = false
+            }
+        case .giveUp:
+            meters.setMicAlert("Microphone is not delivering audio. Try Refresh or pick a different input.")
+        }
     }
 
     /// User-triggered recovery (the Refresh button). Re-enumerates devices AND
@@ -1184,6 +1283,10 @@ final class AppModel: ObservableObject {
                 "engineAlive": micEngine != nil, "buffers": debugMicBuffers
             ])
             micVoiceProcessingDowngraded = false
+            // A manual refresh is a fresh user intent - the ladder starts over.
+            micNoAudioRecoveryAttempts = 0
+            micRecoveryPending = false
+            meters.clearMicAlert()
             enqueueMicLifecycle("refresh") { await $0.restartMeetingMicEngineForInputSwitch() }
         }
     }
@@ -1212,9 +1315,12 @@ final class AppModel: ObservableObject {
                 return
             }
 
-            // Plain capture with no audio is a genuine mic problem, not VPIO.
+            // Plain capture with no audio is a genuine mic problem, not VPIO -
+            // route into the shared recovery ladder instead of logging and
+            // giving up (this was the dead end in the 5 Jul 2026 incident).
             AudioLog.error("healthcheck.no-audio")
             appendBackendLog("Mic health check: still no audio.", toTail: true)
+            requestMicRecovery(reason: "healthcheck-no-audio")
         }
     }
 
@@ -2006,9 +2112,13 @@ final class AppModel: ObservableObject {
             await engine.stop()
         }
         micEngine = nil
+        micEngineStartedAt = nil
         micOutputEnabled = false
         pendingMicAudio.removeAll()
         micStartTime = nil
+        micNoAudioRecoveryAttempts = 0
+        micRecoveryPending = false
+        meters.clearMicAlert()
 
         writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         writer?.closeStdinAfterDraining()

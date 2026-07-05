@@ -23,6 +23,10 @@ final class AudioMetersModel: ObservableObject {
     @Published private(set) var debugMicFormat: String = "-"
     @Published private(set) var debugMicErrorMessage: String = "-"
     @Published private(set) var debugMicErrors: Int = 0
+    /// User-visible mic-dead recovery state (set by AppModel's recovery
+    /// ladder). Distinct from debugMicErrorMessage: that's a hard engine-start
+    /// failure, this is "the engine is running but audio isn't flowing".
+    @Published private(set) var micAlert: String?
 
     @Published private(set) var systemLevel: Float = 0
     @Published private(set) var debugSystemBuffers: Int = 0
@@ -62,6 +66,17 @@ final class AudioMetersModel: ObservableObject {
     func setMicError(message: String, errorCount: Int) {
         debugMicErrorMessage = message
         debugMicErrors = errorCount
+    }
+
+    /// One-shot recovery-ladder state changes; always publish immediately -
+    /// same rationale as setMicError, a dropped throttled publish here would
+    /// never be retried.
+    func setMicAlert(_ message: String) {
+        micAlert = message
+    }
+
+    func clearMicAlert() {
+        micAlert = nil
     }
 
     /// Feed a system-audio-buffer tick. Throttled, except a TRANSITION to
