@@ -30,6 +30,7 @@ enum CaptureSessionMicEngineError: Error {
 /// see `AppModel.shouldUseCaptureSessionEngine`.
 actor CaptureSessionMicEngine: MicCapturing {
     private var session: AVCaptureSession?
+    private var audioOutput: AVCaptureAudioDataOutput?
     private var isRunning = false
     private var onAudioData: ((Data) -> Void)?
     private var observers: [NSObjectProtocol] = []
@@ -97,6 +98,7 @@ actor CaptureSessionMicEngine: MicCapturing {
         }
         output.setSampleBufferDelegate(relay, queue: sampleQueue)
         delegateRelay = relay
+        audioOutput = output
 
         registerObservers(device: device, session: session, onConfigurationChange: onConfigurationChange)
 
@@ -205,6 +207,13 @@ actor CaptureSessionMicEngine: MicCapturing {
             NotificationCenter.default.removeObserver(observer)
         }
         observers.removeAll()
+
+        // Detach the delegate explicitly before dropping our reference to it
+        // or stopping the session - relying on AVFoundation to stop calling a
+        // deallocated delegate is exactly the kind of internal behaviour this
+        // spike shouldn't lean on.
+        audioOutput?.setSampleBufferDelegate(nil, queue: nil)
+        audioOutput = nil
         delegateRelay = nil
 
         let runningSession = session
