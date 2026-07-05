@@ -153,8 +153,8 @@ This is inherent to clustering algorithms - they need enough samples to reliably
 
 **Files involved:**
 - `muesli_backend.py` - `CONTEXT_SECONDS = 30.0` defines the live window
-- `senko_diarisation.py` - Wrapper around Senko library
-- `diarisation.py` - Sortformer implementation (alternative backend, same issue)
+- `senko_diarisation.py` - Wrapper around Senko library (the only diariser since the
+  Sortformer backend was retired 2026-07-05)
 
 ---
 

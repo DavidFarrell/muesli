@@ -98,7 +98,7 @@ Use `--keep-wav` or `--keep-pcm` to retain capture files.
 | `--out-json` | Output JSON file with words, segments, and turns |
 | `--out-srt` | Output SRT subtitle file with speaker labels |
 | `--out-rttm` | Output RTTM file (diarisation segments only) |
-| `--diar-backend` | `senko` (default, recommended) or `sortformer` |
+| `--diar-backend` | `senko` (only supported backend; Sortformer was retired) |
 | `--asr-model` | ASR model ID (default: mlx-community/parakeet-tdt-0.6b-v3) |
 | `--language` | Language code for ASR (auto-detected if not specified) |
 | `--num-speakers` | Filter output to top N speakers by activity |

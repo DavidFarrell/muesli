@@ -71,7 +71,6 @@ def _run(audio_path, recovery: bool):
         audio_path,
         "system",
         diar_backend="senko",
-        diar_model="default",
         asr_model=reprocess.DEFAULT_MODEL,
         language=None,
         gap_threshold=reprocess.DEFAULT_GAP_THRESHOLD_SECONDS,

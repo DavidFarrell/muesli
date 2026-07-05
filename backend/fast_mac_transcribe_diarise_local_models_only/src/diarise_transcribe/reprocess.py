@@ -15,7 +15,7 @@ from typing import List, Optional
 from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
 from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
 from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import DiarSegment, SortformerDiarizer
+from .diarisation import DiarSegment
 from .merge import merge_transcript_with_diarisation
 from .recovery import (
     RecoveryWindow,
@@ -214,7 +214,6 @@ def reprocess_stream(
     audio_path: Path,
     stream_name: str,
     diar_backend: str,
-    diar_model: str,
     asr_model: str,
     language: Optional[str],
     gap_threshold: float,
@@ -250,9 +249,10 @@ def reprocess_stream(
             diarizer = SenkoDiarizer(quiet=not verbose)
             segments = diarizer.diarise(temp_wav)
         else:
-            log(f"Running Sortformer diarization ({diar_model})...")
-            diarizer = SortformerDiarizer(model_name=diar_model)
-            segments = diarizer.diarise(temp_wav)
+            raise ValueError(
+                f"Unknown diar_backend {diar_backend!r}: only 'senko' is supported "
+                "(the Sortformer backend was retired)."
+            )
 
         emit_status("merging", stream_name)
         merged = merge_transcript_with_diarisation(
@@ -338,14 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--diar-backend",
-        choices=["senko", "sortformer"],
+        choices=["senko"],
         default="senko",
-        help="Diarization backend (default: senko)",
-    )
-    parser.add_argument(
-        "--diar-model",
-        default="default",
-        help="Sortformer diarization model variant (default: default)",
+        help="Diarization backend (default: senko; the Sortformer backend was retired)",
     )
     parser.add_argument(
         "--asr-model",
@@ -417,7 +412,6 @@ def main() -> int:
                         path,
                         stream,
                         diar_backend=args.diar_backend,
-                        diar_model=args.diar_model,
                         asr_model=args.asr_model,
                         language=args.language,
                         gap_threshold=args.gap_threshold,

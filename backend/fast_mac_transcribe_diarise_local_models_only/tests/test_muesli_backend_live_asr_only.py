@@ -6,6 +6,7 @@ import wave
 from pathlib import Path
 
 from diarise_transcribe import muesli_backend as mb
+from diarise_transcribe import senko_diarisation
 from diarise_transcribe.asr import TranscriptResult, Word
 
 
@@ -59,7 +60,7 @@ def test_run_pipeline_live_asr_only_labels_turns_by_stream(tmp_path, monkeypatch
     def _diarizer_should_not_be_called(*args, **kwargs):
         raise AssertionError("diariser must not run in live-asr-only mode")
 
-    monkeypatch.setattr(mb, "SortformerDiarizer", _diarizer_should_not_be_called)
+    monkeypatch.setattr(senko_diarisation, "SenkoDiarizer", _diarizer_should_not_be_called)
 
     wav_path = tmp_path / "chunk.wav"
     _write_silent_wav(wav_path)
@@ -67,7 +68,6 @@ def test_run_pipeline_live_asr_only_labels_turns_by_stream(tmp_path, monkeypatch
     merged = mb.run_pipeline(
         input_path=wav_path,
         diar_backend="senko",  # would normally import senko_diarisation; must be bypassed
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
@@ -93,7 +93,6 @@ def test_run_pipeline_live_asr_only_applies_timestamp_offset(tmp_path, monkeypat
     merged = mb.run_pipeline(
         input_path=wav_path,
         diar_backend="senko",
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
@@ -247,7 +246,6 @@ def test_maybe_process_finalize_is_incremental_in_live_asr_only_mode(tmp_path, m
         emitter=mb.TranscriptEmitter(_NullWriter(), finalize_lag=0.0),
         output_dir=tmp_path,
         diar_backend="senko",
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
@@ -297,7 +295,6 @@ def test_maybe_process_finalize_is_full_reprocess_in_default_mode(tmp_path, monk
         emitter=mb.TranscriptEmitter(_NullWriter(), finalize_lag=0.0),
         output_dir=tmp_path,
         diar_backend="senko",
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
@@ -346,7 +343,6 @@ def test_maybe_process_finalize_in_live_asr_only_skips_live_gates(tmp_path, monk
         emitter=mb.TranscriptEmitter(_NullWriter(), finalize_lag=0.0),
         output_dir=tmp_path,
         diar_backend="senko",
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
@@ -397,7 +393,6 @@ def test_maybe_process_finalize_runs_with_zero_new_bytes_in_live_asr_only(tmp_pa
         emitter=mb.TranscriptEmitter(_NullWriter(), finalize_lag=5.0),
         output_dir=tmp_path,
         diar_backend="senko",
-        diar_model="default",
         asr_model="fake",
         language=None,
         gap_threshold=0.8,
