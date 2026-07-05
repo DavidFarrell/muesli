@@ -103,6 +103,14 @@ actor MicEngine {
         // input node format and is where the 0 Hz / 0 channel failure surfaces.
         let nativeFormat = inputNode.outputFormat(forBus: 0)
         print("[MicEngine] Native format: \(nativeFormat)")
+        // print() output isn't captured in backend.log - log it properly so
+        // the next incident's tap format is visible in the recorded log, not
+        // just stdout.
+        AudioLog.event("engine.tap.format", [
+            "sampleRate": nativeFormat.sampleRate,
+            "channels": nativeFormat.channelCount,
+            "vpio": enableVoiceProcessing
+        ])
 
         guard isUsableInputFormat(
             sampleRate: nativeFormat.sampleRate,

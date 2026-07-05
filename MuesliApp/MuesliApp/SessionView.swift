@@ -40,6 +40,14 @@ struct SessionView: View {
                                         .foregroundStyle(.red)
                                 }
                                 .font(.footnote)
+                            } else if let micAlert = meters.micAlert {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text(micAlert)
+                                        .foregroundStyle(.orange)
+                                }
+                                .font(.footnote)
                             } else if model.transcribeMic && meters.debugMicBuffers == 0 {
                                 HStack(spacing: 4) {
                                     Image(systemName: "exclamationmark.triangle.fill")
