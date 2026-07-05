@@ -387,8 +387,12 @@ struct RefreshFeedbackButton: View {
     var body: some View {
         Button {
             guard state == .idle else { return }
+            // Set synchronously, before spawning the Task - a fast double
+            // click can fire twice before SwiftUI re-renders `.disabled`, and
+            // only a synchronous flip here makes the `guard` above actually
+            // exclude the second click.
+            state = .working
             Task {
-                state = .working
                 await action()
                 state = .done
                 try? await Task.sleep(nanoseconds: 900_000_000)

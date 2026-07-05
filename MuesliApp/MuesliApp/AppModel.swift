@@ -1353,8 +1353,13 @@ final class AppModel: ObservableObject {
             // the start screen (audit A3) - re-enumerating devices alone never
             // touched the preview engine driving the meters, so a dead/stale
             // preview meter had nothing to bring it back except a manual
-            // device pick.
-            if isStartScreenActive, previewMicEngine != nil {
+            // device pick. No `previewMicEngine != nil` gate here on purpose:
+            // the dead-preview case a user actually hits is the engine having
+            // FAILED to start and been nilled (mic_preview_start_failed), and
+            // restartPreviewMicEngineForInputSwitch already handles a nil
+            // engine fine (skips the stop, goes straight to
+            // startHomeLevelPreviewNow, which has its own guards).
+            if isStartScreenActive {
                 enqueueMicLifecycle("refresh-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
             }
             return
@@ -2203,7 +2208,7 @@ final class AppModel: ObservableObject {
             let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
             shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
-            await teardownFailedMeetingStart()
+            await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
     }
 
@@ -2221,7 +2226,11 @@ final class AppModel: ObservableObject {
     /// harmless to run regardless of how far the failed attempt got; this
     /// hard-kills the backend rather than waiting for a graceful exit since
     /// there is no meeting transcript to finalize.
-    private func teardownFailedMeetingStart() async {
+    private func teardownFailedMeetingStart(
+        session: MeetingSession,
+        wasResume: Bool,
+        priorMetadata: MeetingMetadata?
+    ) async {
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         screenshotScheduler.stop()
@@ -2251,8 +2260,49 @@ final class AppModel: ObservableObject {
         closeTranscriptEventsLog()
         stopBackendAccess()
 
+        rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
+
         clearAttachments()
         currentSession = nil
+    }
+
+    /// Undoes whatever createInitialMeetingMetadata/appendResumeSessionMetadata
+    /// wrote to meeting.json before the failure - both run early in the do
+    /// block, well before any of the throwing steps that follow, so by the
+    /// time a start attempt lands in the catch the on-disk status may already
+    /// be the mid-write `.recording` value with nothing to ever flip it back.
+    /// Left alone, that permanently disables Resume and rediarize for the
+    /// folder (both gate on `status == .recording` in MeetingViewer) until
+    /// someone hand-edits the file (2026-07 gate finding). Every write here is
+    /// `try?` and safe to call even when the corresponding metadata write
+    /// never actually happened - idempotent against the "threw before
+    /// touching meeting.json" case.
+    private func rollBackFailedMeetingMetadata(
+        for session: MeetingSession,
+        wasResume: Bool,
+        priorMetadata: MeetingMetadata?
+    ) {
+        if wasResume {
+            // appendResumeSessionMetadata (if it got that far) flipped status
+            // to .recording and appended a new, now-phantom session entry.
+            // Restore exactly what was on disk before this attempt touched
+            // it - the meeting must be exactly as resumable/rediarizable as
+            // it was before Resume was tapped.
+            guard let priorMetadata else { return }
+            try? writeMeetingMetadata(priorMetadata, to: session.folderURL)
+            return
+        }
+        // Fresh start: there was no prior metadata to restore. If
+        // createInitialMeetingMetadata got far enough to write status =
+        // .recording, mark it .completed instead - an empty/failed meeting,
+        // but no longer bricked. If the write never happened, there's
+        // nothing to fix here (buildMeetingHistoryItem's legacy fallback
+        // already defaults a folder with no meeting.json to .completed).
+        guard var metadata = try? readMeetingMetadata(from: session.folderURL) else { return }
+        guard metadata.status == .recording else { return }
+        metadata.status = .completed
+        metadata.updatedAt = Date()
+        try? writeMeetingMetadata(metadata, to: session.folderURL)
     }
 
     func stopMeeting() async {
