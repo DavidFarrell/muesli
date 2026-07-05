@@ -1816,6 +1816,19 @@ final class AppModel: ObservableObject {
         timestampOffset: Double
     ) async {
         guard !isStartingMeeting else { return }
+        // The choke point for BOTH the fresh-start (public startMeeting()) and
+        // resume (resumeMeeting -> here directly) paths. stopMeeting() clears
+        // isCapturing and flips activeScreen back to .start well before its
+        // async finalization finishes (isFinalizing stays true until then),
+        // so the start screen's Resume button can otherwise be tapped mid-stop
+        // - without this guard a fresh engine start could race the still-
+        // draining stop and end up unassigned (see startMeetingMicEngine's
+        // superseded-by-stop check) while this function carries on regardless,
+        // starting the health check/watchdog against a mic that never bound.
+        guard !isFinalizing else {
+            AudioLog.event("start.blocked-finalizing")
+            return
+        }
         isStartingMeeting = true
         defer { isStartingMeeting = false }
         cancelMicStartupHealthCheck()

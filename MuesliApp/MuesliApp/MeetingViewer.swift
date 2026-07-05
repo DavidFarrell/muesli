@@ -237,7 +237,7 @@ struct MeetingViewer: View {
                     Label("Resume", systemImage: "play.fill")
                 }
                 .buttonStyle(.bordered)
-                .disabled(model.isCapturing || meeting.status == .recording)
+                .disabled(model.isCapturing || model.isFinalizing || meeting.status == .recording)
                 .help("Resume this meeting")
 
                 Button {
