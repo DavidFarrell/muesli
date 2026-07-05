@@ -144,9 +144,12 @@ struct NewMeetingView: View {
     @State private var showAllMeetings = false
     @State private var pendingDelete: MeetingHistoryItem?
     @State private var showDeleteConfirm = false
-    @State private var pendingRename: MeetingHistoryItem?
-    @State private var renameTitle = ""
-    @State private var showRenameSheet = false
+    @State private var editingMeetingID: String?
+    @State private var renameFieldText = ""
+    @State private var rowRenameErrorID: String?
+    @State private var rowRenameError: String?
+    @FocusState private var isRenameFieldFocused: Bool
+    @FocusState private var isTitleFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -175,6 +178,7 @@ struct NewMeetingView: View {
                 TextField("YYYY_MM_DD - Meeting n -", text: $model.meetingTitle)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 420)
+                    .focused($isTitleFieldFocused)
                 Spacer()
             }
 
@@ -400,35 +404,60 @@ struct NewMeetingView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 10) {
                             ForEach(visibleMeetings) { item in
-                                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                                    Button {
-                                        model.openMeeting(item)
-                                    } label: {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(item.title)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                        if editingMeetingID == item.id {
+                                            TextField("Meeting title", text: $renameFieldText)
+                                                .textFieldStyle(.roundedBorder)
                                                 .font(.headline)
-                                                .lineLimit(1)
-                                            Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                                                .focused($isRenameFieldFocused)
+                                                .onSubmit {
+                                                    commitRowRename(item)
+                                                }
+                                                .onChange(of: isRenameFieldFocused) { _, focused in
+                                                    guard !focused else { return }
+                                                    commitRowRename(item)
+                                                }
+                                                .onExitCommand {
+                                                    cancelRowRename()
+                                                }
+                                        } else {
+                                            Button {
+                                                model.openMeeting(item)
+                                            } label: {
+                                                Text(item.title)
+                                                    .font(.headline)
+                                                    .lineLimit(1)
+                                            }
+                                            .buttonStyle(.plain)
                                         }
+                                        Spacer()
+                                        Button {
+                                            pendingDelete = item
+                                            showDeleteConfirm = true
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.borderless)
                                     }
-                                    .buttonStyle(.plain)
-                                    Spacer()
-                                    Button {
-                                        pendingDelete = item
-                                        showDeleteConfirm = true
-                                    } label: {
-                                        Image(systemName: "trash")
+                                    Text("\(formatDuration(item.durationSeconds)) • \(item.segmentCount) segments")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if rowRenameErrorID == item.id, let rowRenameError {
+                                        Text(rowRenameError)
+                                            .font(.caption2)
+                                            .foregroundStyle(.red)
                                     }
-                                    .buttonStyle(.borderless)
                                 }
                                 .padding(.vertical, 2)
                                 .contextMenu {
                                     Button("Rename") {
-                                        pendingRename = item
-                                        renameTitle = item.title
-                                        showRenameSheet = true
+                                        renameFieldText = item.title
+                                        rowRenameErrorID = nil
+                                        editingMeetingID = item.id
+                                        DispatchQueue.main.async {
+                                            isRenameFieldFocused = true
+                                        }
                                     }
                                 }
                             }
@@ -469,24 +498,8 @@ struct NewMeetingView: View {
         } message: {
             Text("This will move the meeting folder to the Trash.")
         }
-        .sheet(isPresented: $showRenameSheet) {
-            RenameMeetingSheet(
-                title: $renameTitle,
-                onCancel: {
-                    pendingRename = nil
-                    showRenameSheet = false
-                },
-                onSave: {
-                    if let item = pendingRename {
-                        model.renameMeeting(item, to: renameTitle)
-                    }
-                    pendingRename = nil
-                    showRenameSheet = false
-                }
-            )
-        }
         .onAppear {
-            model.refreshMeetingTitleForDateRollover()
+            refreshTitleRolloverIfSafe()
             Task { await model.startHomeLevelPreview() }
         }
         .onDisappear {
@@ -496,8 +509,33 @@ struct NewMeetingView: View {
             Task { await model.refreshHomeLevelPreview() }
         }
         .onReceive(rolloverTicker) { _ in
-            model.refreshMeetingTitleForDateRollover()
+            refreshTitleRolloverIfSafe()
         }
+    }
+
+    /// The rollover would otherwise rewrite the title field's text out from
+    /// under a mid-typing user every time the 60s ticker fires.
+    private func refreshTitleRolloverIfSafe() {
+        guard !isTitleFieldFocused else { return }
+        model.refreshMeetingTitleForDateRollover()
+    }
+
+    private func commitRowRename(_ item: MeetingHistoryItem) {
+        guard editingMeetingID == item.id else { return }
+        let trimmed = renameFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
+        editingMeetingID = nil
+        guard !trimmed.isEmpty, trimmed != item.title else { return }
+        do {
+            try model.renameMeeting(item, to: trimmed)
+            rowRenameErrorID = nil
+        } catch {
+            rowRenameErrorID = item.id
+            rowRenameError = "Couldn't rename: \(error.localizedDescription)"
+        }
+    }
+
+    private func cancelRowRename() {
+        editingMeetingID = nil
     }
 
     private var maxVisibleMeetings: Int { 8 }
@@ -521,33 +559,6 @@ struct NewMeetingView: View {
             return String(format: "%dm %ds", mins, secs)
         }
         return "\(secs)s"
-    }
-}
-
-// MARK: - Rename Meeting Sheet
-
-struct RenameMeetingSheet: View {
-    @Binding var title: String
-    let onCancel: () -> Void
-    let onSave: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Rename meeting")
-                .font(.headline)
-
-            TextField("Title", text: $title)
-                .textFieldStyle(.roundedBorder)
-
-            HStack {
-                Spacer()
-                Button("Cancel") { onCancel() }
-                Button("Save") { onSave() }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(16)
-        .frame(width: 420)
     }
 }
 
