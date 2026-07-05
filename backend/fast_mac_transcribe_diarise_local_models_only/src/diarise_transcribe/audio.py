@@ -7,6 +7,7 @@ Converts any audio input to 16kHz mono WAV for both ASR and diarisation.
 import os
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -109,6 +110,45 @@ def normalise_audio(
         )
 
     return str(output_path)
+
+
+def slice_wav_to_temp(input_path: str, start: float, end: float) -> str:
+    """
+    Slice a 16kHz mono PCM WAV file to [start, end) seconds and write the
+    slice to a new temp WAV file.
+
+    Args:
+        input_path: Path to a 16kHz mono WAV file (as produced by
+            normalise_audio / checked by is_wav_16k_mono).
+        start: Slice start in seconds, clamped to the file bounds.
+        end: Slice end in seconds, clamped to the file bounds.
+
+    Returns:
+        Path to the temp WAV file containing the slice. Caller owns
+        cleanup (the file is not tracked/deleted automatically).
+    """
+    with wave.open(input_path, "rb") as src:
+        framerate = src.getframerate()
+        n_frames = src.getnframes()
+        sample_width = src.getsampwidth()
+        n_channels = src.getnchannels()
+
+        start_frame = max(0, min(n_frames, int(round(start * framerate))))
+        end_frame = max(start_frame, min(n_frames, int(round(end * framerate))))
+
+        src.setpos(start_frame)
+        frame_data = src.readframes(end_frame - start_frame)
+
+    fd, output_path = tempfile.mkstemp(suffix=".wav", prefix="recovery_slice_")
+    os.close(fd)
+
+    with wave.open(output_path, "wb") as dst:
+        dst.setnchannels(n_channels)
+        dst.setsampwidth(sample_width)
+        dst.setframerate(framerate)
+        dst.writeframes(frame_data)
+
+    return output_path
 
 
 def load_audio(path: str) -> Tuple[np.ndarray, int]:

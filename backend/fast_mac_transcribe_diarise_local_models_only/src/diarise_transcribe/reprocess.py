@@ -10,13 +10,20 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg
-from .asr import ASRModel, DEFAULT_MODEL
+from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
+from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
 from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import SortformerDiarizer
+from .diarisation import DiarSegment, SortformerDiarizer
 from .merge import merge_transcript_with_diarisation
+from .recovery import (
+    cluster_recovery_windows,
+    filter_words_in_window,
+    find_wordless_segments,
+    offset_words,
+    splice_words,
+)
 from .senko_diarisation import SenkoDiarizer
 
 
@@ -30,10 +37,11 @@ def emit(obj: dict) -> None:
     print(json.dumps(obj), flush=True)
 
 
-def emit_status(stage: str, stream: Optional[str] = None) -> None:
+def emit_status(stage: str, stream: Optional[str] = None, **extra) -> None:
     payload = {"type": "status", "stage": stage}
     if stream:
         payload["stream"] = stream
+    payload.update(extra)
     emit(payload)
 
 
@@ -117,6 +125,69 @@ def _discover_session_audio_dirs(meeting_dir: Path, verbose: bool) -> list[Path]
     return fallback_dirs
 
 
+def _run_recovery_pass(
+    asr: ASRModel,
+    wav_path: str,
+    transcript: TranscriptResult,
+    segments: List[DiarSegment],
+    language: Optional[str],
+    file_duration: float,
+    log,
+    stream_name: str,
+) -> tuple[TranscriptResult, int]:
+    """
+    Detect diarised segments the main ASR pass produced little or no text
+    for, re-run ASR on just those spans (reusing `asr`'s cached model), and
+    splice any recovered words back into the transcript.
+
+    Runs a single recovery round: if a window still comes back empty, that
+    gap is logged and left as-is rather than retried, so we can't loop on a
+    span the model genuinely can't transcribe.
+    """
+    wordless = find_wordless_segments(segments, transcript.words)
+    if not wordless:
+        log("Recovery pass: no wordless segments detected.")
+        emit_status("recovering", stream_name, windows=0)
+        return transcript, 0
+
+    windows = cluster_recovery_windows(wordless, file_duration=file_duration)
+    window_spans = ", ".join(f"[{w.start:.2f}-{w.end:.2f}]" for w in windows)
+    log(
+        f"Recovery pass: {len(wordless)} wordless segment(s) clustered into "
+        f"{len(windows)} window(s): {window_spans}"
+    )
+    emit_status("recovering", stream_name, windows=len(windows), spans=window_spans)
+
+    recovered_words: List[Word] = []
+    for window in windows:
+        slice_path = slice_wav_to_temp(wav_path, window.start, window.end)
+        try:
+            slice_transcript = asr.transcribe(slice_path, language=language)
+        finally:
+            Path(slice_path).unlink(missing_ok=True)
+
+        shifted = offset_words(slice_transcript.words, window.start)
+        kept = filter_words_in_window(shifted, window)
+        if kept:
+            log(
+                f"Recovery window [{window.gap_start:.2f}-{window.gap_end:.2f}]: "
+                f"recovered {len(kept)} word(s)"
+            )
+        else:
+            log(
+                f"Recovery window [{window.gap_start:.2f}-{window.gap_end:.2f}]: "
+                "still empty after recovery attempt"
+            )
+        recovered_words.extend(kept)
+
+    if not recovered_words:
+        return transcript, 0
+
+    augmented_words = splice_words(transcript.words, recovered_words)
+    augmented_transcript = TranscriptResult(text=transcript.text, words=augmented_words)
+    return augmented_transcript, len(recovered_words)
+
+
 def reprocess_stream(
     audio_path: Path,
     stream_name: str,
@@ -127,6 +198,7 @@ def reprocess_stream(
     gap_threshold: float,
     speaker_tolerance: float,
     verbose: bool,
+    recovery: bool = True,
 ) -> dict:
     def log(msg: str) -> None:
         if verbose:
@@ -167,6 +239,28 @@ def reprocess_stream(
             gap_threshold=gap_threshold,
             speaker_tolerance=speaker_tolerance,
         )
+
+        if recovery:
+            file_duration = get_audio_duration(temp_wav)
+            augmented_transcript, recovered_count = _run_recovery_pass(
+                asr,
+                temp_wav,
+                transcript,
+                segments,
+                language,
+                file_duration,
+                log,
+                stream_name,
+            )
+            if recovered_count:
+                log(f"Recovery pass added {recovered_count} word(s); re-merging...")
+                transcript = augmented_transcript
+                merged = merge_transcript_with_diarisation(
+                    transcript,
+                    segments,
+                    gap_threshold=gap_threshold,
+                    speaker_tolerance=speaker_tolerance,
+                )
 
         turns = []
         speakers = set()
@@ -252,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Verbose output (stderr)",
     )
+    parser.add_argument(
+        "--no-recovery",
+        action="store_true",
+        help="Disable the ASR recovery pass for voiced-but-wordless diar segments",
+    )
     return parser
 
 
@@ -296,6 +395,7 @@ def main() -> int:
                         gap_threshold=args.gap_threshold,
                         speaker_tolerance=args.speaker_tolerance,
                         verbose=args.verbose,
+                        recovery=not args.no_recovery,
                     )
                 except Exception as error:
                     message = f"{stream} reprocess failed ({format_exception_message(error)})"
