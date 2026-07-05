@@ -189,10 +189,11 @@ struct NewMeetingView: View {
 
                 Spacer()
 
-                Button(model.isLoadingShareableContent ? "Loading..." : "Refresh sources") {
+                Button(model.isLoadingShareableContent ? "Loading..." : "Refresh capture sources") {
                     Task { await model.loadShareableContent() }
                 }
                 .disabled(model.isLoadingShareableContent || model.isStartingMeeting)
+                .help("Re-scan the displays and windows available to capture.")
             }
 
             HStack(spacing: 16) {
@@ -281,20 +282,11 @@ struct NewMeetingView: View {
                         }
                     }
 
-                    Button("Refresh devices") {
-                        model.refreshMicrophones()
-                    }
-                    .buttonStyle(.link)
-                    .disabled(model.isSwitchingInputDevice)
-
-                    if model.isSwitchingInputDevice {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Switching microphone...")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
+                    RefreshFeedbackButton(
+                        title: "Refresh audio devices",
+                        help: "Re-scan input/output devices and restart the live level preview if it has gone quiet."
+                    ) {
+                        await model.refreshMicrophonesAwaitingCompletion()
                     }
 
                     Text("Muesli follows your Mac's default input and output. Pick a specific device to pin it - it sticks through Bluetooth changes until you change it again or choose System default.")
