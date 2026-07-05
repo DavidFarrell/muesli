@@ -26,11 +26,13 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AECMode.swift,
+				DurationFormatting.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,
 				MicAudioFormat.swift,
 				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
+				TempTranscriptCleanup.swift,
 				TranscriptModel.swift,
 			);
 			target = AA0000010000000000000005 /* MuesliAppTests */;
