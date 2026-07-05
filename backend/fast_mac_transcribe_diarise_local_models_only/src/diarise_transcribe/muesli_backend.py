@@ -21,7 +21,7 @@ from typing import BinaryIO, List, Optional
 from .audio import check_ffmpeg, normalise_audio, is_wav_16k_mono
 from .asr import ASRModel, DEFAULT_MODEL
 from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import SortformerDiarizer, MODEL_CONFIGS, DiarSegment
+from .diarisation import DiarSegment
 from .merge import merge_transcript_with_diarisation
 
 MSG_AUDIO = 1
@@ -273,7 +273,6 @@ def _synthetic_stream_segments(
 def run_pipeline(
     input_path: Path,
     diar_backend: str,
-    diar_model: str,
     asr_model: str,
     language: Optional[str],
     gap_threshold: float,
@@ -312,9 +311,10 @@ def run_pipeline(
             diarizer = SenkoDiarizer(quiet=not verbose)
             segments = diarizer.diarise(temp_wav)
         else:
-            log(f"Running diarisation with Sortformer {diar_model}...", verbose)
-            diarizer = SortformerDiarizer(model_name=diar_model)
-            segments = diarizer.diarise(temp_wav)
+            raise ValueError(
+                f"Unknown diar_backend {diar_backend!r}: only 'senko' is supported "
+                "(the Sortformer backend was retired)."
+            )
         # Diariser segments are in chunk-local time and need shifting into
         # meeting time. Synthetic live-asr-only segments are built from the
         # ALREADY-shifted words above - shifting them again would double the
@@ -425,7 +425,6 @@ class LiveProcessor:
         emitter: TranscriptEmitter,
         output_dir: Path,
         diar_backend: str,
-        diar_model: str,
         asr_model: str,
         language: Optional[str],
         gap_threshold: float,
@@ -440,7 +439,6 @@ class LiveProcessor:
         self._emitter = emitter
         self._output_dir = output_dir
         self._diar_backend = diar_backend
-        self._diar_model = diar_model
         self._asr_model = asr_model
         self._language = language
         self._gap_threshold = gap_threshold
@@ -549,7 +547,6 @@ class LiveProcessor:
                 merged = run_pipeline(
                     input_path=temp_wav,
                     diar_backend=self._diar_backend,
-                    diar_model=self._diar_model,
                     asr_model=self._asr_model,
                     language=self._language,
                     gap_threshold=self._gap_threshold,
@@ -624,15 +621,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--diar-backend",
-        choices=["senko", "sortformer"],
+        choices=["senko"],
         default="senko",
-        help="Diarisation backend (default: senko)",
-    )
-    parser.add_argument(
-        "--diar-model",
-        choices=list(MODEL_CONFIGS.keys()),
-        default="default",
-        help="Sortformer model variant (default: %(default)s)",
+        help="Diarisation backend (default: senko; the Sortformer backend was retired)",
     )
     parser.add_argument(
         "--asr-model",
@@ -733,7 +724,6 @@ def main() -> int:
                 emitter=emitter,
                 output_dir=output_dir,
                 diar_backend=args.diar_backend,
-                diar_model=args.diar_model,
                 asr_model=args.asr_model,
                 language=args.language,
                 gap_threshold=args.gap_threshold,
@@ -878,7 +868,6 @@ def main() -> int:
                     merged = run_pipeline(
                         input_path=temp_wav,
                         diar_backend=args.diar_backend,
-                        diar_model=args.diar_model,
                         asr_model=args.asr_model,
                         language=args.language,
                         gap_threshold=args.gap_threshold,

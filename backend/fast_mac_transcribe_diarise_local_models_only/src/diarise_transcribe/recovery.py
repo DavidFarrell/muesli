@@ -2,7 +2,7 @@
 ASR recovery pass for the batch reprocess pipeline.
 
 Parakeet occasionally suffers a decoder collapse over a real speech span and
-silently returns zero words for it, even though diarisation (Senko/Sortformer)
+silently returns zero words for it, even though diarisation (Senko)
 correctly detects a speaker there. Because the merge step only ever assigns
 speakers to existing words, that speaker's turn vanishes from the output with
 no error - silent data loss.

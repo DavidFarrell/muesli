@@ -15,7 +15,6 @@ from typing import Optional
 from .audio import normalise_audio, check_ffmpeg, get_audio_duration
 from .asr import ASRModel, DEFAULT_MODEL
 from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import SortformerDiarizer, MODEL_CONFIGS, DiarSegment
 from .merge import (
     merge_transcript_with_diarisation,
     format_text_output,
@@ -42,9 +41,6 @@ Examples:
         --out-srt transcript.srt \\
         --out-rttm diarisation.rttm
 
-    # Use NVIDIA High quality diarisation model
-    python -m diarise_transcribe --in audio.wav --out transcript.txt \\
-        --diar-model nvidia_high
         """,
     )
 
@@ -81,16 +77,10 @@ Examples:
     # Model options
     parser.add_argument(
         "--diar-backend",
-        choices=["senko", "sortformer"],
+        choices=["senko"],
         default="senko",
-        help="Diarisation backend: 'senko' (CoreML pyannote+CAM++, recommended) or "
-             "'sortformer' (CoreML Sortformer) (default: senko)",
-    )
-    parser.add_argument(
-        "--diar-model",
-        choices=list(MODEL_CONFIGS.keys()),
-        default="default",
-        help="Diarisation model variant for Sortformer backend (default: %(default)s)",
+        help="Diarisation backend: 'senko' (CoreML pyannote+CAM++) "
+             "(default: senko; the Sortformer backend was retired)",
     )
     parser.add_argument(
         "--asr-model",
@@ -110,8 +100,8 @@ Examples:
         "--num-speakers",
         type=int,
         default=None,
-        help="Expected number of speakers (Sortformer is fixed at 4 speakers, "
-             "this option filters output to top N speakers by activity)",
+        help="Expected number of speakers "
+             "(filters output to top N speakers by activity)",
     )
 
     # Merge options
@@ -150,7 +140,6 @@ def run_pipeline(
     output_srt: Optional[str] = None,
     output_rttm: Optional[str] = None,
     diar_backend: str = "senko",
-    diar_model: str = "default",
     asr_model: str = DEFAULT_MODEL,
     language: Optional[str] = None,
     num_speakers: Optional[int] = None,
@@ -168,8 +157,7 @@ def run_pipeline(
         output_json: Path for JSON output
         output_srt: Path for SRT output
         output_rttm: Path for RTTM output
-        diar_backend: Diarisation backend ('sortformer' or 'senko')
-        diar_model: Diarisation model variant (for Sortformer)
+        diar_backend: Diarisation backend (only 'senko' is supported)
         asr_model: ASR model ID
         language: Language code
         num_speakers: Expected number of speakers
@@ -222,9 +210,10 @@ def run_pipeline(
             diarizer = SenkoDiarizer(quiet=not verbose)
             segments = diarizer.diarise(temp_wav)
         else:
-            print(f"\n[3/4] Running diarisation with Sortformer {diar_model} model...")
-            diarizer = SortformerDiarizer(model_name=diar_model)
-            segments = diarizer.diarise(temp_wav)
+            raise ValueError(
+                f"Unknown diar_backend {diar_backend!r}: only 'senko' is supported "
+                "(the Sortformer backend was retired)."
+            )
         print(f"  Found {len(segments)} speaker segments")
 
         # Filter to top N speakers if requested
@@ -305,7 +294,6 @@ def main():
             output_srt=args.output_srt,
             output_rttm=args.output_rttm,
             diar_backend=args.diar_backend,
-            diar_model=args.diar_model,
             asr_model=args.asr_model,
             language=args.language,
             num_speakers=args.num_speakers,

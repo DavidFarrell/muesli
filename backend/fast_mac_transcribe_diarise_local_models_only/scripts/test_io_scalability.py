@@ -97,8 +97,8 @@ def test_timestamp_offset():
             )
 
     class DummyDiarizer:
-        def __init__(self, model_name=None, quiet=True):
-            self.model_name = model_name
+        def __init__(self, quiet=True):
+            pass
 
         def diarise(self, audio_path):
             return [DiarSegment(start=0.5, end=1.5, speaker="SPEAKER_00")]
@@ -112,26 +112,27 @@ def test_timestamp_offset():
     def dummy_merge(transcript, segments, gap_threshold, speaker_tolerance):
         return DummyMerged(transcript, segments)
 
+    senko_stub = types.ModuleType("diarise_transcribe.senko_diarisation")
+    senko_stub.SenkoDiarizer = DummyDiarizer
+    sys.modules["diarise_transcribe.senko_diarisation"] = senko_stub
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         wav_path = tmp_path / "audio.wav"
         write_wav(wav_path, [0, 0, 0, 0])
 
         original_asr = mb.ASRModel
-        original_sortformer = mb.SortformerDiarizer
         original_merge = mb.merge_transcript_with_diarisation
         original_is_wav = mb.is_wav_16k_mono
 
         try:
             mb.ASRModel = DummyASR
-            mb.SortformerDiarizer = DummyDiarizer
             mb.merge_transcript_with_diarisation = dummy_merge
             mb.is_wav_16k_mono = lambda _: True
 
             merged = mb.run_pipeline(
                 input_path=wav_path,
-                diar_backend="sortformer",
-                diar_model="dummy",
+                diar_backend="senko",
                 asr_model="dummy",
                 language=None,
                 gap_threshold=0.5,
@@ -146,7 +147,6 @@ def test_timestamp_offset():
             assert merged.segments[0].end == 11.5
         finally:
             mb.ASRModel = original_asr
-            mb.SortformerDiarizer = original_sortformer
             mb.merge_transcript_with_diarisation = original_merge
             mb.is_wav_16k_mono = original_is_wav
 
