@@ -147,3 +147,24 @@ def splice_words(original: List[Word], recovered: List[Word]) -> List[Word]:
     combined = list(original) + list(recovered)
     combined.sort(key=lambda w: w.start)
     return combined
+
+
+def drop_words_in_windows(words: List[Word], windows: List[RecoveryWindow]) -> List[Word]:
+    """
+    Remove original words whose midpoint falls inside any of the given
+    windows' un-padded [gap_start, gap_end) span.
+
+    Call this before splice_words for windows that actually recovered
+    replacement words - a partial-coverage segment's few original words
+    (e.g. a stray "um") would otherwise survive alongside the recovered
+    words and appear twice in the merged turn text. Windows that recovered
+    nothing should not be passed in here, so their originals are untouched.
+    """
+    if not windows:
+        return list(words)
+
+    def in_any_gap(word: Word) -> bool:
+        midpoint = (word.start + word.end) / 2
+        return any(window.gap_start <= midpoint < window.gap_end for window in windows)
+
+    return [word for word in words if not in_any_gap(word)]

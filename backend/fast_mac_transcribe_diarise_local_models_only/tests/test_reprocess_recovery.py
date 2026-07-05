@@ -15,7 +15,12 @@ SLICE_WAV = "SLICE.wav"
 
 
 class FakeASRModel:
-    """Stands in for asr.ASRModel: no real model load, scripted transcripts per path."""
+    """
+    Stands in for asr.ASRModel: no real model load, scripted transcripts (or
+    exceptions) per path. If the scripted value for a path is an Exception
+    instance, transcribe() raises it instead of returning - used to test
+    that a single window's ASR failure doesn't take down the whole stream.
+    """
 
     def __init__(self, model_id: str, transcripts_by_path: dict) -> None:
         self.model_id = model_id
@@ -24,7 +29,10 @@ class FakeASRModel:
 
     def transcribe(self, path: str, language=None) -> TranscriptResult:
         self.calls.append(path)
-        return self._transcripts_by_path[path]
+        value = self._transcripts_by_path[path]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 class FakeDiarizer:
@@ -35,7 +43,11 @@ class FakeDiarizer:
         return self._segments
 
 
-def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.0):
+def _default_slice_fn(wav_path, start, end):
+    return SLICE_WAV
+
+
+def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.0, slice_fn=None):
     fake_asr = FakeASRModel(reprocess.DEFAULT_MODEL, transcripts_by_path)
 
     monkeypatch.setattr(reprocess, "is_wav_16k_mono", lambda path: True)
@@ -49,7 +61,7 @@ def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.
     monkeypatch.setattr(
         reprocess,
         "slice_wav_to_temp",
-        lambda wav_path, start, end: SLICE_WAV,
+        slice_fn or _default_slice_fn,
     )
     return fake_asr
 
@@ -189,3 +201,167 @@ def test_recovery_still_empty_after_attempt_leaves_transcript_unchanged(
     assert fake_asr.calls == [str(audio_path), SLICE_WAV]
     speaker_ids = {turn["speaker_id"] for turn in result["turns"]}
     assert "system:SPEAKER_01" not in speaker_ids
+
+
+def test_recovery_isolates_a_failing_window_and_still_recovers_the_others(
+    monkeypatch, tmp_path
+) -> None:
+    """
+    Gate fix (BLOCKING): a slice/ASR failure on one recovery window must not
+    take down the stream, and must not stop other windows from being tried.
+    """
+    audio_path = tmp_path / "MAIN.wav"
+    segments = [
+        DiarSegment(start=0.0, end=3.0, speaker="SPEAKER_00"),
+        DiarSegment(start=20.0, end=25.0, speaker="SPEAKER_03"),  # window A - will fail
+        DiarSegment(start=50.0, end=55.0, speaker="SPEAKER_04"),  # window B - recovers fine
+        DiarSegment(start=90.0, end=93.0, speaker="SPEAKER_01"),
+    ]
+    main_transcript = TranscriptResult(
+        text="hello there general kenobi",
+        words=[
+            Word(text="hello", start=0.0, end=1.0),
+            Word(text="there", start=1.2, end=2.0),
+            Word(text="general", start=90.0, end=90.8),
+            Word(text="kenobi", start=91.0, end=91.8),
+        ],
+    )
+    # Window A is padded to start at 19.0, window B at 49.0 - use that to
+    # give each window a distinguishable fake slice path.
+    slice_path_a = "SLICE_A_19.0.wav"
+    slice_path_b = "SLICE_B_49.0.wav"
+
+    def fake_slice(wav_path, start, end):
+        return slice_path_a if abs(start - 19.0) < 0.01 else slice_path_b
+
+    recovered_transcript_b = TranscriptResult(
+        text="found it",
+        words=[
+            Word(text="found", start=1.5, end=2.0),  # slice-relative -> absolute 50.5-51.0
+            Word(text="it", start=2.1, end=2.4),  # absolute 51.1-51.4
+        ],
+    )
+
+    fake_asr = _patch_common(
+        monkeypatch,
+        segments,
+        {
+            str(audio_path): main_transcript,
+            slice_path_a: RuntimeError("simulated zero-frame slice failure"),
+            slice_path_b: recovered_transcript_b,
+        },
+        slice_fn=fake_slice,
+    )
+
+    # Must not raise - a window failure is swallowed, not propagated.
+    result = _run(audio_path, recovery=True)
+
+    # Both windows were attempted despite A raising.
+    assert fake_asr.calls == [str(audio_path), slice_path_a, slice_path_b]
+
+    speaker_ids = {turn["speaker_id"] for turn in result["turns"]}
+    # A's speaker never got words (recovery failed) - correctly still absent.
+    assert "system:SPEAKER_03" not in speaker_ids
+    # B's speaker was recovered despite A's failure.
+    assert "system:SPEAKER_04" in speaker_ids
+    # The main transcript's untouched speakers are still present.
+    assert "system:SPEAKER_00" in speaker_ids
+    assert "system:SPEAKER_01" in speaker_ids
+
+    recovered_turn = next(t for t in result["turns"] if t["speaker_id"] == "system:SPEAKER_04")
+    assert "found" in recovered_turn["text"]
+    assert "it" in recovered_turn["text"]
+
+
+def test_recovery_replaces_partial_coverage_words_without_duplicating(
+    monkeypatch, tmp_path
+) -> None:
+    """
+    Gate fix (ADVISORY): a segment with partial (<10%) coverage has its
+    few original words REPLACED by the recovered words, not duplicated
+    alongside them.
+    """
+    audio_path = tmp_path / "MAIN.wav"
+    segments = [DiarSegment(start=0.0, end=10.0, speaker="SPEAKER_00")]
+    # "um" covers 0.3s of a 10s segment (3%) - below the 10% coverage bar,
+    # so the whole segment is flagged for recovery despite having a word.
+    main_transcript = TranscriptResult(
+        text="um",
+        words=[Word(text="um", start=0.0, end=0.3)],
+    )
+    # Window is padded to [0.0, 11.0] (clamped at 0); slice-relative == the
+    # same absolute values here since the window starts at 0.
+    slice_transcript = TranscriptResult(
+        text="right now we are on the build screen",
+        words=[
+            Word(text="right", start=1.0, end=1.5),
+            Word(text="now", start=1.6, end=1.9),
+            Word(text="we", start=2.0, end=2.2),
+            Word(text="are", start=2.3, end=2.5),
+        ],
+    )
+    fake_asr = _patch_common(
+        monkeypatch,
+        segments,
+        {str(audio_path): main_transcript, SLICE_WAV: slice_transcript},
+    )
+
+    result = _run(audio_path, recovery=True)
+
+    assert fake_asr.calls == [str(audio_path), SLICE_WAV]
+    assert len(result["turns"]) == 1
+    turn = result["turns"][0]
+    assert "um" not in turn["text"].split()
+    assert "right" in turn["text"]
+    assert "are" in turn["text"]
+
+
+def test_recovery_leaves_partial_words_in_place_when_that_window_recovers_nothing(
+    monkeypatch, tmp_path
+) -> None:
+    """
+    Gate fix (ADVISORY, negative case): if a partial-coverage window's
+    recovery attempt comes back empty, its original words must survive
+    untouched - only windows that actually recovered replacement words get
+    their originals dropped.
+    """
+    audio_path = tmp_path / "MAIN.wav"
+    segments = [
+        DiarSegment(start=0.0, end=10.0, speaker="SPEAKER_00"),  # partial coverage, recovers nothing
+        DiarSegment(start=50.0, end=55.0, speaker="SPEAKER_01"),  # zero coverage, recovers fine
+    ]
+    main_transcript = TranscriptResult(
+        text="um",
+        words=[Word(text="um", start=0.0, end=0.3)],
+    )
+    slice_path_x = "SLICE_X_0.0.wav"
+    slice_path_y = "SLICE_Y_49.0.wav"
+
+    def fake_slice(wav_path, start, end):
+        return slice_path_x if abs(start - 0.0) < 0.01 else slice_path_y
+
+    recovered_transcript_y = TranscriptResult(
+        text="found it",
+        words=[Word(text="found", start=1.5, end=2.0), Word(text="it", start=2.1, end=2.4)],
+    )
+
+    fake_asr = _patch_common(
+        monkeypatch,
+        segments,
+        {
+            str(audio_path): main_transcript,
+            slice_path_x: TranscriptResult(text="", words=[]),  # still empty
+            slice_path_y: recovered_transcript_y,
+        },
+        slice_fn=fake_slice,
+    )
+
+    result = _run(audio_path, recovery=True)
+
+    assert fake_asr.calls == [str(audio_path), slice_path_x, slice_path_y]
+
+    speaker_00_turn = next(t for t in result["turns"] if t["speaker_id"] == "system:SPEAKER_00")
+    assert "um" in speaker_00_turn["text"].split()
+
+    speaker_01_turn = next(t for t in result["turns"] if t["speaker_id"] == "system:SPEAKER_01")
+    assert "found" in speaker_01_turn["text"]

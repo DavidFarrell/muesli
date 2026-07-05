@@ -173,3 +173,37 @@ def test_splice_words_inserts_recovered_words_in_time_order() -> None:
     result = recovery.splice_words(original, recovered)
 
     assert [w.text for w in result] == ["a", "b", "c", "d"]
+
+
+# --- drop_words_in_windows ---
+
+
+def test_drop_words_in_windows_removes_words_inside_a_recovered_gap() -> None:
+    window = recovery.RecoveryWindow(start=9.0, end=16.0, gap_start=10.0, gap_end=15.0)
+    words = [
+        _word("before", 0.0, 1.0),
+        _word("um", 12.0, 12.3),  # midpoint 12.15, inside the gap -> dropped
+        _word("after", 20.0, 21.0),
+    ]
+
+    result = recovery.drop_words_in_windows(words, [window])
+
+    assert [w.text for w in result] == ["before", "after"]
+
+
+def test_drop_words_in_windows_ignores_words_outside_any_window() -> None:
+    window = recovery.RecoveryWindow(start=9.0, end=16.0, gap_start=10.0, gap_end=15.0)
+    words = [_word("before", 0.0, 1.0), _word("after", 20.0, 21.0)]
+
+    result = recovery.drop_words_in_windows(words, [window])
+
+    assert result == words
+
+
+def test_drop_words_in_windows_empty_windows_list_is_noop() -> None:
+    words = [_word("a", 0.0, 1.0)]
+
+    result = recovery.drop_words_in_windows(words, [])
+
+    assert result == words
+    assert result is not words  # returns a copy, not the same list object

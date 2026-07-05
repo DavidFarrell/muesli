@@ -18,7 +18,9 @@ from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_
 from .diarisation import DiarSegment, SortformerDiarizer
 from .merge import merge_transcript_with_diarisation
 from .recovery import (
+    RecoveryWindow,
     cluster_recovery_windows,
+    drop_words_in_windows,
     filter_words_in_window,
     find_wordless_segments,
     offset_words,
@@ -143,6 +145,11 @@ def _run_recovery_pass(
     Runs a single recovery round: if a window still comes back empty, that
     gap is logged and left as-is rather than retried, so we can't loop on a
     span the model genuinely can't transcribe.
+
+    Recovery is best-effort: each window is isolated in its own try/except,
+    so a slicing or ASR failure on one window (e.g. a zero-frame slice from
+    a clamped-empty range) is logged and skipped rather than losing the
+    other windows' recoveries or the already-good main transcript.
     """
     wordless = find_wordless_segments(segments, transcript.words)
     if not wordless:
@@ -159,20 +166,30 @@ def _run_recovery_pass(
     emit_status("recovering", stream_name, windows=len(windows), spans=window_spans)
 
     recovered_words: List[Word] = []
+    windows_with_recovered_words: List[RecoveryWindow] = []
     for window in windows:
-        slice_path = slice_wav_to_temp(wav_path, window.start, window.end)
         try:
-            slice_transcript = asr.transcribe(slice_path, language=language)
-        finally:
-            Path(slice_path).unlink(missing_ok=True)
+            slice_path = slice_wav_to_temp(wav_path, window.start, window.end)
+            try:
+                slice_transcript = asr.transcribe(slice_path, language=language)
+            finally:
+                Path(slice_path).unlink(missing_ok=True)
 
-        shifted = offset_words(slice_transcript.words, window.start)
-        kept = filter_words_in_window(shifted, window)
+            shifted = offset_words(slice_transcript.words, window.start)
+            kept = filter_words_in_window(shifted, window)
+        except Exception as error:
+            log(
+                f"Recovery window [{window.gap_start:.2f}-{window.gap_end:.2f}]: "
+                f"failed ({format_exception_message(error)}); skipping this window"
+            )
+            continue
+
         if kept:
             log(
                 f"Recovery window [{window.gap_start:.2f}-{window.gap_end:.2f}]: "
                 f"recovered {len(kept)} word(s)"
             )
+            windows_with_recovered_words.append(window)
         else:
             log(
                 f"Recovery window [{window.gap_start:.2f}-{window.gap_end:.2f}]: "
@@ -183,7 +200,12 @@ def _run_recovery_pass(
     if not recovered_words:
         return transcript, 0
 
-    augmented_words = splice_words(transcript.words, recovered_words)
+    # Drop original words inside windows that actually recovered replacement
+    # words, so partial-coverage segments don't end up with their few
+    # original words duplicated alongside the recovered ones. Windows that
+    # recovered nothing are excluded, so their originals are untouched.
+    surviving_words = drop_words_in_windows(transcript.words, windows_with_recovered_words)
+    augmented_words = splice_words(surviving_words, recovered_words)
     augmented_transcript = TranscriptResult(text=transcript.text, words=augmented_words)
     return augmented_transcript, len(recovered_words)
 
@@ -241,17 +263,23 @@ def reprocess_stream(
         )
 
         if recovery:
-            file_duration = get_audio_duration(temp_wav)
-            augmented_transcript, recovered_count = _run_recovery_pass(
-                asr,
-                temp_wav,
-                transcript,
-                segments,
-                language,
-                file_duration,
-                log,
-                stream_name,
-            )
+            try:
+                file_duration = get_audio_duration(temp_wav)
+                augmented_transcript, recovered_count = _run_recovery_pass(
+                    asr,
+                    temp_wav,
+                    transcript,
+                    segments,
+                    language,
+                    file_duration,
+                    log,
+                    stream_name,
+                )
+            except Exception as error:
+                # Recovery is best-effort on top of an already-good merged
+                # result - a bug here must never fail the whole stream.
+                log(f"Recovery pass failed entirely ({format_exception_message(error)}); keeping main transcript")
+                augmented_transcript, recovered_count = transcript, 0
             if recovered_count:
                 log(f"Recovery pass added {recovered_count} word(s); re-merging...")
                 transcript = augmented_transcript
