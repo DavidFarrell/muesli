@@ -12,9 +12,7 @@ struct SessionView: View {
     @State private var showDebug = false
     @State private var copyIconName = "doc.on.clipboard"
     @State private var isEditingTitle = false
-    @State private var pendingTitle = ""
     @FocusState private var isViewFocused: Bool
-    @FocusState private var isTitleFieldFocused: Bool
     private let timeFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "HH:mm:ss"
@@ -181,12 +179,7 @@ struct SessionView: View {
         .focusable()
         .focused($isViewFocused)
         .onAppear {
-            pendingTitle = model.currentSession?.title ?? ""
             isViewFocused = true
-        }
-        .onChange(of: model.currentSession?.title) { _, newValue in
-            guard !isEditingTitle else { return }
-            pendingTitle = newValue ?? ""
         }
         .onKeyPress(keys: [.init("v")], phases: .down) { keyPress in
             guard !isEditingTitle else { return .ignored }
@@ -217,27 +210,17 @@ struct SessionView: View {
     private var header: some View {
         HStack {
             VStack(alignment: .leading) {
-                if isEditingTitle {
-                    TextField("Meeting title", text: $pendingTitle)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.title2.weight(.bold))
-                        .focused($isTitleFieldFocused)
-                        .onSubmit {
-                            commitTitleEdit()
-                        }
-                        .onChange(of: isTitleFieldFocused) { _, focused in
-                            guard !focused else { return }
-                            commitTitleEdit()
-                        }
-                        .onExitCommand {
-                            cancelTitleEdit()
-                        }
-                } else {
-                    Text(model.currentSession?.title ?? "Meeting")
-                        .font(.title2).bold()
-                        .onTapGesture {
-                            startTitleEdit()
-                        }
+                InlineEditableTitle(
+                    title: model.currentSession?.title ?? "Meeting",
+                    font: .title2.bold(),
+                    isEditing: $isEditingTitle
+                ) { newTitle in
+                    do {
+                        try model.renameCurrentMeeting(to: newTitle)
+                        return nil
+                    } catch {
+                        return "Couldn't rename: \(error.localizedDescription)"
+                    }
                 }
                 if let folder = model.currentSession?.folderURL.path {
                     Text(folder)
@@ -248,33 +231,10 @@ struct SessionView: View {
             }
             Spacer()
         }
-    }
-
-    private func startTitleEdit() {
-        pendingTitle = model.currentSession?.title ?? ""
-        isEditingTitle = true
-        DispatchQueue.main.async {
-            isTitleFieldFocused = true
+        .onChange(of: isEditingTitle) { _, editing in
+            guard !editing else { return }
+            isViewFocused = true
         }
-    }
-
-    private func commitTitleEdit() {
-        guard isEditingTitle else { return }
-        let trimmed = pendingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, trimmed != model.currentSession?.title {
-            model.renameCurrentMeeting(to: trimmed)
-        } else {
-            pendingTitle = model.currentSession?.title ?? ""
-        }
-        isEditingTitle = false
-        isViewFocused = true
-    }
-
-    private func cancelTitleEdit() {
-        guard isEditingTitle else { return }
-        pendingTitle = model.currentSession?.title ?? ""
-        isEditingTitle = false
-        isViewFocused = true
     }
 
     private func transcriptPane(autoScroll: Bool) -> some View {

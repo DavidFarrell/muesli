@@ -3111,70 +3111,56 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func renameMeeting(_ item: MeetingHistoryItem, to newTitle: String) {
-        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
+    /// Single entry point for renaming a meeting on disk. Trims/validates the
+    /// title, writes it to meeting.json, then updates every in-memory mirror
+    /// that applies (meetingHistory row, the active .viewing screen, and the
+    /// live session/meetingTitle if this is the current recording). Throws
+    /// on validation or I/O failure instead of swallowing it, so callers can
+    /// revert their optimistic UI and show the user what went wrong.
+    @discardableResult
+    func renameMeeting(folderURL: URL, to newTitle: String) throws -> String {
+        let trimmed: String
         do {
-            var metadata = try readMeetingMetadata(from: item.folderURL)
-            metadata.title = trimmed
-            metadata.updatedAt = Date()
-            try writeMeetingMetadata(metadata, to: item.folderURL)
+            trimmed = try MeetingRenamer.rename(folderURL: folderURL, to: newTitle)
+        } catch {
+            appendBackendLog("Failed to rename meeting at \(folderURL.lastPathComponent): \(error.localizedDescription)", toTail: true)
+            throw error
+        }
 
+        if let idx = meetingHistory.firstIndex(where: { $0.folderURL == folderURL }) {
+            let existing = meetingHistory[idx]
             let updatedItem = MeetingHistoryItem(
-                id: item.id,
-                folderURL: item.folderURL,
+                id: existing.id,
+                folderURL: existing.folderURL,
                 title: trimmed,
-                createdAt: item.createdAt,
-                durationSeconds: item.durationSeconds,
-                segmentCount: item.segmentCount,
-                status: item.status
+                createdAt: existing.createdAt,
+                durationSeconds: existing.durationSeconds,
+                segmentCount: existing.segmentCount,
+                status: existing.status
             )
-            if let idx = meetingHistory.firstIndex(where: { $0.id == item.id }) {
-                meetingHistory[idx] = updatedItem
-            }
-            if case .viewing(let current) = activeScreen, current.id == item.id {
+            meetingHistory[idx] = updatedItem
+            if case .viewing(let current) = activeScreen, current.id == existing.id {
                 activeScreen = .viewing(updatedItem)
             }
-        } catch {
-            appendBackendLog("Failed to rename meeting \(item.id): \(error.localizedDescription)", toTail: true)
         }
+
+        if let session = currentSession, session.folderURL == folderURL {
+            currentSession = MeetingSession(title: trimmed, folderURL: session.folderURL, startedAt: session.startedAt)
+            meetingTitle = trimmed
+        }
+
+        return trimmed
     }
 
-    func renameCurrentMeeting(to newTitle: String) {
-        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let session = currentSession else { return }
+    @discardableResult
+    func renameMeeting(_ item: MeetingHistoryItem, to newTitle: String) throws -> String {
+        try renameMeeting(folderURL: item.folderURL, to: newTitle)
+    }
 
-        do {
-            var metadata = try readMeetingMetadata(from: session.folderURL)
-            metadata.title = trimmed
-            metadata.updatedAt = Date()
-            try writeMeetingMetadata(metadata, to: session.folderURL)
-
-            let updatedSession = MeetingSession(
-                title: trimmed,
-                folderURL: session.folderURL,
-                startedAt: session.startedAt
-            )
-            currentSession = updatedSession
-            meetingTitle = trimmed
-
-            if let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
-                let existing = meetingHistory[idx]
-                let updatedItem = MeetingHistoryItem(
-                    id: existing.id,
-                    folderURL: existing.folderURL,
-                    title: trimmed,
-                    createdAt: existing.createdAt,
-                    durationSeconds: existing.durationSeconds,
-                    segmentCount: existing.segmentCount,
-                    status: existing.status
-                )
-                meetingHistory[idx] = updatedItem
-            }
-        } catch {
-            appendBackendLog("Failed to rename active meeting: \(error.localizedDescription)", toTail: true)
-        }
+    @discardableResult
+    func renameCurrentMeeting(to newTitle: String) throws -> String {
+        guard let session = currentSession else { throw MeetingRenameError.noActiveSession }
+        return try renameMeeting(folderURL: session.folderURL, to: newTitle)
     }
 
     private func persistSpeakerNames(to folderURL: URL) {

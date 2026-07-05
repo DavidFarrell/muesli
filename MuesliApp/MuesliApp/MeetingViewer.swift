@@ -10,8 +10,7 @@ struct MeetingViewer: View {
     @State private var showSpeakers = false
     @State private var autoScroll = true
     @State private var copyIconName = "doc.on.clipboard"
-    @State private var showRenameSheet = false
-    @State private var renameTitle = ""
+    @State private var isEditingTitle = false
     @State private var isIdentifyingSpeakers = false
     @State private var identificationProgress: SpeakerIdentifier.Progress?
     @State private var identificationError: String?
@@ -187,16 +186,6 @@ struct MeetingViewer: View {
         } message: {
             Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace transcript?")
         }
-        .sheet(isPresented: $showRenameSheet) {
-            RenameMeetingSheet(
-                title: $renameTitle,
-                onCancel: { showRenameSheet = false },
-                onSave: {
-                    model.renameMeeting(meeting, to: renameTitle)
-                    showRenameSheet = false
-                }
-            )
-        }
         .onDisappear {
             identificationTask?.cancel()
             identificationTask = nil
@@ -213,8 +202,18 @@ struct MeetingViewer: View {
             .buttonStyle(.link)
 
             VStack(alignment: .leading) {
-                Text(meeting.title)
-                    .font(.title2).bold()
+                InlineEditableTitle(
+                    title: meeting.title,
+                    font: .title2.bold(),
+                    isEditing: $isEditingTitle
+                ) { newTitle in
+                    do {
+                        try model.renameMeeting(meeting, to: newTitle)
+                        return nil
+                    } catch {
+                        return "Couldn't rename: \(error.localizedDescription)"
+                    }
+                }
                 Text("\(formatDuration(meeting.durationSeconds)) • \(meeting.segmentCount) segments")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -224,8 +223,7 @@ struct MeetingViewer: View {
 
             HStack(spacing: 12) {
                 Button {
-                    renameTitle = meeting.title
-                    showRenameSheet = true
+                    isEditingTitle = true
                 } label: {
                     Label("Rename", systemImage: "pencil")
                 }
