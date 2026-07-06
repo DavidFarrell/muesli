@@ -181,12 +181,32 @@ final class AudioSampleExtractor {
     }
 }
 
+/// Thread-safe wrapper around `MeterPublishGate` for use from the capture
+/// queue (never MainActor) - see `MeterPublishGate`'s own doc comment for
+/// the decision rules. This is a pre-gate: it decides whether it's even
+/// worth enqueuing a main-queue block at all, so steady-state buffers (most
+/// of them, once digital silence sets in) never hop to main - the
+/// authoritative gate still lives in `AudioMetersModel` itself.
+private final class SystemMeterGate {
+    private let queue = DispatchQueue(label: "muesli.system-meter-gate", qos: .userInitiated)
+    private var gate: MeterPublishGate
+
+    init(minPublishInterval: TimeInterval) {
+        gate = MeterPublishGate(minPublishInterval: minPublishInterval)
+    }
+
+    func shouldPublish(level: Float, now: Date) -> Bool {
+        queue.sync { gate.shouldPublish(level: level, now: now) }
+    }
+}
+
 // MARK: - Capture Engine
 
 @MainActor
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private let sampleRate = 16000
     private let channelCount = 1
+    private let systemMeterGate = SystemMeterGate(minPublishInterval: 0.066)
 
     private var stream: SCStream?
     private var recordingOutput: SCRecordingOutput?
@@ -370,8 +390,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
             let ptsSeconds = CMTimeGetSeconds(sampleBuffer.presentationTimeStamp)
             let formatInfo = formatString(from: sampleBuffer) ?? "-"
 
-            DispatchQueue.main.async {
-                if type == .audio {
+            // Pre-gate BEFORE dispatching to main at all: previously every
+            // system-audio buffer enqueued a main-queue block regardless of
+            // the throttle inside `AudioMetersModel.updateSystem` - an
+            // invalidation-storm contributor even before counting the
+            // `@Published` writes themselves (audit: 2026-07-06 livelock).
+            // During steady digital silence this now costs one `queue.sync`
+            // on the capture queue and nothing on MainActor at all.
+            if type == .audio, systemMeterGate.shouldPublish(level: level, now: Date()) {
+                DispatchQueue.main.async {
                     self.systemLevel = level
                     self.debugSystemBuffers += 1
                     self.debugSystemFrames = pcm.frameCount

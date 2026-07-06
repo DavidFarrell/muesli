@@ -26,12 +26,16 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AECMode.swift,
+				AudioMetersModel.swift,
 				DurationFormatting.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,
+				MeterPublishGate.swift,
 				MicAudioFormat.swift,
+				MicDeliverySurfaceDecision.swift,
 				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
+				OrphanedMeetingRecovery.swift,
 				TempTranscriptCleanup.swift,
 				TranscriptModel.swift,
 			);

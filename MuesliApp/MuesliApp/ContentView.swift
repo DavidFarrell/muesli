@@ -17,12 +17,10 @@ import Security
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
-    @State private var titlebarInset: CGFloat = 28
 
     var body: some View {
         content
-            .padding(.top, max(28, titlebarInset))
-            .background(TitlebarInsetReader(height: $titlebarInset))
+            .padding(.top, 28)
             .toolbar {
                 ToolbarItem(placement: .automatic) {
                     Button("Permissions") { model.showPermissionsSheet = true }
@@ -45,24 +43,6 @@ struct RootView: View {
                 SessionView()
             case .viewing(let item):
                 MeetingViewer(meeting: item)
-            }
-        }
-    }
-}
-
-private struct TitlebarInsetReader: NSViewRepresentable {
-    @Binding var height: CGFloat
-
-    func makeNSView(context: Context) -> NSView {
-        NSView(frame: .zero)
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            guard let window = nsView.window else { return }
-            let inset = max(0, window.frame.height - window.contentLayoutRect.height)
-            if abs(height - inset) > 0.5 {
-                height = inset
             }
         }
     }
@@ -313,8 +293,8 @@ struct NewMeetingView: View {
 
             GroupBox("Live input check") {
                 VStack(alignment: .leading, spacing: 10) {
-                    LevelMeter(label: "System", level: meters.systemLevel)
-                    LevelMeter(label: "Microphone", level: meters.micLevel)
+                    LevelMeter(label: "System", level: meters.system.level)
+                    LevelMeter(label: "Microphone", level: meters.mic.level)
                     Text(model.isPreviewingLevels
                          ? "Previewing live levels before recording."
                          : "Level preview unavailable. Check permissions and selected source.")

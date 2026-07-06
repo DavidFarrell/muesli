@@ -27,14 +27,14 @@ struct SessionView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     GroupBox("Audio levels") {
                         VStack(alignment: .leading, spacing: 10) {
-                            LevelMeter(label: "System", level: meters.systemLevel)
-                            LevelMeter(label: "Microphone", level: meters.micLevel)
+                            LevelMeter(label: "System", level: meters.system.level)
+                            LevelMeter(label: "Microphone", level: meters.mic.level)
 
-                            if !meters.debugMicErrorMessage.isEmpty && meters.debugMicErrorMessage != "-" {
+                            if !meters.mic.debugErrorMessage.isEmpty && meters.mic.debugErrorMessage != "-" {
                                 HStack(spacing: 4) {
                                     Image(systemName: "exclamationmark.triangle.fill")
                                         .foregroundStyle(.red)
-                                    Text(meters.debugMicErrorMessage)
+                                    Text(meters.mic.debugErrorMessage)
                                         .foregroundStyle(.red)
                                 }
                                 .font(.footnote)
@@ -46,7 +46,7 @@ struct SessionView: View {
                                         .foregroundStyle(.orange)
                                 }
                                 .font(.footnote)
-                            } else if model.transcribeMic && meters.debugMicBuffers == 0 {
+                            } else if model.transcribeMic && meters.mic.debugBuffers == 0 {
                                 HStack(spacing: 4) {
                                     Image(systemName: "exclamationmark.triangle.fill")
                                         .foregroundStyle(.orange)
@@ -133,21 +133,21 @@ struct SessionView: View {
                                 .buttonStyle(.bordered)
                                 Spacer()
                             }
-                            Text("System buffers: \(meters.debugSystemBuffers) frames: \(meters.debugSystemFrames)")
-                            Text("System PTS: \(String(format: "%.3f", meters.debugSystemPTS))")
-                            Text("System format: \(meters.debugSystemFormat)")
-                            Text("System errors: \(meters.debugAudioErrors)")
-                            if meters.debugSystemErrorMessage != "-" {
-                                Text("System error: \(meters.debugSystemErrorMessage)")
+                            Text("System buffers: \(meters.system.debugBuffers) frames: \(meters.system.debugFrames)")
+                            Text("System PTS: \(String(format: "%.3f", meters.system.debugPTS))")
+                            Text("System format: \(meters.system.debugFormat)")
+                            Text("System errors: \(meters.system.debugErrors)")
+                            if meters.system.debugErrorMessage != "-" {
+                                Text("System error: \(meters.system.debugErrorMessage)")
                                     .foregroundStyle(.red)
                             }
                             Divider()
-                            Text("Mic buffers: \(meters.debugMicBuffers) frames: \(meters.debugMicFrames)")
-                            Text("Mic PTS: \(String(format: "%.3f", meters.debugMicPTS))")
-                            Text("Mic format: \(meters.debugMicFormat)")
-                            Text("Mic errors: \(meters.debugMicErrors)")
-                            if meters.debugMicErrorMessage != "-" {
-                                Text("Mic error: \(meters.debugMicErrorMessage)")
+                            Text("Mic buffers: \(meters.mic.debugBuffers) frames: \(meters.mic.debugFrames)")
+                            Text("Mic PTS: \(String(format: "%.3f", meters.mic.debugPTS))")
+                            Text("Mic format: \(meters.mic.debugFormat)")
+                            Text("Mic errors: \(meters.mic.debugErrors)")
+                            if meters.mic.debugErrorMessage != "-" {
+                                Text("Mic error: \(meters.mic.debugErrorMessage)")
                                     .foregroundStyle(.red)
                             }
                             Divider()
