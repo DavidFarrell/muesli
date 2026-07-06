@@ -32,6 +32,7 @@
 				MeetingRenamer.swift,
 				MeterPublishGate.swift,
 				MicAudioFormat.swift,
+				MicDeliverySurfaceDecision.swift,
 				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
 				OrphanedMeetingRecovery.swift,

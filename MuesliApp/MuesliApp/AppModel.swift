@@ -738,11 +738,26 @@ final class AppModel: ObservableObject {
         guard generation == micEngineGeneration else { return }
         guard transcribeMic else { return }
 
-        if result.isFirstFrame {
+        // A frame actually arriving is the ladder's success signal - not
+        // just on the first frame of a generation, but also whenever a
+        // recovery attempt is in flight or the ladder has parked. The
+        // `.giveUp` step parks WITHOUT rebuilding the engine (see
+        // `requestMicRecovery`), so a stall that resolves on its own on the
+        // SAME generation never produces `isFirstFrame`; without this OR,
+        // `micRecoveryParked`/the persistent mic alert would never clear
+        // even though audio is flowing again (review-gate finding on the
+        // 2026-07-06 livelock fix).
+        let shouldResetRecovery = result.isFirstFrame || micNoAudioRecoveryAttempts > 0 || micRecoveryParked
+        if shouldResetRecovery {
             resetMicRecoveryLadder()
+        }
+        if result.isFirstFrame {
             if let startedAt = micEngineStartedAt {
                 AudioLog.event("mic.first-frame", ["msSinceStart": Int(Date().timeIntervalSince(startedAt) * 1000)])
             }
+        }
+        if result.isResumptionAfterGap {
+            AudioLog.event("mic.resumed-after-gap", ["generation": generation])
         }
 
         micLevel = result.level

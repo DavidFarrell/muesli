@@ -32,6 +32,13 @@ actor MicAudioForwarder {
     private var generation: Int = 0
 
     private var meterGate = MeterPublishGate(minPublishInterval: 0.066)
+    // A frame following a gap this long always surfaces regardless of level
+    // or the meter gate - see MicDeliverySurfaceDecision's doc comment for
+    // why a silent resumption must not be suppressed forever. Deliberately
+    // smaller than AppModel's mic-stall threshold (4s) so a genuine
+    // resumption surfaces well before the next watchdog tick could
+    // re-detect the same stall.
+    private let resumptionGapThresholdSeconds: TimeInterval = 2.0
 
     private let sampleRate: Int
     private let channels: Int
@@ -98,6 +105,13 @@ actor MicAudioForwarder {
         let frameSampleCount: Int
         let elapsedSeconds: Double
         let isFirstFrame: Bool
+        /// True when this delivery surfaced ONLY because it followed a long
+        /// delivery gap (not because it's the first frame of a generation,
+        /// and not because the meter gate would have let it through on its
+        /// own) - see `MicDeliverySurfaceDecision`. Informational, for
+        /// logging; `AppModel` doesn't need to branch on it for correctness
+        /// since it resets the recovery ladder on attempts/parked state too.
+        let isResumptionAfterGap: Bool
     }
 
     /// The hot path: always computes level and forwards/queues the buffer
@@ -106,11 +120,12 @@ actor MicAudioForwarder {
     /// worth telling MainActor about - steady digital silence keeps updating
     /// `frameCount`/`lastFrameAt` internally (so the watchdog still sees
     /// truthful liveness) but does not force a MainActor hop for every
-    /// buffer. The very first frame of a generation ALWAYS surfaces
-    /// regardless of level - that is what lets `AppModel` reset the
-    /// recovery ladder promptly (see `MeterPublishGate`'s doc comment for
-    /// the quantize/dedupe rules and `AppModel.onMicAudioDelivered` for how
-    /// the ladder reset is derived from `isFirstFrame` alone).
+    /// buffer. `MicDeliverySurfaceDecision.mustSurface` always overrides the
+    /// meter gate for the first frame of a generation OR a frame following a
+    /// long delivery gap - the latter is what lets a PARKED recovery ladder
+    /// (which gives up without rebuilding the engine, so no new generation
+    /// ever starts) un-park on a silent resumption instead of staying parked
+    /// forever (see that type's doc comment).
     func deliver(_ data: Data, generation callerGeneration: Int) -> DeliveryResult? {
         guard callerGeneration == generation else { return nil }
         let now = Date()
@@ -119,6 +134,7 @@ actor MicAudioForwarder {
         let ptsUs = Int64(elapsed * 1_000_000.0)
         let isFirstFrame = !hadFirstFrameThisGeneration
         hadFirstFrameThisGeneration = true
+        let secondsSinceLastFrame = lastFrameAt.map { now.timeIntervalSince($0) }
 
         let level = Self.rmsLevelInt16(data)
         frameCount += 1
@@ -135,7 +151,12 @@ actor MicAudioForwarder {
             }
         }
 
-        guard isFirstFrame || meterGate.shouldPublish(level: level, now: now) else {
+        let mustSurface = MicDeliverySurfaceDecision.mustSurface(
+            isFirstFrame: isFirstFrame,
+            secondsSinceLastFrame: secondsSinceLastFrame,
+            resumptionGapThresholdSeconds: resumptionGapThresholdSeconds
+        )
+        guard mustSurface || meterGate.shouldPublish(level: level, now: now) else {
             return nil
         }
 
@@ -143,7 +164,8 @@ actor MicAudioForwarder {
             level: level,
             frameSampleCount: data.count / 2,
             elapsedSeconds: elapsed,
-            isFirstFrame: isFirstFrame
+            isFirstFrame: isFirstFrame,
+            isResumptionAfterGap: mustSurface && !isFirstFrame
         )
     }
 
