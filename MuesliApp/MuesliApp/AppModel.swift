@@ -153,7 +153,6 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    @Published var backendLogTail: [String] = []
     @Published var isPreviewingLevels = false
     @Published private(set) var isStartingMeeting = false
 
@@ -230,15 +229,32 @@ final class AppModel: ObservableObject {
     // every tick and re-logging/re-attempting for the rest of the meeting.
     // Cleared only where the ladder itself resets (see resetMicRecoveryLadder).
     private var micRecoveryParked = false
-    private var micOutputEnabled = false
     // Effective VPIO state the current meeting-mic start requested, and whether a
     // VPIO->plain downgrade has already fired this generation (gates it to once).
     private var micVoiceProcessingRequested = false
     private var micVoiceProcessingDowngraded = false
-    private var pendingMicAudio: [PendingAudio] = []
-    private let maxPendingMicAudio = 200
     private let screenshotScheduler = ScreenshotScheduler()
     private let backendLogTailLimit = 200
+
+    // Owns the mic hot path (level compute + FramedWriter delivery) off
+    // MainActor entirely - see MicAudioForwarder's doc comment (2026-07-06
+    // livelock fix, item 1). `micOutputEnabled`/`pendingMicAudio` used to
+    // live on AppModel directly; both now live inside the forwarder.
+    private let micAudioForwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+    // Owns backend.log file writes + the copy-debug ring buffer off
+    // MainActor (2026-07-06 livelock fix, item 5). `nonisolated(unsafe)`:
+    // BackendLogWriter is internally serialized on its own private queue
+    // (see its doc comment), so it is genuinely safe to call from any
+    // isolation domain, incl. `AudioLog.sink`'s arbitrary-queue closure -
+    // that is the entire point of moving it off MainActor.
+    private nonisolated(unsafe) let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
+    // Detects (and logs) a wedged main thread from entirely off-main code -
+    // see its doc comment (2026-07-06 livelock fix, item 2). Assigned in
+    // init() since it depends on `backendLogWriter`/`micAudioForwarder`.
+    private let mainActorStarvationWatchdog: MainActorStarvationWatchdog
+    // Cheap storm tripwire - see its doc comment (2026-07-06 livelock fix,
+    // item 7). Assigned in init() for the same reason.
+    private let stormTripwire: RunLoopStormTripwire
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
@@ -312,19 +328,47 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        mainActorStarvationWatchdog = MainActorStarvationWatchdog(
+            logWriter: backendLogWriter, forwarder: micAudioForwarder
+        )
+        stormTripwire = RunLoopStormTripwire(logWriter: backendLogWriter)
+
         if let stored = UserDefaults.standard.string(forKey: aecModeKey),
            let mode = AECMode(rawValue: stored) {
             aecMode = mode
         }
 
-        // Mirror the unified audio log into the in-app backend log tail so the
-        // failure timeline is visible without Console. The sink fires on
-        // arbitrary queues, so hop to the main actor.
+        // Mirror the unified audio log into the backend-log writer's ring
+        // buffer so the failure timeline is visible without Console. The
+        // sink fires on arbitrary queues (CoreAudio listeners, mic-engine
+        // actors, a MainActor heartbeat every ~2s) - it must NOT hop to
+        // MainActor to do this (audit: 2026-07-06 livelock - the old
+        // `Task { @MainActor in appendBackendLog }` here fed an
+        // AppModel-wide invalidation drumbeat with zero live UI readers).
+        // `backendLogWriter` is internally queue-serialized, so calling into
+        // it directly from any thread is safe.
         AudioLog.sink = { [weak self] line in
-            Task { @MainActor [weak self] in
-                self?.appendBackendLog("[audio] \(line)", toTail: true)
-            }
+            self?.backendLogWriter.append("[audio] \(line)", toTail: true)
         }
+
+        // Safe only now: every stored property (including stormTripwire
+        // itself) is assigned by this point, so this escaping closure can
+        // capture `self`.
+        stormTripwire.setContextProvider { [weak self] in
+            guard let self else {
+                return RunLoopStormTripwire.Context(
+                    activeScreen: "-", transcriptRows: 0, historyCount: 0, meterPublishCount: 0
+                )
+            }
+            return RunLoopStormTripwire.Context(
+                activeScreen: String(describing: self.activeScreen),
+                transcriptRows: self.transcriptModel.segments.count,
+                historyCount: self.meetingHistory.count,
+                meterPublishCount: self.meters.publishCount
+            )
+        }
+        mainActorStarvationWatchdog.start()
+        stormTripwire.start()
 
         // Restore the persisted device policy (a pin survives relaunch by UID).
         inputSelection = Self.persistedSelection(
@@ -354,6 +398,7 @@ final class AppModel: ObservableObject {
         loadBackendBookmark()
         validateBackendFolder()
         migrateLegacyMeetingsIfNeeded()
+        recoverOrphanedMeetingsIfNeeded()
         loadMeetingHistory()
         Task { await loadShareableContent() }
 
@@ -378,7 +423,7 @@ final class AppModel: ObservableObject {
     var debugAudioErrors: Int { captureEngine.debugAudioErrors }
     var backendLogPath: String? { backendLogURL?.path }
     var debugSummary: String {
-        let tail = backendLogTail.suffix(50).joined(separator: "\n")
+        let tail = backendLogWriter.tailSnapshot(limit: 50).joined(separator: "\n")
         return """
         System buffers: \(debugSystemBuffers) frames: \(debugSystemFrames)
         System PTS: \(String(format: "%.3f", debugSystemPTS))
@@ -506,17 +551,15 @@ final class AppModel: ObservableObject {
     }
 
     private func resetBackendLog(in folderURL: URL) {
-        backendLogTail.removeAll()
         let logURL = folderURL.appendingPathComponent("backend.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         backendLogURL = logURL
         backendLogHandle = try? FileHandle(forWritingTo: logURL)
+        backendLogWriter.reset(handle: backendLogHandle)
     }
 
     private func closeBackendLog() {
-        if let handle = backendLogHandle {
-            try? handle.close()
-        }
+        backendLogWriter.close()
         backendLogHandle = nil
     }
 
@@ -565,13 +608,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func appendBackendLogTail(_ line: String) {
-        backendLogTail.append(line)
-        if backendLogTail.count > backendLogTailLimit {
-            backendLogTail.removeFirst(backendLogTail.count - backendLogTailLimit)
-        }
-    }
-
     private func writeDataToHandle(_ data: Data, handle: FileHandle?) -> Error? {
         guard let handle else { return nil }
         do {
@@ -587,19 +623,16 @@ final class AppModel: ObservableObject {
         do {
             try handle.synchronize()
         } catch {
-            appendBackendLogTail("Failed to flush \(label): \(error.localizedDescription)")
+            appendBackendLog("Failed to flush \(label): \(error.localizedDescription)", toTail: true)
         }
     }
 
+    /// The actual file write + ring-buffer append happen on
+    /// `backendLogWriter`'s own queue, off MainActor (2026-07-06 livelock
+    /// fix, item 5) - this call itself is fire-and-forget from here.
     private func appendBackendLog(_ line: String, toTail: Bool, handle: FileHandle? = nil) {
         let trimmed = line.trimmingCharacters(in: .newlines)
-        if let data = (trimmed + "\n").data(using: .utf8) {
-            if let error = writeDataToHandle(data, handle: handle ?? backendLogHandle), toTail {
-                appendBackendLogTail("[backend.log write failed] \(error.localizedDescription)")
-            }
-        }
-        guard toTail else { return }
-        appendBackendLogTail(trimmed)
+        backendLogWriter.append(trimmed, toTail: toTail, handle: handle)
     }
 
     private func handleBackendWriteError(_ error: Error) {
@@ -689,53 +722,41 @@ final class AppModel: ObservableObject {
         publishMicError()
     }
 
-    private func handleMicAudio(_ data: Data) {
-        guard transcribeMic, writer != nil else { return }
-        let now = Date()
-        if micStartTime == nil {
-            micStartTime = now
-        }
-        let elapsed = now.timeIntervalSince(micStartTime ?? now)
-        let ptsUs = Int64(elapsed * 1_000_000.0)
+    /// MainActor-side bookkeeping for a mic buffer that `MicAudioForwarder`
+    /// already delivered (level computed, sent to the backend or queued)
+    /// entirely off MainActor - see the forwarder's doc comment for why (the
+    /// 2026-07-06 livelock fix, item 1). This method only ever handles
+    /// metering + recovery-ladder bookkeeping; it can lag behind the actual
+    /// audio delivery under a MainActor storm without the audio pipeline
+    /// itself being affected. `result.isFirstFrame` alone is a complete
+    /// replacement for the old
+    /// `lastMicAudioAt == nil || micNoAudioRecoveryAttempts > 0 ||
+    /// micRecoveryParked` reset condition: any successful recovery attempt
+    /// rebuilds the engine into a new generation, so its first delivered
+    /// frame is always the generation's first frame too.
+    private func onMicAudioDelivered(_ result: MicAudioForwarder.DeliveryResult, generation: Int) {
+        guard generation == micEngineGeneration else { return }
+        guard transcribeMic else { return }
 
-        // A frame actually arriving is the ladder's success signal, whether
-        // this is the very first frame after a fresh start (lastMicAudioAt ==
-        // nil) or a frame landing mid-recovery (attempts > 0). Cheap
-        // diagnostic for the next incident: how long the engine ran silent.
-        if lastMicAudioAt == nil {
+        if result.isFirstFrame {
+            resetMicRecoveryLadder()
             if let startedAt = micEngineStartedAt {
-                AudioLog.event("mic.first-frame", ["msSinceStart": Int(now.timeIntervalSince(startedAt) * 1000)])
+                AudioLog.event("mic.first-frame", ["msSinceStart": Int(Date().timeIntervalSince(startedAt) * 1000)])
             }
         }
-        if lastMicAudioAt == nil || micNoAudioRecoveryAttempts > 0 || micRecoveryParked {
-            resetMicRecoveryLadder()
-        }
 
-        micLevel = rmsLevelInt16(data)
+        micLevel = result.level
         debugMicBuffers += 1
-        debugMicFrames = data.count / 2
-        debugMicPTS = elapsed
-        // Liveness signals for the frames watchdog (debugMicFrames is per-buffer,
-        // not cumulative, so it can't serve this).
-        lastMicAudioAt = now
+        debugMicFrames = result.frameSampleCount
+        debugMicPTS = result.elapsedSeconds
+        // Liveness signals for UI/logging convenience. The frames watchdog's
+        // actual STALL DETECTION reads `micAudioForwarder.snapshot()`
+        // directly instead (ground truth, updated even when this MainActor
+        // hop is delayed) - see `startMicFramesWatchdog`.
+        lastMicAudioAt = Date()
         micFrameCount += 1
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
         publishMicMeters()
-
-        let payload = data
-        if micOutputEnabled {
-            writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: payload)
-        } else {
-            pendingMicAudio.append(PendingAudio(
-                ptsUs: ptsUs,
-                payload: payload,
-                sampleRate: micOutputSampleRate,
-                channels: micOutputChannels
-            ))
-            if pendingMicAudio.count > maxPendingMicAudio {
-                pendingMicAudio.removeFirst(pendingMicAudio.count - maxPendingMicAudio)
-            }
-        }
     }
 
     private func handlePreviewMicAudio(_ data: Data) {
@@ -943,6 +964,15 @@ final class AppModel: ObservableObject {
     private func startHomeLevelPreviewNow() async {
         guard !isCapturing else { return }
         guard !isStartingMeeting else { return }
+        // A meeting that just stopped is still tearing down (capture engine,
+        // mic engine, backend) until isFinalizing clears - starting the
+        // preview capture concurrently would race that teardown. See the
+        // `finalizeStoppedMeeting` defer for the matching restart-kick once
+        // finalizing completes (item 4, 2026-07-06 livelock fix).
+        guard !isFinalizing else {
+            isPreviewingLevels = false
+            return
+        }
         guard !shouldShowOnboarding else {
             isPreviewingLevels = false
             return
@@ -1112,7 +1142,7 @@ final class AppModel: ObservableObject {
         guard transcribeMic else {
             micEngine = nil
             micEngineStartedAt = nil
-            micOutputEnabled = false
+            await micAudioForwarder.stop()
             cancelMicStartupHealthCheck()
             return
         }
@@ -1178,6 +1208,15 @@ final class AppModel: ObservableObject {
             "gen": generation, "vpio": enableVPIO, "pinned": pinned, "resolvedID": resolvedID, "captureSession": usesCaptureSession
         ])
 
+        // Arm the forwarder's new generation BEFORE the tap can possibly
+        // fire, so audio delivery (level compute + FramedWriter.send) never
+        // depends on MainActor being free - see MicAudioForwarder's doc
+        // comment (2026-07-06 livelock fix, item 1). This also closes the
+        // narrow startup race the old MainActor-side `pendingMicAudio`
+        // mechanism only papered over: no buffer can arrive before its
+        // generation is recognised.
+        await micAudioForwarder.beginGeneration(generation, writer: writer)
+
         try await engine.start(
             enableVoiceProcessing: enableVPIO,
             preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
@@ -1192,13 +1231,15 @@ final class AppModel: ObservableObject {
                 }
             }
         ) { [weak self] data in
-            Task { @MainActor in
-                // A buffer posted from an already-superseded engine (e.g.
-                // one last callback landing just after a restart) must not
-                // reset the new generation's recovery-ladder bookkeeping -
-                // drop it before any state changes.
-                guard let self, self.micEngineGeneration == generation else { return }
-                self.handleMicAudio(data)
+            guard let self else { return }
+            // Deliver directly to the forwarder - NOT `Task { @MainActor in
+            // ... }` - so this never needs a live UI thread. Only a
+            // throttled subset of deliveries (see the forwarder's gating)
+            // hops to MainActor afterwards, purely for metering/recovery-
+            // ladder bookkeeping.
+            Task {
+                guard let result = await self.micAudioForwarder.deliver(data, generation: generation) else { return }
+                await self.onMicAudioDelivered(result, generation: generation)
             }
         }
         // Serialization should prevent overlap, but bail if a newer start
@@ -1219,7 +1260,7 @@ final class AppModel: ObservableObject {
         }
         micEngine = engine
         micEngineStartedAt = Date()
-        micOutputEnabled = true
+        await micAudioForwarder.setOutputEnabled(true)
         debugMicErrorMessage = "-"
         publishMicError()
         if isCapturing {
@@ -1244,15 +1285,15 @@ final class AppModel: ObservableObject {
             await startMeetingMicEngine()
             return
         }
-        handleMicStartFailure(error)
+        await handleMicStartFailure(error)
     }
 
-    private func handleMicStartFailure(_ error: Error) {
+    private func handleMicStartFailure(_ error: Error) async {
         micEngine = nil
         micEngineStartedAt = nil
         micEngineBoundDeviceID = 0
         micEngineUsesCaptureSession = false
-        micOutputEnabled = false
+        await micAudioForwarder.stop()
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
         debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
@@ -1287,8 +1328,11 @@ final class AppModel: ObservableObject {
         micEngineUsesCaptureSession = false
         micEngineStartedAt = nil
 
-        pendingMicAudio.removeAll()
-        micOutputEnabled = false
+        // The upcoming startMeetingMicEngine() call re-arms the forwarder
+        // for a fresh generation (see beginGeneration), but stop it
+        // explicitly here too so forwarding halts the instant the engine
+        // does, rather than lingering until the new generation is armed.
+        await micAudioForwarder.stop()
         micLevel = 0
         debugMicBuffers = 0
         debugMicFrames = 0
@@ -1311,15 +1355,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func flushPendingMicAudio() {
-        guard micOutputEnabled, !pendingMicAudio.isEmpty else { return }
-        let pending = pendingMicAudio
-        pendingMicAudio.removeAll()
-        for item in pending {
-            writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
-        }
-    }
-
     private func cancelMicStartupHealthCheck() {
         micStartupHealthTask?.cancel()
         micStartupHealthTask = nil
@@ -1339,10 +1374,17 @@ final class AppModel: ObservableObject {
                 guard !Task.isCancelled else { return }
                 guard self.isCapturing, self.transcribeMic else { continue }
 
-                let reference = self.lastMicAudioAt ?? self.micStartTime
+                // Ground truth from the forwarder, NOT the MainActor mirrors
+                // (`lastMicAudioAt`/`micFrameCount`) - those can lag behind
+                // reality under exactly the MainActor storm this watchdog
+                // needs to stay correct through (2026-07-06 livelock fix,
+                // item 1). A delayed mirror must never read as "mic stopped"
+                // when the forwarder is still delivering fine off-actor.
+                let snap = await self.micAudioForwarder.snapshot()
+                let reference = snap.lastFrameAt ?? self.micStartTime
                 let since = reference.map { Date().timeIntervalSince($0) }
                 AudioLog.event("heartbeat", [
-                    "frames": self.micFrameCount,
+                    "frames": snap.frameCount,
                     "sinceLastFrameMs": since.map { Int($0 * 1000) } ?? -1,
                     "micLevel": String(format: "%.3f", self.micLevel),
                     "engineAlive": self.micEngine != nil,
@@ -1356,7 +1398,7 @@ final class AppModel: ObservableObject {
                 // and re-announce "attempting recovery" for the rest of the
                 // meeting even though requestMicRecovery itself would no-op.
                 guard !self.micRecoveryParked else { continue }
-                if let last = self.lastMicAudioAt {
+                if let last = snap.lastFrameAt {
                     // Delivered-then-stopped: frames were flowing and died.
                     guard Date().timeIntervalSince(last) > self.micStallThresholdSeconds else { continue }
                     AudioLog.error("heartbeat.STALL", [
@@ -1367,7 +1409,7 @@ final class AppModel: ObservableObject {
                     self.requestMicRecovery(reason: "watchdog-stall")
                 } else if let startedAt = self.micEngineStartedAt,
                           Date().timeIntervalSince(startedAt) > self.micStallThresholdSeconds {
-                    // Never-delivered-at-all: lastMicAudioAt only arms after a
+                    // Never-delivered-at-all: lastFrameAt only arms after a
                     // first frame, so an engine that never delivers frame one
                     // was previously invisible here (the 5 Jul 2026 incident -
                     // engine.start.ok pinned=true but zero frames, ever).
@@ -2265,8 +2307,6 @@ final class AppModel: ObservableObject {
             )
 
             resetMicDebugState()
-            pendingMicAudio.removeAll()
-            micOutputEnabled = false
             micStartTime = Date()
             await startMeetingMicEngine()
 
@@ -2305,7 +2345,10 @@ final class AppModel: ObservableObject {
                 micChannels: micChannels
             )
             captureEngine.setAudioOutputEnabled(true)
-            flushPendingMicAudio()
+            // Mic-side flushing is now handled inline by
+            // `micAudioForwarder.setOutputEnabled(true)` at the moment the
+            // engine started (see attemptMeetingMicEngineStart) - there is
+            // no separate mic flush step here any more.
 
             if captureMode == .video {
                 let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
@@ -2378,8 +2421,7 @@ final class AppModel: ObservableObject {
             model.micEngineUsesCaptureSession = false
         }
         await micLifecycleTask?.value
-        micOutputEnabled = false
-        pendingMicAudio.removeAll()
+        await micAudioForwarder.stop()
         micStartTime = nil
         resetMicRecoveryLadder()
 
@@ -2465,8 +2507,7 @@ final class AppModel: ObservableObject {
         }
         micEngine = nil
         micEngineStartedAt = nil
-        micOutputEnabled = false
-        pendingMicAudio.removeAll()
+        await micAudioForwarder.stop()
         micStartTime = nil
         resetMicRecoveryLadder()
 
@@ -2538,9 +2579,20 @@ final class AppModel: ObservableObject {
     ) async {
         defer {
             closeHandle(transcriptEventsHandle)
-            closeHandle(backendLogHandle)
+            // Ordered after any writes still queued on the writer's own
+            // serial queue - see BackendLogWriter.close's doc comment for
+            // why this must not be a bare `handle.close()` here.
+            backendLogWriter.close()
             stopBackendAccess(for: backendAccessURL)
             isFinalizing = false
+            // The home-level preview was blocked from (re)starting while
+            // isFinalizing (see startHomeLevelPreviewNow's guard, item 4) -
+            // if the user is still sitting on the start screen, kick it back
+            // on now rather than leaving it dead until they navigate away
+            // and back or hit Refresh.
+            if isStartScreenActive, !isCapturing {
+                Task { await self.startHomeLevelPreview() }
+            }
         }
 
         let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
@@ -2555,7 +2607,7 @@ final class AppModel: ObservableObject {
         backend?.cleanup()
         await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
         synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
-        synchronizeHandle(backendLogHandle, label: "backend log")
+        backendLogWriter.synchronize(label: "backend log")
 
         let model = TranscriptModel()
         model.timestampOffset = timestampOffsetSnapshot
@@ -3292,6 +3344,77 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Finalizes any meeting left at `status: recording` with no live
+    /// session - i.e. the app crashed or was force-quit mid-meeting (see
+    /// engineer-notes/incident-2026-07-06-mainthread-livelock.md, where a
+    /// 54-minute main-thread livelock led to a SIGKILL and the meeting was
+    /// never finalized despite the audio underneath being completely
+    /// healthy). Called from `init()`, before any meeting could possibly be
+    /// live in THIS process, so a `.recording` `meeting.json` found here is
+    /// unconditionally orphaned. Resume stays disabled for the recovered
+    /// meeting - it's `.completed` now, which is the point: the recording is
+    /// over and its audio should be usable in-app (viewer, rediarize,
+    /// export) rather than permanently locked out.
+    private func recoverOrphanedMeetingsIfNeeded() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Muesli", isDirectory: true)
+            .appendingPathComponent("Meetings", isDirectory: true)
+        guard let folders = try? FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for folderURL in folders {
+            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard resourceValues?.isDirectory == true else { continue }
+            guard let metadata = try? readMeetingMetadata(from: folderURL),
+                  OrphanedMeetingRecovery.needsRecovery(metadata) else { continue }
+
+            let wavDuration = wavDurationSeconds(for: folderURL, metadata: metadata)
+            let fallbackEnd = latestModificationDate(for: folderURL) ?? metadata.updatedAt
+            let fallbackDuration = max(0, fallbackEnd.timeIntervalSince(metadata.createdAt))
+            let recovered = OrphanedMeetingRecovery.finalize(
+                metadata,
+                wavDurationSeconds: wavDuration,
+                fallbackDurationSeconds: fallbackDuration,
+                now: Date()
+            )
+            do {
+                try writeMeetingMetadata(recovered, to: folderURL)
+                appendBackendLog(
+                    "Recovered orphaned meeting '\(recovered.title)' left mid-recording (likely a crash or " +
+                    "force-quit) - marked completed, duration=\(String(format: "%.1f", recovered.durationSeconds))s.",
+                    toTail: true
+                )
+            } catch {
+                appendBackendLog(
+                    "Failed to recover orphaned meeting \(folderURL.lastPathComponent): \(error.localizedDescription)",
+                    toTail: true
+                )
+            }
+        }
+    }
+
+    /// The longer of the mic/system wav durations, read via `AVAudioFile` -
+    /// `nil` if neither wav exists or is readable, so the caller can fall
+    /// back to an mtime-based estimate.
+    private func wavDurationSeconds(for folderURL: URL, metadata: MeetingMetadata) -> Double? {
+        let audioFolderName = metadata.sessions.last?.audioFolder ?? findAudioFolderName(in: folderURL) ?? "audio"
+        let audioDir = folderURL.appendingPathComponent(audioFolderName, isDirectory: true)
+        var longest: Double?
+        for name in ["mic.wav", "system.wav"] {
+            let url = audioDir.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path),
+                  let file = try? AVAudioFile(forReading: url),
+                  file.fileFormat.sampleRate > 0 else { continue }
+            let seconds = Double(file.length) / file.fileFormat.sampleRate
+            guard seconds.isFinite else { continue }
+            longest = max(longest ?? 0, seconds)
+        }
+        return longest
     }
 
     private func loadMeetingHistory() {
