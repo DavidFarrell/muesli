@@ -452,13 +452,24 @@ final class AppModel: ObservableObject {
             #if DEBUG
             return .success(venvPythonURL.path)
             #else
-            if FileManager.default.isExecutableFile(atPath: venvPythonURL.path) {
+            if Self.hasExecutePermissionBits(atPath: venvPythonURL.path) {
                 return .success(venvPythonURL.path)
             }
             return .failure(.venvNotExecutable)
             #endif
         }
         return .failure(.venvMissing)
+    }
+
+    /// Checks the file's POSIX mode bits directly. `FileManager.isExecutableFile`
+    /// (access(2) with X_OK) is sandbox-filtered and returns false for files under a
+    /// security-scoped user-selected folder even though spawning them works fine.
+    static func hasExecutePermissionBits(atPath path: String) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let permissions = attrs[.posixPermissions] as? NSNumber else {
+            return false
+        }
+        return permissions.uint16Value & 0o111 != 0
     }
 
     private func loadBackendBookmark() {
@@ -490,12 +501,12 @@ final class AppModel: ObservableObject {
         }
         backendFolderError = "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
         #else
-        if FileManager.default.isExecutableFile(atPath: pythonPath) {
-            backendFolderError = nil
-            return
-        }
         if FileManager.default.fileExists(atPath: pythonPath) {
-            backendFolderError = "Backend venv python is not executable. Recreate it with /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+            if Self.hasExecutePermissionBits(atPath: pythonPath) {
+                backendFolderError = nil
+            } else {
+                backendFolderError = "Backend venv python is not executable. Recreate it with /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
+            }
             return
         }
         backendFolderError = "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
