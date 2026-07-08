@@ -144,7 +144,7 @@ enum MsgType: UInt8 {
     case meetingStop = 4
 }
 
-final class FramedWriter {
+final class FramedWriter: FrameSending {
     private let handle: FileHandle
     private let writeQueue = DispatchQueue(label: "muesli.framed-writer", qos: .userInitiated)
     private var didFail = false

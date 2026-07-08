@@ -2334,6 +2334,14 @@ final class AppModel: ObservableObject {
 
             resetMicDebugState()
             micStartTime = Date()
+            // Marks meeting-timeline zero for the forwarder's PTS clock,
+            // BEFORE the first startMeetingMicEngine() can arm a generation -
+            // see MicAudioForwarder.beginMeeting's doc comment (2026-07-08
+            // mic-stall fix). Unlike micStartTime, this must survive every
+            // mid-meeting engine rebuild, so it is cleared only by the two
+            // true-end teardown paths (teardownFailedMeetingStart, stopMeeting)
+            // calling endMeeting(), never by restartMeetingMicEngineForInputSwitch.
+            await micAudioForwarder.beginMeeting()
             await startMeetingMicEngine()
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
@@ -2448,6 +2456,7 @@ final class AppModel: ObservableObject {
         }
         await micLifecycleTask?.value
         await micAudioForwarder.stop()
+        await micAudioForwarder.endMeeting()
         micStartTime = nil
         resetMicRecoveryLadder()
 
@@ -2534,6 +2543,7 @@ final class AppModel: ObservableObject {
         micEngine = nil
         micEngineStartedAt = nil
         await micAudioForwarder.stop()
+        await micAudioForwarder.endMeeting()
         micStartTime = nil
         resetMicRecoveryLadder()
 

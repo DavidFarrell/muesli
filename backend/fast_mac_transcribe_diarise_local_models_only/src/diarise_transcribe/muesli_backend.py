@@ -13,6 +13,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,17 @@ class StreamWriter:
     pcm: BinaryIO
     last_sample_index: int = 0
     bytes_written: int = 0
+    # Cumulative counters for write_aligned_audio's PTS-alignment drops - see
+    # _log_and_count_drop. Before the 2026-07-08 mic-stall fix these drops
+    # were entirely silent (no log, no counter), which is why that incident's
+    # ~60s of lost mic audio could only be proven after the fact by
+    # inference (engineer-notes/bug-2026-07-08-mic-stall/RCA-2026-07-08.md).
+    # frames_dropped counts DROP EVENTS (one per write_aligned_audio call
+    # that dropped or front-trimmed a frame), not individual PCM sample
+    # frames - bytes_dropped is the actual data-loss measure.
+    frames_dropped: int = 0
+    bytes_dropped: int = 0
+    last_drop_log_time: Optional[float] = None
 
 
 @dataclass
@@ -142,12 +154,55 @@ def rms_int16(pcm: bytes) -> float:
     return (acc / count) ** 0.5
 
 
+DROP_LOG_MIN_INTERVAL_SECONDS = 5.0
+
+
+def _log_and_count_drop(
+    writer: StreamWriter,
+    stream_name: str,
+    *,
+    pts_us: int,
+    start_sample: int,
+    dropped_bytes: int,
+) -> None:
+    """Records a write_aligned_audio drop/trim: always bumps the writer's
+    cumulative counters, and prints a line to stderr - unconditionally on
+    the first occurrence, then rate-limited to at most one line per writer
+    per DROP_LOG_MIN_INTERVAL_SECONDS after that, so a sustained epoch-reset
+    stall (the 2026-07-08 mic-stall shape) doesn't spam a line per frame.
+    Deliberately NOT gated behind `log()`/--verbose - backend.log's stderr
+    lines surface directly in the app's live log, and a drop that corrupts
+    the recording must always be visible there, verbose or not.
+    """
+    writer.frames_dropped += 1
+    writer.bytes_dropped += dropped_bytes
+
+    now = time.monotonic()
+    first_occurrence = writer.last_drop_log_time is None
+    if not first_occurrence and (now - writer.last_drop_log_time) < DROP_LOG_MIN_INTERVAL_SECONDS:
+        return
+    writer.last_drop_log_time = now
+
+    try:
+        print(
+            f"[muesli-backend] AUDIO DROP stream={stream_name} pts_us={pts_us} "
+            f"start_sample={start_sample} last_sample_index={writer.last_sample_index} "
+            f"dropped_bytes={dropped_bytes} "
+            f"cumulative_frames_dropped={writer.frames_dropped} "
+            f"cumulative_bytes_dropped={writer.bytes_dropped}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
 def write_aligned_audio(
     writer: StreamWriter,
     payload: bytes,
     pts_us: int,
     sample_rate: int,
     channels: int,
+    stream_name: str = "unknown",
 ) -> None:
     if not payload:
         return
@@ -174,7 +229,17 @@ def write_aligned_audio(
         overlap_frames = writer.last_sample_index - start_sample
         drop_bytes = overlap_frames * bytes_per_frame
         if drop_bytes >= len(payload):
+            # Whole payload lands behind the write position - previously
+            # dropped with no trace at all (see _log_and_count_drop).
+            _log_and_count_drop(
+                writer, stream_name,
+                pts_us=pts_us, start_sample=start_sample, dropped_bytes=len(payload),
+            )
             return
+        _log_and_count_drop(
+            writer, stream_name,
+            pts_us=pts_us, start_sample=start_sample, dropped_bytes=drop_bytes,
+        )
         payload = payload[drop_bytes:]
 
     writer.wav.writeframes(payload)
@@ -788,7 +853,8 @@ def main() -> int:
                         payload,
                         pts_us,
                         state.system_sample_rate,
-                        state.system_channels
+                        state.system_channels,
+                        stream_name="system"
                     )
                     if args.emit_meters:
                         emit_jsonl({"type": "meter", "stream": "system", "t": t, "rms": rms_int16(payload)}, stdout_writer)
@@ -801,7 +867,8 @@ def main() -> int:
                         payload,
                         pts_us,
                         state.mic_sample_rate,
-                        state.mic_channels
+                        state.mic_channels,
+                        stream_name="mic"
                     )
                     if args.emit_meters:
                         emit_jsonl({"type": "meter", "stream": "mic", "t": t, "rms": rms_int16(payload)}, stdout_writer)
