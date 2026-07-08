@@ -1,5 +1,43 @@
 import Foundation
 
+/// The subset of `FramedWriter` that `MicAudioForwarder` depends on. Exists
+/// purely as a test seam - `FramedWriter` itself needs a real `FileHandle`
+/// and can't be constructed in a unit test, so `MicAudioForwarderTests` uses
+/// a fake conforming to this protocol to capture sent frames instead of
+/// restructuring `FramedWriter`. `FramedWriter` conforms in `BackendProcess.swift`.
+protocol FrameSending: AnyObject {
+    func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
+}
+
+/// Abstraction over a monotonic time source, used for the forwarder's
+/// meeting-epoch PTS clock. Injectable so tests can simulate a generation
+/// restart at an arbitrary elapsed time without depending on wall-clock
+/// `Date` - the 2026-07-08 mic-stall RCA
+/// (`engineer-notes/bug-2026-07-08-mic-stall/RCA-2026-07-08.md`) specifically
+/// rules `Date` out for this purpose: an NTP step mid-meeting would corrupt
+/// the PTS timeline the backend's `write_aligned_audio` aligns writes
+/// against. Production uses `SystemMicMonotonicClock`.
+protocol MicMonotonicClock: Sendable {
+    /// Monotonically non-decreasing microseconds. Only differences between
+    /// two calls carry meaning - the absolute value has no defined epoch.
+    func nowMicroseconds() -> Int64
+}
+
+/// Production clock: wraps `ContinuousClock`, which - unlike `SuspendingClock`
+/// - keeps advancing across machine sleep, so a sleep/wake cycle mid-meeting
+/// still produces a PTS gap the backend pads with silence rather than a
+/// clock that silently stops (and unlike `Date`, is immune to NTP steps).
+struct SystemMicMonotonicClock: MicMonotonicClock {
+    private static let clock = ContinuousClock()
+    private static let referenceInstant = clock.now
+
+    func nowMicroseconds() -> Int64 {
+        let elapsed = Self.clock.now - Self.referenceInstant
+        let components = elapsed.components
+        return components.seconds * 1_000_000 + components.attoseconds / 1_000_000_000_000
+    }
+}
+
 /// Confines the mic-audio hot path (level compute + `FramedWriter` delivery)
 /// to its own actor so a MainActor render storm can never stall mic capture
 /// - the exact failure mode of the 2026-07-06 livelock incident. Mic buffers
@@ -19,10 +57,25 @@ import Foundation
 /// touching per-buffer state on MainActor - critical so the watchdog's stall
 /// detection stays correct even when MainActor itself is temporarily busy
 /// (a delayed MainActor mirror must never be misread as "mic stopped").
+/// Mic-side pending buffer entry, queued between tap install and
+/// `setOutputEnabled(true)`. Deliberately NOT the identically-shaped
+/// `PendingAudio` in `CaptureEngine.swift` (the system-audio side's own
+/// pending-buffer type) - keeping the two independent means this file has no
+/// dependency on `CaptureEngine.swift`, which is out of scope for the
+/// 2026-07-08 mic-stall fix (see that RCA) and pulls in ScreenCaptureKit/
+/// AVFoundation, unnecessary weight for `MicAudioForwarderTests` to compile
+/// against.
+private struct MicPendingAudio {
+    let ptsUs: Int64
+    let payload: Data
+    let sampleRate: Int
+    let channels: Int
+}
+
 actor MicAudioForwarder {
-    private var writer: FramedWriter?
+    private var writer: FrameSending?
     private var micOutputEnabled = false
-    private var pendingMicAudio: [PendingAudio] = []
+    private var pendingMicAudio: [MicPendingAudio] = []
     private let maxPendingMicAudio = 200
 
     private(set) var frameCount: Int = 0
@@ -30,6 +83,13 @@ actor MicAudioForwarder {
     private var hadFirstFrameThisGeneration = false
     private var startedAt: Date?
     private var generation: Int = 0
+
+    private let clock: MicMonotonicClock
+    /// Meeting-timeline zero for PTS purposes: set once by `beginMeeting()`
+    /// and left untouched across every `beginGeneration()`/`stop()` call
+    /// until `endMeeting()`. This is the fix for the 2026-07-08 mic-stall
+    /// incident - see that method's doc comment.
+    private var meetingEpochUs: Int64?
 
     private var meterGate = MeterPublishGate(minPublishInterval: 0.066)
     // A frame following a gap this long always surfaces regardless of level
@@ -43,9 +103,35 @@ actor MicAudioForwarder {
     private let sampleRate: Int
     private let channels: Int
 
-    init(sampleRate: Int, channels: Int) {
+    init(sampleRate: Int, channels: Int, clock: MicMonotonicClock = SystemMicMonotonicClock()) {
         self.sampleRate = sampleRate
         self.channels = channels
+        self.clock = clock
+    }
+
+    /// Marks meeting-timeline zero for PTS purposes. Call exactly once, at
+    /// true meeting start, before the first `beginGeneration()` of the
+    /// meeting (see `AppModel.startMeeting`, where this sits alongside the
+    /// existing `micStartTime = Date()` assignment). Unlike `beginGeneration`,
+    /// this must NOT be called again on a mid-meeting engine rebuild: the
+    /// backend aligns file writes to this epoch (`write_aligned_audio`), so
+    /// resetting it on every watchdog rebuild is exactly the 2026-07-08
+    /// mic-stall regression this fixes - PTS would restart at zero while the
+    /// output file position keeps advancing, and the backend would silently
+    /// drop every mic frame until the new PTS clock caught back up (see
+    /// `engineer-notes/bug-2026-07-08-mic-stall/RCA-2026-07-08.md`).
+    func beginMeeting() {
+        meetingEpochUs = clock.nowMicroseconds()
+    }
+
+    /// Clears the meeting epoch at true meeting end. Deliberately separate
+    /// from `stop()`, which is ALSO called mid-meeting (input-device
+    /// restarts via `restartMeetingMicEngineForInputSwitch`) and must not
+    /// lose the epoch there - only `AppModel`'s true end-of-meeting teardown
+    /// paths (failed-start teardown and `stopMeeting`) call this, alongside
+    /// their existing `micStartTime = nil`.
+    func endMeeting() {
+        meetingEpochUs = nil
     }
 
     /// Ground-truth liveness data, cheap enough to poll from a background
@@ -65,8 +151,11 @@ actor MicAudioForwarder {
     /// Called once per engine (re)start, BEFORE `engine.start()` so no buffer
     /// can arrive before the generation is armed - eliminates the narrow
     /// startup race the old MainActor-side `pendingMicAudio` mechanism was
-    /// guarding against, rather than needing to reproduce it.
-    func beginGeneration(_ generation: Int, writer: FramedWriter?) {
+    /// guarding against, rather than needing to reproduce it. Resets all
+    /// per-generation liveness state (frame count, first-frame flag, the
+    /// generation's own `startedAt`) but deliberately does NOT touch
+    /// `meetingEpochUs` - see `beginMeeting`.
+    func beginGeneration(_ generation: Int, writer: FrameSending?) {
         self.generation = generation
         self.writer = writer
         micOutputEnabled = false
@@ -92,6 +181,10 @@ actor MicAudioForwarder {
     }
 
     /// Full stop: drop the writer reference and any still-pending audio.
+    /// Called BOTH mid-meeting (`restartMeetingMicEngineForInputSwitch`, ahead
+    /// of a fresh `beginGeneration`) and at true meeting end - it must
+    /// therefore NEVER clear `meetingEpochUs` itself; only `endMeeting()`
+    /// (called separately, only at true meeting end) does that.
     func stop() {
         writer = nil
         micOutputEnabled = false
@@ -103,6 +196,11 @@ actor MicAudioForwarder {
     struct DeliveryResult {
         let level: Float
         let frameSampleCount: Int
+        /// Seconds since the MEETING epoch (`beginMeeting`), not since this
+        /// generation started - restores the pre-2026-07-06 meaning of the
+        /// old `debugMicPTS` display value. See `MicAudioForwarder`'s and
+        /// `beginMeeting`'s doc comments for why this must survive
+        /// generation rebuilds.
         let elapsedSeconds: Double
         let isFirstFrame: Bool
         /// True when this delivery surfaced ONLY because it followed a long
@@ -129,9 +227,20 @@ actor MicAudioForwarder {
     func deliver(_ data: Data, generation callerGeneration: Int) -> DeliveryResult? {
         guard callerGeneration == generation else { return nil }
         let now = Date()
+        // `startedAt` is per-generation bookkeeping only (part of the
+        // liveness `Snapshot`) - it plays no part in the PTS computation
+        // below any more. See `meetingEpochUs`/`beginMeeting` for the actual
+        // PTS anchor.
         if startedAt == nil { startedAt = now }
-        let elapsed = now.timeIntervalSince(startedAt ?? now)
-        let ptsUs = Int64(elapsed * 1_000_000.0)
+        let nowUs = clock.nowMicroseconds()
+        // `meetingEpochUs` should always be set by the time a frame arrives
+        // (AppModel calls `beginMeeting()` before `startMeetingMicEngine()`
+        // ever runs) - this self-heals rather than crashing or emitting a
+        // nonsensical negative PTS in case that invariant is ever violated,
+        // treating an unexpectedly-epoch-less first frame as meeting-timeline
+        // zero.
+        if meetingEpochUs == nil { meetingEpochUs = nowUs }
+        let ptsUs = nowUs - (meetingEpochUs ?? nowUs)
         let isFirstFrame = !hadFirstFrameThisGeneration
         hadFirstFrameThisGeneration = true
         let secondsSinceLastFrame = lastFrameAt.map { now.timeIntervalSince($0) }
@@ -143,7 +252,7 @@ actor MicAudioForwarder {
         if micOutputEnabled {
             writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: data)
         } else {
-            pendingMicAudio.append(PendingAudio(
+            pendingMicAudio.append(MicPendingAudio(
                 ptsUs: ptsUs, payload: data, sampleRate: sampleRate, channels: channels
             ))
             if pendingMicAudio.count > maxPendingMicAudio {
@@ -163,7 +272,7 @@ actor MicAudioForwarder {
         return DeliveryResult(
             level: level,
             frameSampleCount: data.count / 2,
-            elapsedSeconds: elapsed,
+            elapsedSeconds: Double(ptsUs) / 1_000_000.0,
             isFirstFrame: isFirstFrame,
             isResumptionAfterGap: mustSurface && !isFirstFrame
         )
