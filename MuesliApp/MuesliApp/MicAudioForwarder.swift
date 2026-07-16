@@ -58,12 +58,11 @@ struct SystemMicMonotonicClock: MicMonotonicClock {
 /// detection stays correct even when MainActor itself is temporarily busy
 /// (a delayed MainActor mirror must never be misread as "mic stopped").
 /// Mic-side pending buffer entry, queued between tap install and
-/// `setOutputEnabled(true)`. Deliberately NOT the identically-shaped
-/// `PendingAudio` in `CaptureEngine.swift` (the system-audio side's own
-/// pending-buffer type) - keeping the two independent means this file has no
-/// dependency on `CaptureEngine.swift`, which is out of scope for the
-/// 2026-07-08 mic-stall fix (see that RCA) and pulls in ScreenCaptureKit/
-/// AVFoundation, unnecessary weight for `MicAudioForwarderTests` to compile
+/// `setOutputEnabled(true)`. Deliberately NOT shared with the system-audio
+/// side's pending-buffer type (`PendingAudioGate.Item`) - keeping the two
+/// independent means this file has no dependency on the capture-side
+/// machinery, which is out of scope for the 2026-07-08 mic-stall fix (see
+/// that RCA) and unnecessary weight for `MicAudioForwarderTests` to compile
 /// against.
 private struct MicPendingAudio {
     let ptsUs: Int64
@@ -76,17 +75,19 @@ actor MicAudioForwarder {
     private var writer: FrameSending?
     private var micOutputEnabled = false
     private var pendingMicAudio: [MicPendingAudio] = []
-    /// Ring cap while output is disabled. Originally 200 (the brief
-    /// tap-install -> setOutputEnabled window); since the backend-readiness
-    /// handshake (2026-07-16 RCA rec #3) this ring also carries the whole
-    /// startup window until the backend acknowledges meeting_started - up to
-    /// ~10s plus margin. Sizing: the 4096-frame tap at a 48kHz device is
-    /// ~85ms per buffer (~2.7KB converted to 16k mono int16), so 512 buffers
-    /// ≈ 43s / ~1.4MB worst case - cheap, and comfortably more than the 10s
-    /// readiness timeout even on a 96kHz device (~22s). Overflow drops the
-    /// OLDEST audio first: late early-meeting audio is acceptable, a lost
-    /// meeting is not.
-    private let maxPendingMicAudio = 512
+    private var pendingMicBytes = 0
+    /// Ring cap while output is disabled, in PCM BYTES - deliberately not a
+    /// callback count (gate BLOCKER 2 on the 2026-07-16 slice): callback
+    /// cadence is engine-dependent (the AVAudioEngine tap chunks at 4096
+    /// frames ≈ 85ms, but `CaptureSessionMicEngine`'s
+    /// AVCaptureAudioDataOutput has no such guarantee and can deliver far
+    /// smaller buffers), so a count cap covers an unpredictable wall-time
+    /// span. Bytes are cadence-independent: post-conversion audio is 16kHz
+    /// mono int16 = 32,000 B/s, so the 2MiB default ≈ 65s - covering engine
+    /// start -> capture setup (~2-3s) -> the 10s readiness timeout with a
+    /// wide margin, while bounding memory. Overflow drops the OLDEST audio
+    /// first: late early-meeting audio is acceptable, a lost meeting is not.
+    private let maxPendingMicBytes: Int
 
     private(set) var frameCount: Int = 0
     private(set) var lastFrameAt: Date?
@@ -113,10 +114,16 @@ actor MicAudioForwarder {
     private let sampleRate: Int
     private let channels: Int
 
-    init(sampleRate: Int, channels: Int, clock: MicMonotonicClock = SystemMicMonotonicClock()) {
+    init(
+        sampleRate: Int,
+        channels: Int,
+        clock: MicMonotonicClock = SystemMicMonotonicClock(),
+        maxPendingBytes: Int = 2 * 1024 * 1024
+    ) {
         self.sampleRate = sampleRate
         self.channels = channels
         self.clock = clock
+        self.maxPendingMicBytes = maxPendingBytes
     }
 
     /// Marks meeting-timeline zero for PTS purposes. Call exactly once, at
@@ -174,17 +181,25 @@ actor MicAudioForwarder {
         hadFirstFrameThisGeneration = false
         startedAt = nil
         pendingMicAudio.removeAll()
+        pendingMicBytes = 0
         meterGate = MeterPublishGate(minPublishInterval: 0.066)
     }
 
-    /// Flip on right after a successful engine start (mirrors the exact
-    /// timing of the old `micOutputEnabled = true`), flushing anything that
-    /// arrived in the brief window between tap install and this call.
+    /// Flip on right after a successful engine start (or, under the
+    /// readiness handshake, when the backend acknowledges meeting_started),
+    /// flushing anything queued while output was disabled.
+    ///
+    /// Ordering note (the system-audio side's gate BLOCKER 1 does NOT apply
+    /// here): this is a synchronous actor-isolated method with no suspension
+    /// points, and `deliver` is actor-isolated too - so the flush and the
+    /// `micOutputEnabled` flip are atomic with respect to deliveries. A
+    /// frame can never be sent live ahead of the still-unflushed prefix.
     func setOutputEnabled(_ enabled: Bool) {
         micOutputEnabled = enabled
         guard enabled, !pendingMicAudio.isEmpty else { return }
         let pending = pendingMicAudio
         pendingMicAudio.removeAll()
+        pendingMicBytes = 0
         for item in pending {
             writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
         }
@@ -199,6 +214,7 @@ actor MicAudioForwarder {
         writer = nil
         micOutputEnabled = false
         pendingMicAudio.removeAll()
+        pendingMicBytes = 0
     }
 
     /// Everything a caller needs to update MainActor-side bookkeeping after a
@@ -265,8 +281,10 @@ actor MicAudioForwarder {
             pendingMicAudio.append(MicPendingAudio(
                 ptsUs: ptsUs, payload: data, sampleRate: sampleRate, channels: channels
             ))
-            if pendingMicAudio.count > maxPendingMicAudio {
-                pendingMicAudio.removeFirst(pendingMicAudio.count - maxPendingMicAudio)
+            pendingMicBytes += data.count
+            while pendingMicBytes > maxPendingMicBytes, !pendingMicAudio.isEmpty {
+                let evicted = pendingMicAudio.removeFirst()
+                pendingMicBytes -= evicted.payload.count
             }
         }
 

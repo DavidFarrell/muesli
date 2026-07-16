@@ -19,13 +19,6 @@ struct PCMChunk {
     let frameCount: Int
 }
 
-struct PendingAudio {
-    let ptsUs: Int64
-    let payload: Data
-    let sampleRate: Int
-    let channels: Int
-}
-
 final class AudioSampleExtractor {
     func extractInt16Mono(from sampleBuffer: CMSampleBuffer) throws -> PCMChunk {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
@@ -216,8 +209,6 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     private(set) var meetingStartPTS: CMTime?
     private var writer: FramedWriter?
     private struct AudioState {
-        var audioOutputEnabled = false
-        var pendingSystemAudio: [PendingAudio] = []
         var systemSampleRate: Int?
         var systemChannelCount: Int?
     }
@@ -235,15 +226,14 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private let audioState = AudioStateStore(AudioState())
-    /// Pending-ring cap while audio output is disabled. Originally 200
-    /// (covering only startCapture -> setAudioOutputEnabled); since the
-    /// backend-readiness handshake (2026-07-16 RCA rec #3) output stays
-    /// disabled until the backend acknowledges meeting_started - up to ~10s
-    /// plus margin - and SCK's 16kHz buffer cadence is device/OS dependent
-    /// (tens of ms per buffer), so 200 could underrun the window. 1024
-    /// covers >=10s even at a 10ms cadence; items are ~0.3-3KB, so worst
-    /// case a few MB, transiently. Overflow drops the OLDEST audio first.
-    private let maxPendingAudio = 1024
+    /// Buffer-until-ready gate for the readiness handshake window (2026-07-16
+    /// RCA rec #3): output stays disabled until the backend acknowledges
+    /// meeting_started, so this carries capture start -> acknowledgment
+    /// (~2-3s setup + the 10s handshake timeout). Byte-capped (not
+    /// callback-count-capped - SCK cadence is device/OS dependent) and its
+    /// enable+flush is atomic with respect to concurrent callbacks - see
+    /// PendingAudioGate's doc comment for both gate-blocker rationales.
+    private let systemAudioGate = PendingAudioGate()
 
     var systemLevel: Float = 0
 
@@ -268,9 +258,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         writer: FramedWriter?,
         recordTo url: URL?
     ) async throws {
+        systemAudioGate.reset()
         audioState.withState { state in
-            state.audioOutputEnabled = false
-            state.pendingSystemAudio.removeAll()
             state.systemSampleRate = nil
             state.systemChannelCount = nil
         }
@@ -320,9 +309,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         self.recordingOutput = nil
         self.writer = nil
         self.meetingStartPTS = nil
+        systemAudioGate.reset()
         audioState.withState { state in
-            state.audioOutputEnabled = false
-            state.pendingSystemAudio.removeAll()
             state.systemSampleRate = nil
             state.systemChannelCount = nil
         }
@@ -361,17 +349,17 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func setAudioOutputEnabled(_ enabled: Bool) {
-        var systemPending: [PendingAudio] = []
-        audioState.withState { state in
-            state.audioOutputEnabled = enabled
-            if enabled {
-                systemPending = state.pendingSystemAudio
-                state.pendingSystemAudio.removeAll()
-            }
+        guard enabled else {
+            systemAudioGate.reset()
+            return
         }
-
-        guard enabled else { return }
-        for item in systemPending {
+        // Flush + enable atomically (gate BLOCKER 1 fix): the buffered
+        // startup prefix is enqueued on the writer's serial queue INSIDE the
+        // gate's critical section, so a concurrent capture callback can
+        // never send a newer PTS ahead of it - which would make the
+        // backend's PTS-aligned writer silently drop the whole prefix.
+        let writer = self.writer
+        systemAudioGate.enableAndFlush { item in
             writer?.send(type: .audio, stream: .system, ptsUs: item.ptsUs, payload: item.payload)
         }
     }
@@ -435,32 +423,28 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
                 detectedChannels = Int(asbd.mChannelsPerFrame)
             }
 
-            let canWrite = audioState.withState { state -> Bool in
+            audioState.withState { state in
                 if type == .audio {
                     if state.systemSampleRate == nil, let detectedSampleRate {
                         state.systemSampleRate = detectedSampleRate
                         state.systemChannelCount = detectedChannels
                     }
                 }
-
-                let canWrite = state.audioOutputEnabled
-                if !canWrite, type == .audio {
-                    state.pendingSystemAudio.append(PendingAudio(
-                        ptsUs: ptsUs,
-                        payload: pcm.data,
-                        sampleRate: detectedSampleRate ?? sampleRate,
-                        channels: detectedChannels ?? channelCount
-                    ))
-                    if state.pendingSystemAudio.count > maxPendingAudio {
-                        state.pendingSystemAudio.removeFirst(state.pendingSystemAudio.count - maxPendingAudio)
-                    }
-                }
-                return canWrite
             }
 
-            guard canWrite else { return }
-            if type == .audio {
-                writer?.send(type: .audio, stream: .system, ptsUs: ptsUs, payload: pcm.data)
+            guard type == .audio else { return }
+            // No writer means the home-screen level preview: metering only,
+            // nothing to forward now or ever - skip the gate entirely so a
+            // preview idling on the start screen can't accumulate buffered
+            // audio it will never flush.
+            guard let writer else { return }
+            // Gate open: forward live (SCK delivers these callbacks serially
+            // on one queue, and admitOrBuffer only returns true once
+            // enableAndFlush's prefix sends are already enqueued, so this
+            // send can never overtake the flushed prefix). Gate closed: the
+            // frame was buffered for the readiness flush.
+            if systemAudioGate.admitOrBuffer(.init(ptsUs: ptsUs, payload: pcm.data)) {
+                writer.send(type: .audio, stream: .system, ptsUs: ptsUs, payload: pcm.data)
             }
         } catch {
             let formatInfo = formatString(from: sampleBuffer) ?? "-"

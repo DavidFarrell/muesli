@@ -62,7 +62,16 @@ final class BackendStartupGate {
         while true {
             if isReady { return .ready }
             if !isProcessAlive() { return .processExited }
-            if Date() >= deadline { return .timedOut }
+            if Date() >= deadline {
+                // Wall-clock deadlines and MainActor scheduling can drift
+                // apart: if the actor was briefly starved, a markReady()
+                // from the stdout task may be sitting right behind this
+                // turn. Yield once and re-check before declaring a timeout
+                // - a spurious timeout is fail-safe (loud teardown, no data
+                // loss) but still worth avoiding when one yield prevents it.
+                await Task.yield()
+                return isReady ? .ready : .timedOut
+            }
             try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
         }
     }

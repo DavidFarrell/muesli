@@ -1532,6 +1532,8 @@ final class AppModel: ObservableObject {
                     "outstandingBytes": snap.outstandingBytes,
                     "droppedFrames": snap.droppedFrames,
                     "droppedBytes": snap.droppedBytes,
+                    "failedWrites": snap.failedWrites,
+                    "rejectedAfterClose": snap.rejectedAfterCloseFrames,
                     "stalledSeconds": Int(snap.secondsSinceLastProgress ?? -1)
                 ])
             }
@@ -2218,14 +2220,6 @@ final class AppModel: ObservableObject {
         backendFolderError = nil
         shareableContentError = nil
         tempTranscriptFolderPath = nil
-        // Fresh handshake + backpressure state for this attempt (2026-07-16
-        // RCA recs #2/#3). The gate MUST be closed before the mic engine can
-        // start - attemptMeetingMicEngineStart checks it to decide whether
-        // audio may flow to the pipe yet.
-        backendStartupGate.reset()
-        backendWriteStalled = false
-        backendStallLogTicks = 0
-        meters.clearBackendAlert()
         if shouldShowOnboarding {
             showPermissionsSheet = true
             return
@@ -2237,6 +2231,18 @@ final class AppModel: ObservableObject {
             shareableContentError = "Select at least one transcription source."
             return
         }
+
+        // Fresh handshake + backpressure state for this attempt (2026-07-16
+        // RCA recs #2/#3). The gate MUST be closed before the mic engine can
+        // start - attemptMeetingMicEngineStart checks it to decide whether
+        // audio may flow to the pipe yet. Deliberately AFTER every early
+        // return above (gate advisory): resetting before the `!isCapturing`
+        // guard would close the gate under a still-active meeting, silently
+        // re-buffering its mic forwarding on the next engine rebuild.
+        backendStartupGate.reset()
+        backendWriteStalled = false
+        backendStallLogTicks = 0
+        meters.clearBackendAlert()
 
         guard let backendProjectRoot = backendFolderURL else {
             shareableContentError = "Select the backend folder before starting."
@@ -2724,15 +2730,18 @@ final class AppModel: ObservableObject {
         micStartTime = nil
         resetMicRecoveryLadder()
 
-        // Stop-path hardening (2026-07-16 RCA rec #6): meetingStop and the
-        // drained close queue BEHIND any write currently blocked on a full
-        // pipe, so against a wedged (alive-but-not-reading) child they never
-        // arrive and stop used to hang for the full 120s exit timeout. If
-        // the backpressure detector has fired - or the queue is stalled
-        // right now - skip the drain entirely: force-close stdin directly
-        // (EOF for a healthy-but-slow child, no-op for a wedged one) and let
-        // finalize's shortened SIGTERM/SIGKILL escalation do the rest.
-        let backendStalledAtStop = backendWriteStalled || (writer?.isBacklogStalled() ?? false)
+        // Stop-path hardening (2026-07-16 RCA rec #6). meetingStop and the
+        // close both go through the writer's serial queue - against a
+        // wedged (alive-but-not-reading) child they queue behind the
+        // blocked write and never arrive, and the finalize wait below is
+        // what escalates (its no-progress check re-measures LIVE, so this
+        // at-stop snapshot is diagnostic only - deliberately NOT the stale
+        // backendWriteStalled latch, which can outlive a recovery by a
+        // watchdog tick; gate BLOCKER 4). meetingStop is sent even when
+        // stalled: it is a control frame, and if the child recovers during
+        // finalize it should still stop cleanly.
+        let backendStalledAtStop = writer?.isBacklogStalled() ?? false
+        writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         if backendStalledAtStop {
             let snap = writer?.backlogSnapshot()
             AudioLog.error("writequeue.stalled-at-stop", [
@@ -2740,10 +2749,11 @@ final class AppModel: ObservableObject {
                 "outstandingBytes": snap?.outstandingBytes ?? -1,
                 "droppedFrames": snap?.droppedFrames ?? -1
             ])
-            appendBackendLog("Backend write queue stalled at stop; bypassing drain and force-closing stdin.", toTail: true)
+            appendBackendLog("Backend write queue stalled at stop; new sends rejected, close queued.", toTail: true)
+            // Same queued close as the healthy path, plus reject any
+            // further sends with accounting.
             writer?.forceCloseStdin()
         } else {
-            writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
             writer?.closeStdinAfterDraining()
         }
         backendStartupGate.reset()
@@ -2753,6 +2763,7 @@ final class AppModel: ObservableObject {
 
         let stoppingSession = currentSession
         let stoppingBackend = backend
+        let stoppingWriter = writer
         let stoppingStdoutTask = stdoutTask
         let stoppingBackendLogHandle = backendLogHandle
         let stoppingTranscriptEventsHandle = transcriptEventsHandle
@@ -2798,7 +2809,7 @@ final class AppModel: ObservableObject {
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
                 speakerNamesSnapshot: stoppingSpeakerNames,
                 timestampOffsetSnapshot: stoppingTimestampOffset,
-                backendWasStalled: backendStalledAtStop
+                writer: stoppingWriter
             )
         }
     }
@@ -2814,7 +2825,7 @@ final class AppModel: ObservableObject {
         transcriptSegmentsSnapshot: [TranscriptSegment],
         speakerNamesSnapshot: [String: String],
         timestampOffsetSnapshot: Double,
-        backendWasStalled: Bool = false
+        writer: FramedWriter? = nil
     ) async {
         defer {
             closeHandle(transcriptEventsHandle)
@@ -2834,12 +2845,23 @@ final class AppModel: ObservableObject {
             }
         }
 
-        // A backend whose write queue stalled (alive-but-not-reading, the
-        // 2026-07-16 incident) will not see the stdin EOF and cannot exit on
-        // its own - waiting the normal 120s finalize grace is pointless.
-        // 5s is a courtesy window in case it was merely slow; then escalate.
-        let exitTimeout: Double = backendWasStalled ? 5 : 120
-        let exitStatus = await backend?.waitForExit(timeoutSeconds: exitTimeout)
+        // Exit wait with LIVE stall escalation (gate BLOCKER 4 fix): a
+        // healthy finalize (joining ASR workers, muesli_backend stop path)
+        // legitimately takes tens of seconds and always keeps the full 120s
+        // grace - including a backend that stalled mid-meeting and then
+        // RECOVERED, which the old fixed-5s-when-stalled-latch design would
+        // have SIGTERMed mid-finalize, losing the transcript tail. Early
+        // escalation happens only on live evidence of a wedged child: the
+        // writer's queue re-measured EVERY second as having work outstanding
+        // with zero completions for 15s straight (any progress resets the
+        // clock inside the tracker).
+        let exitStatus = await waitForBackendExit(
+            backend: backend,
+            writer: writer,
+            maxWaitSeconds: 120,
+            escalateAfterNoProgressSeconds: 15,
+            logHandle: backendLogHandle
+        )
         if exitStatus == nil {
             appendBackendLog(
                 "Backend did not exit after stop; terminating.",
@@ -2889,6 +2911,45 @@ final class AppModel: ObservableObject {
         } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
             meetingHistory.insert(updatedItem, at: 0)
         }
+    }
+
+    /// Post-stop exit wait: up to `maxWaitSeconds` for a clean exit, but
+    /// gives up early when the stopped meeting's writer shows SUSTAINED
+    /// zero progress with work still queued - the wedged-child signature
+    /// (2026-07-16 RCA), re-measured fresh on every 1s tick rather than
+    /// carried over from any mid-meeting stall flag. Returning nil sends
+    /// the caller into the SIGTERM->SIGKILL escalation, whose kill closes
+    /// the pipe's read end and thereby unblocks the write the queued
+    /// stdin-close is stuck behind (see FramedWriter.forceCloseStdin).
+    private func waitForBackendExit(
+        backend: BackendProcess?,
+        writer: FramedWriter?,
+        maxWaitSeconds: Double,
+        escalateAfterNoProgressSeconds: Double,
+        logHandle: FileHandle?
+    ) async -> Int32? {
+        guard let backend else { return nil }
+        let deadline = Date().addingTimeInterval(maxWaitSeconds)
+        while Date() < deadline {
+            if let status = await backend.waitForExit(timeoutSeconds: 1.0) {
+                return status
+            }
+            if let writer, writer.hasMadeNoProgress(forAtLeast: escalateAfterNoProgressSeconds) {
+                let snap = writer.backlogSnapshot()
+                AudioLog.error("writequeue.stalled-at-finalize", [
+                    "outstandingFrames": snap.outstandingFrames,
+                    "outstandingBytes": snap.outstandingBytes,
+                    "noProgressSeconds": Int(snap.secondsSinceLastProgress ?? -1)
+                ])
+                appendBackendLog(
+                    "Backend write queue made no progress for \(Int(escalateAfterNoProgressSeconds))s after stop; escalating termination.",
+                    toTail: false,
+                    handle: logHandle
+                )
+                return nil
+            }
+        }
+        return nil
     }
 
     private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {

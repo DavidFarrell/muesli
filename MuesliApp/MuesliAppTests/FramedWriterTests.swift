@@ -150,13 +150,14 @@ final class FramedWriterTests: XCTestCase {
 
         writer.forceCloseStdin()
 
-        // Post-close sends are no-ops: nothing enqueued, nothing dropped -
-        // the writer is done, not backlogged.
+        // Post-close sends are rejected with accounting: nothing enqueued,
+        // nothing counted as a cap drop - the writer is done, not backlogged.
         writer.send(type: .audio, stream: .mic, ptsUs: 1, payload: payload)
         writer.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
         let snap = writer.backlogSnapshot()
         XCTAssertEqual(snap.totalEnqueuedFrames, 1)
         XCTAssertEqual(snap.droppedFrames, 0)
+        XCTAssertEqual(snap.rejectedAfterCloseFrames, 2)
 
         // The reader sees the one delivered frame then EOF.
         let expected = Self.headerByteCount + payload.count
@@ -176,5 +177,69 @@ final class FramedWriterTests: XCTestCase {
         writer.forceCloseStdin() // second close must not crash (try? close)
         writer.closeStdinAfterDraining() // nor the queued close afterwards
         XCTAssertTrue(waitUntil(timeout: 1.0) { true })
+    }
+
+    /// The gate BLOCKER 3 regression test - the exact wedged-child stop
+    /// sequence. forceCloseStdin must NOT touch the handle from the caller's
+    /// thread while a write sits blocked on the writeQueue (NSFileHandle is
+    /// not safe for simultaneous multi-thread use); the close queues behind
+    /// the blocked write instead, and the designed unblocking agent is the
+    /// reader's death (in production: SIGTERM/SIGKILL closing the pipe's
+    /// read end). This test performs that whole ordering against a real
+    /// blocked pipe write.
+    func testForceCloseBehindBlockedWriteResolvesOnceReaderCloses() {
+        // The blocked write fails with EPIPE when the read end closes; make
+        // sure the accompanying SIGPIPE cannot kill the test process.
+        signal(SIGPIPE, SIG_IGN)
+
+        let pipe = Pipe()
+        let payload = Data(repeating: 0x77, count: 65_536)
+        let frameBytes = Self.headerByteCount + payload.count
+        let writer = FramedWriter(
+            stdinHandle: pipe.fileHandleForWriting,
+            maxOutstandingBytes: frameBytes * 3,
+            stallThresholdSeconds: 0.25
+        )
+        let errorLock = NSLock()
+        var writeErrors = 0
+        writer.onWriteError = { _ in
+            errorLock.lock()
+            writeErrors += 1
+            errorLock.unlock()
+        }
+
+        // Nobody reads: the first frame's payload write blocks in the
+        // kernel; the second queues behind it.
+        writer.send(type: .audio, stream: .mic, ptsUs: 0, payload: payload)
+        writer.send(type: .audio, stream: .mic, ptsUs: 1, payload: payload)
+        XCTAssertTrue(
+            waitUntil(timeout: 1.0) { writer.isBacklogStalled() },
+            "the blocked write must register as a stall first"
+        )
+
+        // Force-close with the write still blocked: must not crash, must
+        // not unblock anything by itself (the close is queue-ordered), and
+        // must reject anything sent afterwards.
+        writer.forceCloseStdin()
+        writer.send(type: .audio, stream: .mic, ptsUs: 2, payload: payload)
+        var snap = writer.backlogSnapshot()
+        XCTAssertEqual(snap.totalEnqueuedFrames, 2)
+        XCTAssertEqual(snap.rejectedAfterCloseFrames, 1)
+        XCTAssertEqual(snap.totalCompletedFrames, 0, "the write is still blocked - nothing completed")
+
+        // The reader dies (production: SIGKILL). The kernel write fails
+        // over with EPIPE, the queue drains fast, the queued close runs.
+        try? pipe.fileHandleForReading.close()
+        XCTAssertTrue(
+            waitUntil(timeout: 2.0) { writer.backlogSnapshot().outstandingFrames == 0 },
+            "reader death must unblock and drain the queue"
+        )
+        snap = writer.backlogSnapshot()
+        XCTAssertEqual(snap.totalCompletedFrames, 2, "both queued frames complete (by failing fast)")
+        XCTAssertGreaterThanOrEqual(snap.failedWrites, 1, "failed writes are accounted")
+        errorLock.lock()
+        let observedErrors = writeErrors
+        errorLock.unlock()
+        XCTAssertEqual(observedErrors, 1, "onWriteError fires exactly once (didFail gate)")
     }
 }

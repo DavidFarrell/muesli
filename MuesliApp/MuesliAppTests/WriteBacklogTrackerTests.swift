@@ -86,6 +86,45 @@ final class WriteBacklogTrackerTests: XCTestCase {
         XCTAssertFalse(tracker.isStalled(now: at(20)), "empty queue - stall must clear")
     }
 
+    /// Gate BLOCKER 4 semantics: stall state must be a LIVE measurement,
+    /// never a latch. The incident pattern it guards: stall -> recover ->
+    /// immediate Stop must NOT read as stalled (the old design consulted a
+    /// flag that only cleared on the next 2s watchdog tick, sending a
+    /// legitimately-finalizing backend down the kill-fast path).
+    func testRecoveryClearsStallImmediatelyWithoutAnyTickDelay() {
+        var tracker = makeTracker(stallThresholdSeconds: 5.0)
+        _ = tracker.recordEnqueue(bytes: 100, droppable: true, now: at(0))
+        _ = tracker.recordEnqueue(bytes: 100, droppable: true, now: at(1))
+        XCTAssertTrue(tracker.isStalled(now: at(6)))
+        tracker.recordCompletion(bytes: 100, now: at(6.5))
+        XCTAssertFalse(
+            tracker.isStalled(now: at(6.51)),
+            "one completion clears the stall instantly - no watchdog-tick latency, no latch"
+        )
+    }
+
+    /// The post-stop escalation predicate: sustained zero progress with
+    /// work outstanding, measured fresh - a recovered or drained queue can
+    /// never satisfy it, so a healthy finalize keeps its full exit grace.
+    func testHasMadeNoProgressIsLiveAndRequiresOutstandingWork() {
+        var tracker = makeTracker(stallThresholdSeconds: 5.0)
+        XCTAssertFalse(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(100)), "nothing ever enqueued")
+
+        _ = tracker.recordEnqueue(bytes: 100, droppable: true, now: at(0))
+        XCTAssertFalse(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(14.9)))
+        XCTAssertTrue(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(15)), "wedged: 15s of zero progress")
+
+        // Progress resets the escalation clock even with work still queued.
+        _ = tracker.recordEnqueue(bytes: 100, droppable: true, now: at(15.5))
+        tracker.recordCompletion(bytes: 100, now: at(16))
+        XCTAssertFalse(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(20)))
+        XCTAssertTrue(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(31)), "re-wedged after the recovery")
+
+        // Fully drained: never escalates, however long we wait.
+        tracker.recordCompletion(bytes: 100, now: at(32))
+        XCTAssertFalse(tracker.hasMadeNoProgress(forAtLeast: 15, now: at(300)))
+    }
+
     // MARK: - Backlog cap
 
     func testDropsAudioBeyondByteCapWithAccounting() {

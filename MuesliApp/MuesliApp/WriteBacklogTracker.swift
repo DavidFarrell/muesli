@@ -107,4 +107,15 @@ struct WriteBacklogTracker {
     func secondsSinceLastProgress(now: Date) -> TimeInterval? {
         lastProgressAt.map { now.timeIntervalSince($0) }
     }
+
+    /// Sustained-no-progress check for the post-stop escalation decision
+    /// (gate BLOCKER 4 on the 2026-07-16 slice): true only when work is
+    /// outstanding NOW and nothing has completed for at least `seconds`.
+    /// Purely a live measurement - any completion resets the clock and a
+    /// drained queue never satisfies it - so callers can never escalate off
+    /// a stall that has since recovered.
+    func hasMadeNoProgress(forAtLeast seconds: TimeInterval, now: Date) -> Bool {
+        guard outstandingFrames > 0, let last = lastProgressAt else { return false }
+        return now.timeIntervalSince(last) >= seconds
+    }
 }

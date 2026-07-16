@@ -39,6 +39,7 @@
 				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
 				OrphanedMeetingRecovery.swift,
+				PendingAudioGate.swift,
 				TempTranscriptCleanup.swift,
 				TranscriptModel.swift,
 				WriteBacklogTracker.swift,

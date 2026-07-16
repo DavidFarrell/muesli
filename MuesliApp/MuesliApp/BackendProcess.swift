@@ -177,6 +177,12 @@ final class FramedWriter: FrameSending {
     private let stateLock = NSLock()
     private var backlog: WriteBacklogTracker
     private var isForceClosed = false
+    /// Diagnostics beyond the tracker's backlog accounting: queued writes
+    /// that threw (EPIPE after the child died, or writes landing after the
+    /// handle closed) and sends rejected because `forceCloseStdin` already
+    /// ran. Both count toward "audio that never reached the backend".
+    private var failedWrites = 0
+    private var rejectedAfterCloseFrames = 0
 
     init(
         stdinHandle: FileHandle,
@@ -199,14 +205,20 @@ final class FramedWriter: FrameSending {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
         let frameBytes = Self.headerByteCount + payload.count
         let admitted: Bool = stateLock.withLock {
-            guard !isForceClosed else { return false }
+            guard !isForceClosed else {
+                rejectedAfterCloseFrames += 1
+                return false
+            }
             return backlog.recordEnqueue(bytes: frameBytes, droppable: type == .audio, now: Date())
         }
         guard admitted else { return }
         writeQueue.async {
-            self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
+            let wroteOK = self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
             self.stateLock.withLock {
                 self.backlog.recordCompletion(bytes: frameBytes, now: Date())
+                if !wroteOK {
+                    self.failedWrites += 1
+                }
             }
         }
     }
@@ -219,6 +231,8 @@ final class FramedWriter: FrameSending {
         let droppedBytes: Int
         let totalEnqueuedFrames: Int
         let totalCompletedFrames: Int
+        let failedWrites: Int
+        let rejectedAfterCloseFrames: Int
         let secondsSinceLastProgress: TimeInterval?
         let isStalled: Bool
     }
@@ -232,6 +246,8 @@ final class FramedWriter: FrameSending {
                 droppedBytes: backlog.droppedBytes,
                 totalEnqueuedFrames: backlog.totalEnqueuedFrames,
                 totalCompletedFrames: backlog.totalCompletedFrames,
+                failedWrites: failedWrites,
+                rejectedAfterCloseFrames: rejectedAfterCloseFrames,
                 secondsSinceLastProgress: backlog.secondsSinceLastProgress(now: now),
                 isStalled: backlog.isStalled(now: now)
             )
@@ -242,29 +258,49 @@ final class FramedWriter: FrameSending {
         stateLock.withLock { backlog.isStalled(now: now) }
     }
 
+    /// FRESH no-progress check for the post-stop exit wait (gate BLOCKER 4
+    /// fix): true only when work is outstanding RIGHT NOW and nothing has
+    /// completed for at least `seconds`. Any completion resets the clock, so
+    /// a backend that recovered - or recovers while the caller is waiting -
+    /// stops satisfying this immediately; there is no historical latch here.
+    func hasMadeNoProgress(forAtLeast seconds: TimeInterval, now: Date = Date()) -> Bool {
+        stateLock.withLock { backlog.hasMadeNoProgress(forAtLeast: seconds, now: now) }
+    }
+
     func closeStdinAfterDraining() {
         writeQueue.async {
             try? self.handle.close()
         }
     }
 
-    /// Stop-path hardening for a wedged reader (2026-07-16 RCA rec #6):
-    /// `closeStdinAfterDraining` queues BEHIND any write currently blocked
-    /// on a full pipe, so against an alive-but-not-reading child the close
-    /// never happens and stop hangs until the 120s exit timeout. This closes
-    /// the write end DIRECTLY, off the queue: a healthy-but-slow child sees
-    /// EOF and exits; new `send` calls become no-ops (`isForceClosed`); and
-    /// any write already blocked in the kernel is unblocked by the child's
-    /// subsequent SIGTERM/SIGKILL closing the pipe's read end - the two are
-    /// designed to be used together (see AppModel.stopMeeting /
-    /// finalizeStoppedMeeting). Queued writes that run after the close throw
-    /// immediately (fast drain) rather than blocking.
+    /// Stop-path hardening for a wedged reader (2026-07-16 RCA rec #6).
+    /// Two effects: new `send` calls are rejected immediately (with
+    /// accounting - see `rejectedAfterCloseFrames`), and a close of the
+    /// write end is enqueued on the writeQueue.
+    ///
+    /// The close deliberately goes THROUGH the queue, not around it
+    /// (gate BLOCKER 3 fix): NSFileHandle must not be used from multiple
+    /// threads simultaneously, so closing from the caller's thread while a
+    /// write sits blocked on the queue would be an unsupported race
+    /// (crash / half-written frame risk). Single-queue handle ownership is
+    /// preserved instead, which means this method alone cannot unblock a
+    /// write stuck on a full pipe - the queued close waits behind it. The
+    /// designed unblocking agent is killing the READER (see
+    /// AppModel.finalizeStoppedMeeting's SIGTERM->SIGKILL escalation):
+    /// the child's death closes the pipe's read end, the blocked write
+    /// fails over with EPIPE, any remaining queued writes fail fast, and
+    /// then the queued close runs. Against a healthy-but-slow child the
+    /// queue drains normally and the close delivers EOF, exactly like
+    /// `closeStdinAfterDraining`.
     func forceCloseStdin() {
         stateLock.withLock { isForceClosed = true }
-        try? handle.close()
+        writeQueue.async {
+            try? self.handle.close()
+        }
     }
 
-    private func writeFrame(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
+    /// Returns whether both writes succeeded (runs on `writeQueue` only).
+    private func writeFrame(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) -> Bool {
         var header = Data()
         header.append(type.rawValue)
         header.append(stream.rawValue)
@@ -278,12 +314,13 @@ final class FramedWriter: FrameSending {
         do {
             try handle.write(contentsOf: header)
             try handle.write(contentsOf: payload)
+            return true
         } catch {
             if !didFail {
                 didFail = true
                 onWriteError?(error)
             }
-            return
+            return false
         }
     }
 }

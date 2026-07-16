@@ -219,10 +219,44 @@ final class MicAudioForwarderTests: XCTestCase {
         XCTAssertEqual(sender.sent.count, frameCount + 1)
     }
 
-    /// If the readiness window somehow outlasts the enlarged ring (cap 512),
-    /// the OLDEST frames drop first: audio arriving late is acceptable,
-    /// losing the newest audio (or growing without bound) is not.
-    func testReadinessWindowRingCapDropsOldestFirst() async {
+    /// The ring is capped by PCM BYTES, not callback count (gate BLOCKER 2
+    /// on the 2026-07-16 slice): callback cadence is engine-dependent, so a
+    /// count cap covers an unpredictable wall-time span. When the window
+    /// somehow outlasts the byte cap, the OLDEST frames drop first: audio
+    /// arriving late is acceptable, losing the newest audio (or growing
+    /// without bound) is not. Cap injected small so the test stays cheap.
+    func testReadinessWindowRingCapEvictsOldestBytesFirst() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(
+            sampleRate: 16000, channels: 1, clock: clock, maxPendingBytes: 2_000
+        )
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+
+        // 640B frames against a 2,000B cap: only the newest 3 (1,920B) fit.
+        for _ in 0..<10 {
+            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            clock.advance(seconds: 0.1)
+        }
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(sender.sent.count, 3, "ring must cap by bytes (3 x 640B <= 2,000B)")
+        XCTAssertEqual(
+            sender.sent.first?.ptsUs, Int64(7) * 100_000,
+            "the OLDEST frames drop; the survivors start at frame index 7's capture PTS"
+        )
+        XCTAssertEqual(sender.sent.last?.ptsUs, Int64(9) * 100_000)
+    }
+
+    /// A count cap breaks exactly here (gate BLOCKER 2): the capture-session
+    /// mic engine's AVCaptureAudioDataOutput can deliver much smaller/faster
+    /// callbacks than the AVAudioEngine tap's ~85ms chunks. 13 seconds at a
+    /// 20ms cadence is 650 callbacks - more than the old 512-callback cap -
+    /// but only ~416KB, well inside the byte cap, so every frame must
+    /// survive the readiness window.
+    func testShortCadenceCallbacksSurviveFullReadinessWindow() async {
         let clock = FakeMicMonotonicClock()
         let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
         let sender = FakeFrameSender()
@@ -230,17 +264,19 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginMeeting()
         await forwarder.beginGeneration(1, writer: sender)
 
-        let delivered = 520 // 8 beyond the 512-buffer cap
-        for _ in 0..<delivered {
-            _ = await forwarder.deliver(makeSampleData(), generation: 1)
-            clock.advance(seconds: 0.1)
+        let frameCount = 650 // 13s at 20ms per callback (640B each at 16kHz)
+        for _ in 0..<frameCount {
+            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            clock.advance(seconds: 0.02)
         }
         await forwarder.setOutputEnabled(true)
 
-        XCTAssertEqual(sender.sent.count, 512, "ring must cap at 512 buffers")
         XCTAssertEqual(
-            sender.sent.first?.ptsUs, Int64(8) * 100_000,
-            "the 8 OLDEST frames drop; the survivors start at frame index 8's capture PTS"
+            sender.sent.count, frameCount,
+            "byte-capped ring must carry a full readiness window of short-cadence callbacks"
         )
+        for (index, frame) in sender.sent.enumerated() {
+            XCTAssertEqual(frame.ptsUs, Int64(index) * 20_000)
+        }
     }
 }
