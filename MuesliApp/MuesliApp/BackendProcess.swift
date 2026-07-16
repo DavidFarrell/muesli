@@ -122,6 +122,22 @@ nonisolated final class BackendProcess {
         }
     }
 
+    /// Whether the child is still running. Used by the startup readiness
+    /// gate to fail fast when the backend crashes during launch instead of
+    /// waiting out the full handshake timeout (2026-07-16 RCA rec #3).
+    var isRunning: Bool { process.isRunning }
+
+    /// SIGKILL escalation for a child that ignores SIGTERM - the 2026-07-16
+    /// incident's backend was wedged pre-read-loop and could plausibly have
+    /// ignored SIGTERM too (RCA rec #6). Killing the child also closes the
+    /// pipe's read end, which is what actually unblocks a `FramedWriter`
+    /// write stuck on a full pipe. No-op if the process already exited.
+    func forceKill() {
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
     func cleanup() {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
@@ -145,25 +161,107 @@ enum MsgType: UInt8 {
 }
 
 final class FramedWriter: FrameSending {
+    /// Frame header size: type (1) + stream (1) + PTS (8) + length (4).
+    private static let headerByteCount = 14
+
     private let handle: FileHandle
     private let writeQueue = DispatchQueue(label: "muesli.framed-writer", qos: .userInitiated)
     private var didFail = false
     var onWriteError: ((Error) -> Void)?
 
-    init(stdinHandle: FileHandle) {
+    /// Guards `backlog` and `isForceClosed` - `send` is called from the
+    /// capture queue, the mic forwarder actor and MainActor, and completions
+    /// land on `writeQueue`. Everything under the lock is cheap counter
+    /// arithmetic; no per-frame timers or dispatch sources (2026-07-16 RCA
+    /// rec #2 requires the detection itself to be near-free).
+    private let stateLock = NSLock()
+    private var backlog: WriteBacklogTracker
+    private var isForceClosed = false
+
+    init(
+        stdinHandle: FileHandle,
+        maxOutstandingBytes: Int = WriteBacklogTracker.defaultMaxOutstandingBytes,
+        stallThresholdSeconds: TimeInterval = WriteBacklogTracker.defaultStallThresholdSeconds
+    ) {
         self.handle = stdinHandle
+        self.backlog = WriteBacklogTracker(
+            maxOutstandingBytes: maxOutstandingBytes,
+            stallThresholdSeconds: stallThresholdSeconds
+        )
     }
 
+    /// Fire-and-forget for callers, exactly as before - the audio hot paths
+    /// must never block on the pipe. New since the 2026-07-16 incident:
+    /// enqueue/completion accounting feeds the backpressure detector, and
+    /// audio frames beyond the backlog cap are dropped-with-accounting
+    /// instead of retained (a wedged child used to grow ~100MB of queued
+    /// payloads invisibly). Control frames are never dropped.
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
+        let frameBytes = Self.headerByteCount + payload.count
+        let admitted: Bool = stateLock.withLock {
+            guard !isForceClosed else { return false }
+            return backlog.recordEnqueue(bytes: frameBytes, droppable: type == .audio, now: Date())
+        }
+        guard admitted else { return }
         writeQueue.async {
             self.writeFrame(type: type, stream: stream, ptsUs: ptsUs, payload: payload)
+            self.stateLock.withLock {
+                self.backlog.recordCompletion(bytes: frameBytes, now: Date())
+            }
         }
+    }
+
+    /// Read-only view of the backpressure state for AppModel's watchdog.
+    struct BacklogSnapshot {
+        let outstandingFrames: Int
+        let outstandingBytes: Int
+        let droppedFrames: Int
+        let droppedBytes: Int
+        let totalEnqueuedFrames: Int
+        let totalCompletedFrames: Int
+        let secondsSinceLastProgress: TimeInterval?
+        let isStalled: Bool
+    }
+
+    func backlogSnapshot(now: Date = Date()) -> BacklogSnapshot {
+        stateLock.withLock {
+            BacklogSnapshot(
+                outstandingFrames: backlog.outstandingFrames,
+                outstandingBytes: backlog.outstandingBytes,
+                droppedFrames: backlog.droppedFrames,
+                droppedBytes: backlog.droppedBytes,
+                totalEnqueuedFrames: backlog.totalEnqueuedFrames,
+                totalCompletedFrames: backlog.totalCompletedFrames,
+                secondsSinceLastProgress: backlog.secondsSinceLastProgress(now: now),
+                isStalled: backlog.isStalled(now: now)
+            )
+        }
+    }
+
+    func isBacklogStalled(now: Date = Date()) -> Bool {
+        stateLock.withLock { backlog.isStalled(now: now) }
     }
 
     func closeStdinAfterDraining() {
         writeQueue.async {
             try? self.handle.close()
         }
+    }
+
+    /// Stop-path hardening for a wedged reader (2026-07-16 RCA rec #6):
+    /// `closeStdinAfterDraining` queues BEHIND any write currently blocked
+    /// on a full pipe, so against an alive-but-not-reading child the close
+    /// never happens and stop hangs until the 120s exit timeout. This closes
+    /// the write end DIRECTLY, off the queue: a healthy-but-slow child sees
+    /// EOF and exits; new `send` calls become no-ops (`isForceClosed`); and
+    /// any write already blocked in the kernel is unblocked by the child's
+    /// subsequent SIGTERM/SIGKILL closing the pipe's read end - the two are
+    /// designed to be used together (see AppModel.stopMeeting /
+    /// finalizeStoppedMeeting). Queued writes that run after the close throw
+    /// immediately (fast drain) rather than blocking.
+    func forceCloseStdin() {
+        stateLock.withLock { isForceClosed = true }
+        try? handle.close()
     }
 
     private func writeFrame(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
