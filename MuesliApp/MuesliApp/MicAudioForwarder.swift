@@ -76,7 +76,17 @@ actor MicAudioForwarder {
     private var writer: FrameSending?
     private var micOutputEnabled = false
     private var pendingMicAudio: [MicPendingAudio] = []
-    private let maxPendingMicAudio = 200
+    /// Ring cap while output is disabled. Originally 200 (the brief
+    /// tap-install -> setOutputEnabled window); since the backend-readiness
+    /// handshake (2026-07-16 RCA rec #3) this ring also carries the whole
+    /// startup window until the backend acknowledges meeting_started - up to
+    /// ~10s plus margin. Sizing: the 4096-frame tap at a 48kHz device is
+    /// ~85ms per buffer (~2.7KB converted to 16k mono int16), so 512 buffers
+    /// ≈ 43s / ~1.4MB worst case - cheap, and comfortably more than the 10s
+    /// readiness timeout even on a 96kHz device (~22s). Overflow drops the
+    /// OLDEST audio first: late early-meeting audio is acceptable, a lost
+    /// meeting is not.
+    private let maxPendingMicAudio = 512
 
     private(set) var frameCount: Int = 0
     private(set) var lastFrameAt: Date?

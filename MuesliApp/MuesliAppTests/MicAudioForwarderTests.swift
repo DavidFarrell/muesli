@@ -179,4 +179,68 @@ final class MicAudioForwarderTests: XCTestCase {
             "a new meeting's PTS must start at zero again, not continue the previous meeting's clock"
         )
     }
+
+    /// The backend-readiness handshake (2026-07-16 RCA rec #3,
+    /// `engineer-notes/bug-2026-07-16-stop-device-change/RCA-2026-07-16.md`)
+    /// keeps mic output DISABLED for the whole startup window until the
+    /// backend acknowledges meeting_started - up to ~10s. The pending ring
+    /// carries that window: on a healthy (if slow) start, every frame
+    /// captured while waiting must reach the writer, in order, once the gate
+    /// opens. Simulates a full 10s window at the real ~85ms tap cadence.
+    func testReadinessWindowBufferingLosesNothingOnHealthyStart() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+        // Gate closed: backend hasn't acknowledged meeting_start yet.
+
+        let frameCount = 120 // 12s at a 0.1s cadence - past the 10s timeout
+        for _ in 0..<frameCount {
+            _ = await forwarder.deliver(makeSampleData(), generation: 1)
+            clock.advance(seconds: 0.1)
+        }
+        XCTAssertTrue(sender.sent.isEmpty, "nothing may reach the pipe before the backend is ready")
+
+        // meeting_started arrives; startMeeting flushes.
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(sender.sent.count, frameCount, "a >10s readiness window must not overflow the ring")
+        for (index, frame) in sender.sent.enumerated() {
+            XCTAssertEqual(
+                frame.ptsUs, Int64(index) * 100_000,
+                "flushed frames must be in capture order with capture-time PTS"
+            )
+        }
+
+        // Post-flush deliveries forward immediately.
+        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        XCTAssertEqual(sender.sent.count, frameCount + 1)
+    }
+
+    /// If the readiness window somehow outlasts the enlarged ring (cap 512),
+    /// the OLDEST frames drop first: audio arriving late is acceptable,
+    /// losing the newest audio (or growing without bound) is not.
+    func testReadinessWindowRingCapDropsOldestFirst() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+
+        let delivered = 520 // 8 beyond the 512-buffer cap
+        for _ in 0..<delivered {
+            _ = await forwarder.deliver(makeSampleData(), generation: 1)
+            clock.advance(seconds: 0.1)
+        }
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(sender.sent.count, 512, "ring must cap at 512 buffers")
+        XCTAssertEqual(
+            sender.sent.first?.ptsUs, Int64(8) * 100_000,
+            "the 8 OLDEST frames drop; the survivors start at frame index 8's capture PTS"
+        )
+    }
 }

@@ -28,6 +28,7 @@
 				AECMode.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
+				BackendStartupGate.swift,
 				DurationFormatting.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,

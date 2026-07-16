@@ -235,7 +235,15 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private let audioState = AudioStateStore(AudioState())
-    private let maxPendingAudio = 200
+    /// Pending-ring cap while audio output is disabled. Originally 200
+    /// (covering only startCapture -> setAudioOutputEnabled); since the
+    /// backend-readiness handshake (2026-07-16 RCA rec #3) output stays
+    /// disabled until the backend acknowledges meeting_started - up to ~10s
+    /// plus margin - and SCK's 16kHz buffer cadence is device/OS dependent
+    /// (tens of ms per buffer), so 200 could underrun the window. 1024
+    /// covers >=10s even at a 10ms cadence; items are ~0.3-3KB, so worst
+    /// case a few MB, transiently. Overflow drops the OLDEST audio first.
+    private let maxPendingAudio = 1024
 
     var systemLevel: Float = 0
 
