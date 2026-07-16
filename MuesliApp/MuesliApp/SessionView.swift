@@ -21,6 +21,23 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 12) {
+            // Backend-not-persisting alarm (2026-07-16 RCA rec #2). Full-
+            // width red banner above everything, NOT a meter footnote: when
+            // this fires the meters still bounce and the meeting looks
+            // healthy, but nothing is reaching disk - it must be impossible
+            // to miss.
+            if let backendAlert = meters.backendAlert {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.octagon.fill")
+                    Text(backendAlert)
+                        .fontWeight(.semibold)
+                    Spacer()
+                }
+                .padding(10)
+                .foregroundStyle(.white)
+                .background(Color.red, in: RoundedRectangle(cornerRadius: 8))
+            }
+
             header
 
             HStack(alignment: .top, spacing: 12) {
