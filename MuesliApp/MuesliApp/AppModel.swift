@@ -258,6 +258,26 @@ final class AppModel: ObservableObject {
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
+    // Backend-readiness handshake state (2026-07-16 RCA rec #3 - backend
+    // wedged pre-read-loop, meeting presented as recording, 26 minutes lost).
+    // The gate opens when the child acknowledges MSG_MEETING_START with a
+    // meeting_started status; until then no audio is forwarded to the pipe
+    // (mic buffers in MicAudioForwarder's pending ring, system audio in
+    // CaptureEngine's) and the meeting is not presented as recording.
+    private let backendStartupGate = BackendStartupGate()
+    // 10s: the pre-read-loop cost is the module import chain (numpy/
+    // soundfile/parakeet_mlx pulling in MLX/Metal), a few seconds on a cold
+    // start - and most of it overlaps the capture/mic startup that runs
+    // between spawn and the handshake wait. 10s is a comfortable multiple of
+    // the worst healthy start while still turning the incident's silent
+    // 26-minute loss into a ~10-second visible failure.
+    private let backendReadinessTimeoutSeconds: Double = 10.0
+    // Backpressure detector state (2026-07-16 RCA rec #2): flips when the
+    // FramedWriter's queue has work but writes stop completing (backend
+    // alive-but-not-reading; a blocked pipe write never throws, so
+    // onWriteError can't see this). Checked each frames-watchdog tick.
+    private var backendWriteStalled = false
+    private var backendStallLogTicks = 0
     private var backendLogHandle: FileHandle?
     private var backendLogURL: URL?
     private var transcriptEventsHandle: FileHandle?
@@ -658,7 +678,8 @@ final class AppModel: ObservableObject {
         _ line: String,
         transcriptEventsHandle: FileHandle?,
         backendLogHandle: FileHandle?,
-        ingestIntoLiveTranscript: Bool
+        ingestIntoLiveTranscript: Bool,
+        sessionFolderURL: URL? = nil
     ) {
         if let data = (line + "\n").data(using: .utf8) {
             if let error = writeDataToHandle(data, handle: transcriptEventsHandle) {
@@ -676,6 +697,21 @@ final class AppModel: ObservableObject {
                 let message = (obj["message"] as? String) ?? line
                 appendBackendLog("[error] \(message)", toTail: ingestIntoLiveTranscript, handle: backendLogHandle)
             } else if type == "status" {
+                // The readiness handshake's other half (2026-07-16 RCA rec
+                // #3): the backend emits meeting_started immediately after
+                // opening its stream writers in response to MSG_MEETING_START
+                // - the proof that the child's read loop is alive and the
+                // WAV/PCM files exist. Gated on the session folder so a
+                // late line from a previous meeting's stdout task can never
+                // open a new meeting's gate. NB this must NOT be gated on
+                // ingestIntoLiveTranscript: that flag requires isCapturing,
+                // which is deliberately still false while startMeeting waits
+                // on this very acknowledgment.
+                if (obj["message"] as? String) == "meeting_started",
+                   let sessionFolderURL,
+                   currentSession?.folderURL == sessionFolderURL {
+                    backendStartupGate.markReady()
+                }
                 var parts: [String] = []
                 if let message = obj["message"] as? String {
                     parts.append(message)
@@ -1286,7 +1322,19 @@ final class AppModel: ObservableObject {
         }
         micEngine = engine
         micEngineStartedAt = Date()
-        await micAudioForwarder.setOutputEnabled(true)
+        // Only open the pipe once the backend has acknowledged
+        // MSG_MEETING_START (2026-07-16 RCA §9 startup-ordering defect: mic
+        // forwarding used to be enabled here unconditionally, before
+        // meeting_start was even sent, so frames could reach a backend whose
+        // writers didn't exist - and, in the incident, pile into a pipe
+        // nobody read). At FIRST start the gate is still closed: frames
+        // buffer in the forwarder's pending ring and startMeeting flushes
+        // them via setOutputEnabled(true) the moment meeting_started
+        // arrives. On mid-meeting engine rebuilds the gate is already open,
+        // so this enables immediately - exactly the old timing.
+        if backendStartupGate.isReady {
+            await micAudioForwarder.setOutputEnabled(true)
+        }
         debugMicErrorMessage = "-"
         publishMicError()
         if isCapturing {
@@ -1398,7 +1446,14 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: self?.micWatchdogIntervalNs ?? 2_000_000_000)
                 guard let self else { return }
                 guard !Task.isCancelled else { return }
-                guard self.isCapturing, self.transcribeMic else { continue }
+                guard self.isCapturing else { continue }
+                // Backpressure check rides the existing watchdog cadence
+                // (2026-07-16 RCA rec #2: cheap counter comparison, no
+                // per-frame timers). Deliberately BEFORE the transcribeMic
+                // guard - a system-only meeting pipes audio too and needs
+                // the same alarm.
+                self.checkBackendWriteBacklog()
+                guard self.transcribeMic else { continue }
 
                 // Ground truth from the forwarder, NOT the MainActor mirrors
                 // (`lastMicAudioAt`/`micFrameCount`) - those can lag behind
@@ -1453,6 +1508,70 @@ final class AppModel: ObservableObject {
     private func stopMicFramesWatchdog() {
         micFramesWatchdogTask?.cancel()
         micFramesWatchdogTask = nil
+    }
+
+    /// The writequeue-backpressure detector (2026-07-16 RCA rec #2), run
+    /// once per frames-watchdog tick. The signature it catches: the backend
+    /// is alive but not reading its stdin, so the pipe fills, writes BLOCK
+    /// (never throw - `onWriteError` is structurally blind to this), and in
+    /// the incident 26 minutes of audio vanished behind healthy-looking
+    /// meters. Mid-meeting this deliberately does NOT stop the meeting: the
+    /// user may prefer to keep talking and rely on a parallel recorder, so
+    /// it surfaces an unmissable persistent alert instead, and the stop path
+    /// (see stopMeeting) uses the flag to bypass the drain and escalate.
+    private func checkBackendWriteBacklog() {
+        guard let writer, isCapturing, !isFinalizing else { return }
+        let snap = writer.backlogSnapshot()
+        if snap.isStalled {
+            backendStallLogTicks += 1
+            // Log the transition loudly, then re-log the queue-depth trend
+            // every ~30s rather than every 2s tick.
+            if !backendWriteStalled || backendStallLogTicks % 15 == 0 {
+                AudioLog.error("writequeue.stalled", [
+                    "outstandingFrames": snap.outstandingFrames,
+                    "outstandingBytes": snap.outstandingBytes,
+                    "droppedFrames": snap.droppedFrames,
+                    "droppedBytes": snap.droppedBytes,
+                    "failedWrites": snap.failedWrites,
+                    "rejectedAfterClose": snap.rejectedAfterCloseFrames,
+                    "stalledSeconds": Int(snap.secondsSinceLastProgress ?? -1)
+                ])
+            }
+            if !backendWriteStalled {
+                backendWriteStalled = true
+                appendBackendLog(
+                    "Backend stopped consuming audio (write queue stalled) - recording is NOT being saved to disk.",
+                    toTail: true
+                )
+                meters.setBackendAlert(
+                    "Recording backend stopped responding - audio is NOT being saved. Stop and restart the meeting, or use a backup recorder."
+                )
+            }
+        } else if backendWriteStalled {
+            // The child resumed reading. Frames that were queued (not
+            // dropped) have now been written, so if nothing was dropped the
+            // recording is whole - clear the alarm. If frames WERE dropped
+            // there is a real gap in the audio; the alert must survive so
+            // the user knows this meeting is damaged.
+            backendWriteStalled = false
+            backendStallLogTicks = 0
+            AudioLog.event("writequeue.recovered", [
+                "droppedFrames": snap.droppedFrames,
+                "droppedBytes": snap.droppedBytes
+            ])
+            if snap.droppedFrames > 0 {
+                appendBackendLog(
+                    "Backend resumed consuming audio after a stall; \(snap.droppedFrames) audio frames (\(snap.droppedBytes) bytes) were dropped and are lost.",
+                    toTail: true
+                )
+                meters.setBackendAlert(
+                    "Recording backend recovered after a stall - some audio during the stall was lost."
+                )
+            } else {
+                appendBackendLog("Backend resumed consuming audio after a stall; no frames were dropped.", toTail: true)
+                meters.clearBackendAlert()
+            }
+        }
     }
 
     /// True when the input is pinned to a specific device that is not
@@ -2113,6 +2232,18 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // Fresh handshake + backpressure state for this attempt (2026-07-16
+        // RCA recs #2/#3). The gate MUST be closed before the mic engine can
+        // start - attemptMeetingMicEngineStart checks it to decide whether
+        // audio may flow to the pipe yet. Deliberately AFTER every early
+        // return above (gate advisory): resetting before the `!isCapturing`
+        // guard would close the gate under a still-active meeting, silently
+        // re-buffering its mic forwarding on the next engine rebuild.
+        backendStartupGate.reset()
+        backendWriteStalled = false
+        backendStallLogTicks = 0
+        meters.clearBackendAlert()
+
         guard let backendProjectRoot = backendFolderURL else {
             shareableContentError = "Select the backend folder before starting."
             return
@@ -2298,7 +2429,8 @@ final class AppModel: ObservableObject {
                             line,
                             transcriptEventsHandle: sessionEventsHandle,
                             backendLogHandle: sessionLogHandle,
-                            ingestIntoLiveTranscript: isActiveSession
+                            ingestIntoLiveTranscript: isActiveSession,
+                            sessionFolderURL: sessionFolderURL
                         )
                     }
                 }
@@ -2378,11 +2510,45 @@ final class AppModel: ObservableObject {
                 micSampleRate: micSampleRate,
                 micChannels: micChannels
             )
+            // Backend-readiness handshake (2026-07-16 RCA rec #3): do not
+            // report the meeting as recording - and do not let a single
+            // audio byte into the pipe - until the child acknowledges
+            // MSG_MEETING_START with meeting_started (which it emits only
+            // after its stream writers exist on disk). The incident this
+            // guards against: the backend wedged before its read loop, Swift
+            // piped audio into a full pipe for 26 minutes, and the meeting
+            // looked healthy throughout. Audio captured during the wait is
+            // NOT lost on a healthy start: mic frames buffer in the
+            // forwarder's pending ring, system audio in CaptureEngine's, and
+            // both flush below the moment the gate opens.
+            let sessionBackend = backend
+            let readiness = await backendStartupGate.waitUntilReady(
+                timeoutSeconds: backendReadinessTimeoutSeconds,
+                isProcessAlive: { sessionBackend?.isRunning ?? false }
+            )
+            guard readiness == .ready else {
+                let reason: String
+                switch readiness {
+                case .processExited:
+                    reason = "backend process exited during startup"
+                default:
+                    reason = "no meeting_started acknowledgment within \(Int(backendReadinessTimeoutSeconds))s"
+                }
+                AudioLog.error("backend.readiness.failed", ["reason": reason])
+                appendBackendLog("Backend readiness handshake failed (\(reason)); treating meeting start as FAILED.", toTail: true)
+                shareableContentError = "Recording backend failed to start - meeting NOT recording. (\(reason).)"
+                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
+                return
+            }
+            appendBackendLog("Backend ready (meeting_started acknowledged)", toTail: true)
+
             captureEngine.setAudioOutputEnabled(true)
-            // Mic-side flushing is now handled inline by
-            // `micAudioForwarder.setOutputEnabled(true)` at the moment the
-            // engine started (see attemptMeetingMicEngineStart) - there is
-            // no separate mic flush step here any more.
+            // Open the mic side too: at first start the engine came up with
+            // the gate still closed (see attemptMeetingMicEngineStart), so
+            // everything delivered so far sits in the forwarder's pending
+            // ring - this flushes it to the now-provably-listening backend
+            // in order, PTS intact.
+            await micAudioForwarder.setOutputEnabled(true)
 
             if captureMode == .video {
                 let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
@@ -2460,11 +2626,37 @@ final class AppModel: ObservableObject {
         micStartTime = nil
         resetMicRecoveryLadder()
 
+        // Stdin closing belongs to the writer's queue exclusively (round-2
+        // gate blocker) - close it via the barrier before stop()'s teardown.
+        // In this failed-start path audio never flowed (the readiness gate
+        // was still closed), so the queue holds at most the small
+        // meeting_start control frame and the barrier resolves immediately;
+        // the bound is defensive.
+        if let failedWriter = writer {
+            _ = await failedWriter.closeStdinAndWait(timeoutSeconds: 2)
+        }
+        // stop() SIGTERMs, but the child this teardown most needs to kill is
+        // one wedged pre-read-loop (2026-07-16 RCA) - which may ignore
+        // SIGTERM. Escalate to SIGKILL after a short grace, detached so the
+        // teardown itself stays fast; killing the child also closes the
+        // pipe's read end, unblocking any FramedWriter write stuck on a full
+        // pipe (RCA rec #6).
+        let failedBackend = backend
         backend?.stop()
         backend = nil
         stdoutTask?.cancel()
         stdoutTask = nil
         writer = nil
+        backendStartupGate.reset()
+        backendWriteStalled = false
+        meters.clearBackendAlert()
+        if let failedBackend {
+            Task.detached {
+                if await failedBackend.waitForExit(timeoutSeconds: 5) == nil {
+                    failedBackend.forceKill()
+                }
+            }
+        }
 
         closeBackendLog()
         closeTranscriptEventsLog()
@@ -2547,11 +2739,40 @@ final class AppModel: ObservableObject {
         micStartTime = nil
         resetMicRecoveryLadder()
 
+        // Stop-path hardening (2026-07-16 RCA rec #6). meetingStop and the
+        // close both go through the writer's serial queue - against a
+        // wedged (alive-but-not-reading) child they queue behind the
+        // blocked write and never arrive, and the finalize wait below is
+        // what escalates (its no-progress check re-measures LIVE, so this
+        // at-stop snapshot is diagnostic only - deliberately NOT the stale
+        // backendWriteStalled latch, which can outlive a recovery by a
+        // watchdog tick; gate BLOCKER 4). meetingStop is sent even when
+        // stalled: it is a control frame, and if the child recovers during
+        // finalize it should still stop cleanly.
+        let backendStalledAtStop = writer?.isBacklogStalled() ?? false
         writer?.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
-        writer?.closeStdinAfterDraining()
+        if backendStalledAtStop {
+            let snap = writer?.backlogSnapshot()
+            AudioLog.error("writequeue.stalled-at-stop", [
+                "outstandingFrames": snap?.outstandingFrames ?? -1,
+                "outstandingBytes": snap?.outstandingBytes ?? -1,
+                "droppedFrames": snap?.droppedFrames ?? -1
+            ])
+            appendBackendLog("Backend write queue stalled at stop; new sends rejected, close queued.", toTail: true)
+            // Same queued close as the healthy path, plus reject any
+            // further sends with accounting.
+            writer?.forceCloseStdin()
+        } else {
+            writer?.closeStdinAfterDraining()
+        }
+        backendStartupGate.reset()
+        backendWriteStalled = false
+        backendStallLogTicks = 0
+        meters.clearBackendAlert()
 
         let stoppingSession = currentSession
         let stoppingBackend = backend
+        let stoppingWriter = writer
         let stoppingStdoutTask = stdoutTask
         let stoppingBackendLogHandle = backendLogHandle
         let stoppingTranscriptEventsHandle = transcriptEventsHandle
@@ -2596,7 +2817,8 @@ final class AppModel: ObservableObject {
                 transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
                 speakerNamesSnapshot: stoppingSpeakerNames,
-                timestampOffsetSnapshot: stoppingTimestampOffset
+                timestampOffsetSnapshot: stoppingTimestampOffset,
+                writer: stoppingWriter
             )
         }
     }
@@ -2611,7 +2833,8 @@ final class AppModel: ObservableObject {
         transcriptEventsStartOffset: UInt64,
         transcriptSegmentsSnapshot: [TranscriptSegment],
         speakerNamesSnapshot: [String: String],
-        timestampOffsetSnapshot: Double
+        timestampOffsetSnapshot: Double,
+        writer: FramedWriter? = nil
     ) async {
         defer {
             closeHandle(transcriptEventsHandle)
@@ -2631,7 +2854,23 @@ final class AppModel: ObservableObject {
             }
         }
 
-        let exitStatus = await backend?.waitForExit(timeoutSeconds: 120)
+        // Exit wait with LIVE stall escalation (gate BLOCKER 4 fix): a
+        // healthy finalize (joining ASR workers, muesli_backend stop path)
+        // legitimately takes tens of seconds and always keeps the full 120s
+        // grace - including a backend that stalled mid-meeting and then
+        // RECOVERED, which the old fixed-5s-when-stalled-latch design would
+        // have SIGTERMed mid-finalize, losing the transcript tail. Early
+        // escalation happens only on live evidence of a wedged child: the
+        // writer's queue re-measured EVERY second as having work outstanding
+        // with zero completions for 15s straight (any progress resets the
+        // clock inside the tracker).
+        let exitStatus = await waitForBackendExit(
+            backend: backend,
+            writer: writer,
+            maxWaitSeconds: 120,
+            escalateAfterNoProgressSeconds: 15,
+            logHandle: backendLogHandle
+        )
         if exitStatus == nil {
             appendBackendLog(
                 "Backend did not exit after stop; terminating.",
@@ -2639,6 +2878,34 @@ final class AppModel: ObservableObject {
                 handle: backendLogHandle
             )
             backend?.terminate()
+            // A wedged child can ignore SIGTERM too (RCA rec #6) - escalate
+            // to SIGKILL after a short grace. The kill closes the pipe's
+            // read end, which is also what unblocks any FramedWriter write
+            // still stuck on the full pipe.
+            if await backend?.waitForExit(timeoutSeconds: 5) == nil {
+                appendBackendLog(
+                    "Backend ignored SIGTERM; force-killing.",
+                    toTail: false,
+                    handle: backendLogHandle
+                )
+                backend?.forceKill()
+                _ = await backend?.waitForExit(timeoutSeconds: 2)
+            }
+        }
+        // Single-queue stdin ownership (round-2 gate blocker): cleanup() no
+        // longer touches stdin, so wait for the writer's queued close to
+        // have actually run before tearing down the rest of the plumbing.
+        // The child is dead by now, so EPIPE has unblocked any stuck write
+        // and the queue drains fast; the bound is defensive. On timeout we
+        // proceed WITHOUT closing stdin ourselves - the queued close still
+        // runs whenever the queue unblocks.
+        if let writer, await writer.closeStdinAndWait(timeoutSeconds: 5) == false {
+            AudioLog.error("writequeue.close-barrier-timeout")
+            appendBackendLog(
+                "Writer queue close did not complete within 5s; stdin close left to the queue.",
+                toTail: false,
+                handle: backendLogHandle
+            )
         }
         backend?.cleanup()
         await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
@@ -2668,6 +2935,46 @@ final class AppModel: ObservableObject {
         } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
             meetingHistory.insert(updatedItem, at: 0)
         }
+    }
+
+    /// Post-stop exit wait: up to `maxWaitSeconds` for a clean exit, but
+    /// gives up early when the stopped meeting's writer shows SUSTAINED
+    /// zero progress with work still queued - the wedged-child signature
+    /// (2026-07-16 RCA), re-measured fresh on every 1s tick rather than
+    /// carried over from any mid-meeting stall flag. Returning nil sends
+    /// the caller into the SIGTERM->SIGKILL escalation, whose kill closes
+    /// the pipe's read end and thereby unblocks the write the queued
+    /// stdin-close is stuck behind (see FramedWriter.forceCloseStdin).
+    private func waitForBackendExit(
+        backend: BackendProcess?,
+        writer: FramedWriter?,
+        maxWaitSeconds: Double,
+        escalateAfterNoProgressSeconds: Double,
+        logHandle: FileHandle?
+    ) async -> Int32? {
+        guard let backend else { return nil }
+        let deadline = Date().addingTimeInterval(maxWaitSeconds)
+        while Date() < deadline {
+            if let status = await backend.waitForExit(timeoutSeconds: 1.0) {
+                return status
+            }
+            if Task.isCancelled { return nil }
+            if let writer, writer.hasMadeNoProgress(forAtLeast: escalateAfterNoProgressSeconds) {
+                let snap = writer.backlogSnapshot()
+                AudioLog.error("writequeue.stalled-at-finalize", [
+                    "outstandingFrames": snap.outstandingFrames,
+                    "outstandingBytes": snap.outstandingBytes,
+                    "noProgressSeconds": Int(snap.secondsSinceLastProgress ?? -1)
+                ])
+                appendBackendLog(
+                    "Backend write queue made no progress for \(Int(escalateAfterNoProgressSeconds))s after stop; escalating termination.",
+                    toTail: false,
+                    handle: logHandle
+                )
+                return nil
+            }
+        }
+        return nil
     }
 
     private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {

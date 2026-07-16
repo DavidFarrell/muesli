@@ -88,4 +88,19 @@ final class AudioMetersModelTests: XCTestCase {
         model.updateMic(level: 0.5, buffers: 1, frames: 160, pts: 0.01, format: "s16le")
         XCTAssertEqual(model.publishCount, afterFirst + 1, "immediately repeated without force stays throttled")
     }
+
+    func testBackendAlertSetAndClear() {
+        // The backpressure detector's channel (2026-07-16 RCA rec #2) -
+        // one-shot, ungated, independent of micAlert (the incident's mic was
+        // healthy while the backend consumed nothing).
+        let model = makeModel()
+        XCTAssertNil(model.backendAlert)
+        model.setBackendAlert("audio is NOT being saved")
+        XCTAssertEqual(model.backendAlert, "audio is NOT being saved")
+        model.setMicAlert("reconnecting...")
+        XCTAssertEqual(model.backendAlert, "audio is NOT being saved", "mic alert traffic must not disturb it")
+        model.clearBackendAlert()
+        XCTAssertNil(model.backendAlert)
+        XCTAssertEqual(model.micAlert, "reconnecting...")
+    }
 }

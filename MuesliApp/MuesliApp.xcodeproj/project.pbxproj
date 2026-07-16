@@ -26,8 +26,10 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AECMode.swift,
+				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
+				BackendStartupGate.swift,
 				DurationFormatting.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,
@@ -38,8 +40,10 @@
 				MicEngineSelection.swift,
 				MicRecoveryLadder.swift,
 				OrphanedMeetingRecovery.swift,
+				PendingAudioGate.swift,
 				TempTranscriptCleanup.swift,
 				TranscriptModel.swift,
+				WriteBacklogTracker.swift,
 			);
 			target = AA0000010000000000000005 /* MuesliAppTests */;
 		};

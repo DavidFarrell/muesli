@@ -40,6 +40,15 @@ final class AudioMetersModel: ObservableObject {
     /// flowing".
     @Published private(set) var micAlert: String?
 
+    /// User-visible backend-not-persisting state (set by AppModel's
+    /// writequeue-backpressure detector, 2026-07-16 RCA rec #2). Distinct
+    /// from `micAlert`: the mic can be perfectly healthy - the incident's
+    /// meters bounced for 26 minutes - while the backend consumes nothing
+    /// and the recording silently ceases to exist. Rendered as a prominent
+    /// banner in SessionView, not a meter footnote: this one means the
+    /// meeting is being LOST.
+    @Published private(set) var backendAlert: String?
+
     /// Cumulative count of actual `mic`/`system` publishes - NOT `@Published`
     /// (it exists for `RunLoopStormTripwire`'s diagnostic rate calculation,
     /// not for the UI, and must not itself become an invalidation source).
@@ -86,6 +95,16 @@ final class AudioMetersModel: ObservableObject {
 
     func clearMicAlert() {
         micAlert = nil
+    }
+
+    /// One-shot state changes from the backpressure detector; always publish
+    /// immediately - same rationale as setMicAlert.
+    func setBackendAlert(_ message: String) {
+        backendAlert = message
+    }
+
+    func clearBackendAlert() {
+        backendAlert = nil
     }
 
     /// Feed a system-audio-buffer tick. Mirrors `updateMic` - see its doc

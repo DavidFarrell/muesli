@@ -179,4 +179,104 @@ final class MicAudioForwarderTests: XCTestCase {
             "a new meeting's PTS must start at zero again, not continue the previous meeting's clock"
         )
     }
+
+    /// The backend-readiness handshake (2026-07-16 RCA rec #3,
+    /// `engineer-notes/bug-2026-07-16-stop-device-change/RCA-2026-07-16.md`)
+    /// keeps mic output DISABLED for the whole startup window until the
+    /// backend acknowledges meeting_started - up to ~10s. The pending ring
+    /// carries that window: on a healthy (if slow) start, every frame
+    /// captured while waiting must reach the writer, in order, once the gate
+    /// opens. Simulates a full 10s window at the real ~85ms tap cadence.
+    func testReadinessWindowBufferingLosesNothingOnHealthyStart() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+        // Gate closed: backend hasn't acknowledged meeting_start yet.
+
+        let frameCount = 120 // 12s at a 0.1s cadence - past the 10s timeout
+        for _ in 0..<frameCount {
+            _ = await forwarder.deliver(makeSampleData(), generation: 1)
+            clock.advance(seconds: 0.1)
+        }
+        XCTAssertTrue(sender.sent.isEmpty, "nothing may reach the pipe before the backend is ready")
+
+        // meeting_started arrives; startMeeting flushes.
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(sender.sent.count, frameCount, "a >10s readiness window must not overflow the ring")
+        for (index, frame) in sender.sent.enumerated() {
+            XCTAssertEqual(
+                frame.ptsUs, Int64(index) * 100_000,
+                "flushed frames must be in capture order with capture-time PTS"
+            )
+        }
+
+        // Post-flush deliveries forward immediately.
+        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        XCTAssertEqual(sender.sent.count, frameCount + 1)
+    }
+
+    /// The ring is capped by PCM BYTES, not callback count (gate BLOCKER 2
+    /// on the 2026-07-16 slice): callback cadence is engine-dependent, so a
+    /// count cap covers an unpredictable wall-time span. When the window
+    /// somehow outlasts the byte cap, the OLDEST frames drop first: audio
+    /// arriving late is acceptable, losing the newest audio (or growing
+    /// without bound) is not. Cap injected small so the test stays cheap.
+    func testReadinessWindowRingCapEvictsOldestBytesFirst() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(
+            sampleRate: 16000, channels: 1, clock: clock, maxPendingBytes: 2_000
+        )
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+
+        // 640B frames against a 2,000B cap: only the newest 3 (1,920B) fit.
+        for _ in 0..<10 {
+            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            clock.advance(seconds: 0.1)
+        }
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(sender.sent.count, 3, "ring must cap by bytes (3 x 640B <= 2,000B)")
+        XCTAssertEqual(
+            sender.sent.first?.ptsUs, Int64(7) * 100_000,
+            "the OLDEST frames drop; the survivors start at frame index 7's capture PTS"
+        )
+        XCTAssertEqual(sender.sent.last?.ptsUs, Int64(9) * 100_000)
+    }
+
+    /// A count cap breaks exactly here (gate BLOCKER 2): the capture-session
+    /// mic engine's AVCaptureAudioDataOutput can deliver much smaller/faster
+    /// callbacks than the AVAudioEngine tap's ~85ms chunks. 13 seconds at a
+    /// 20ms cadence is 650 callbacks - more than the old 512-callback cap -
+    /// but only ~416KB, well inside the byte cap, so every frame must
+    /// survive the readiness window.
+    func testShortCadenceCallbacksSurviveFullReadinessWindow() async {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
+        let sender = FakeFrameSender()
+
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(1, writer: sender)
+
+        let frameCount = 650 // 13s at 20ms per callback (640B each at 16kHz)
+        for _ in 0..<frameCount {
+            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            clock.advance(seconds: 0.02)
+        }
+        await forwarder.setOutputEnabled(true)
+
+        XCTAssertEqual(
+            sender.sent.count, frameCount,
+            "byte-capped ring must carry a full readiness window of short-cadence callbacks"
+        )
+        for (index, frame) in sender.sent.enumerated() {
+            XCTAssertEqual(frame.ptsUs, Int64(index) * 20_000)
+        }
+    }
 }
