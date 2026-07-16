@@ -46,12 +46,13 @@ final class PendingAudioGate: @unchecked Sendable {
         let droppedOldestBytes: Int
     }
 
-    /// Default cap ≈ 32s of headroom even if the OS ignored the requested
-    /// 16kHz mono and delivered 48kHz mono int16 (96KB/s); at the requested
-    /// format (32KB/s) it is over two minutes. The window it must cover is
-    /// capture start -> readiness acknowledgment: ~2-3s of setup plus the
-    /// 10s handshake timeout. Worst case is a few MB held transiently
-    /// during startup, released on flush or teardown.
+    /// Default cap ≈ 43s of headroom even if the OS ignored the requested
+    /// 16kHz mono and delivered 48kHz mono int16 (96,000 B/s ->
+    /// 4MiB / 96,000 ≈ 43.7s); at the requested format (32,000 B/s) it is
+    /// over two minutes. The window it must cover is capture start ->
+    /// readiness acknowledgment: ~2-3s of setup plus the 10s handshake
+    /// timeout. Worst case is a few MB held transiently during startup,
+    /// released on flush or teardown.
     static let defaultMaxPendingBytes = 4 * 1024 * 1024
 
     private let queue = DispatchQueue(label: "muesli.pending-audio-gate", qos: .userInitiated)

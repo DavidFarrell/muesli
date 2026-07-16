@@ -76,6 +76,12 @@ actor MicAudioForwarder {
     private var micOutputEnabled = false
     private var pendingMicAudio: [MicPendingAudio] = []
     private var pendingMicBytes = 0
+    /// Cumulative eviction diagnostics (forwarder lifetime, mirroring the
+    /// system side's PendingAudioGate accounting): audio dropped from the
+    /// pending ring is audio that never reached the backend, and must be
+    /// countable after the fact.
+    private(set) var pendingEvictedFrames = 0
+    private(set) var pendingEvictedBytes = 0
     /// Ring cap while output is disabled, in PCM BYTES - deliberately not a
     /// callback count (gate BLOCKER 2 on the 2026-07-16 slice): callback
     /// cadence is engine-dependent (the AVAudioEngine tap chunks at 4096
@@ -159,10 +165,19 @@ actor MicAudioForwarder {
         let lastFrameAt: Date?
         let startedAt: Date?
         let generation: Int
+        let pendingEvictedFrames: Int
+        let pendingEvictedBytes: Int
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(frameCount: frameCount, lastFrameAt: lastFrameAt, startedAt: startedAt, generation: generation)
+        Snapshot(
+            frameCount: frameCount,
+            lastFrameAt: lastFrameAt,
+            startedAt: startedAt,
+            generation: generation,
+            pendingEvictedFrames: pendingEvictedFrames,
+            pendingEvictedBytes: pendingEvictedBytes
+        )
     }
 
     /// Called once per engine (re)start, BEFORE `engine.start()` so no buffer
@@ -285,6 +300,17 @@ actor MicAudioForwarder {
             while pendingMicBytes > maxPendingMicBytes, !pendingMicAudio.isEmpty {
                 let evicted = pendingMicAudio.removeFirst()
                 pendingMicBytes -= evicted.payload.count
+                pendingEvictedFrames += 1
+                pendingEvictedBytes += evicted.payload.count
+                // Loud but rate-limited: eviction means startup audio is
+                // being lost, which should never happen inside the sized
+                // window - worth a log line, not one per frame.
+                if pendingEvictedFrames == 1 || pendingEvictedFrames % 256 == 0 {
+                    AudioLog.error("mic.pending.evicted", [
+                        "evictedFrames": pendingEvictedFrames,
+                        "evictedBytes": pendingEvictedBytes
+                    ])
+                }
             }
         }
 

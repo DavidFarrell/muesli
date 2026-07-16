@@ -72,7 +72,14 @@ final class BackendStartupGate {
                 await Task.yield()
                 return isReady ? .ready : .timedOut
             }
-            try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+            do {
+                try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+            } catch {
+                // Cancelled: resolve promptly with the current state (the
+                // timeout outcome is the fail-safe path) instead of
+                // spinning out the rest of the window.
+                return isReady ? .ready : .timedOut
+            }
         }
     }
 }

@@ -26,6 +26,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AECMode.swift,
+				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
 				BackendStartupGate.swift,

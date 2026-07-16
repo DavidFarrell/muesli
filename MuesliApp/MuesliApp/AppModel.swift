@@ -2626,6 +2626,15 @@ final class AppModel: ObservableObject {
         micStartTime = nil
         resetMicRecoveryLadder()
 
+        // Stdin closing belongs to the writer's queue exclusively (round-2
+        // gate blocker) - close it via the barrier before stop()'s teardown.
+        // In this failed-start path audio never flowed (the readiness gate
+        // was still closed), so the queue holds at most the small
+        // meeting_start control frame and the barrier resolves immediately;
+        // the bound is defensive.
+        if let failedWriter = writer {
+            _ = await failedWriter.closeStdinAndWait(timeoutSeconds: 2)
+        }
         // stop() SIGTERMs, but the child this teardown most needs to kill is
         // one wedged pre-read-loop (2026-07-16 RCA) - which may ignore
         // SIGTERM. Escalate to SIGKILL after a short grace, detached so the
@@ -2883,6 +2892,21 @@ final class AppModel: ObservableObject {
                 _ = await backend?.waitForExit(timeoutSeconds: 2)
             }
         }
+        // Single-queue stdin ownership (round-2 gate blocker): cleanup() no
+        // longer touches stdin, so wait for the writer's queued close to
+        // have actually run before tearing down the rest of the plumbing.
+        // The child is dead by now, so EPIPE has unblocked any stuck write
+        // and the queue drains fast; the bound is defensive. On timeout we
+        // proceed WITHOUT closing stdin ourselves - the queued close still
+        // runs whenever the queue unblocks.
+        if let writer, await writer.closeStdinAndWait(timeoutSeconds: 5) == false {
+            AudioLog.error("writequeue.close-barrier-timeout")
+            appendBackendLog(
+                "Writer queue close did not complete within 5s; stdin close left to the queue.",
+                toTail: false,
+                handle: backendLogHandle
+            )
+        }
         backend?.cleanup()
         await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
         synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
@@ -2934,6 +2958,7 @@ final class AppModel: ObservableObject {
             if let status = await backend.waitForExit(timeoutSeconds: 1.0) {
                 return status
             }
+            if Task.isCancelled { return nil }
             if let writer, writer.hasMadeNoProgress(forAtLeast: escalateAfterNoProgressSeconds) {
                 let snap = writer.backlogSnapshot()
                 AudioLog.error("writequeue.stalled-at-finalize", [

@@ -104,14 +104,16 @@ nonisolated final class BackendProcess {
         terminate()
     }
 
-    func requestStop() {
-        stdinPipe.fileHandleForWriting.closeFile()
-    }
-
     func waitForExit(timeoutSeconds: Double) async -> Int32? {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while process.isRunning && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                // Cancelled: resolve promptly with the current state instead
+                // of silently spinning out the rest of the deadline.
+                break
+            }
         }
         return process.isRunning ? nil : process.terminationStatus
     }
@@ -138,10 +140,18 @@ nonisolated final class BackendProcess {
         }
     }
 
+    /// Tears down the stdout/stderr plumbing. Deliberately does NOT touch
+    /// stdin (round-2 gate blocker on the 2026-07-16 slice): once the write
+    /// end is handed to a `FramedWriter` (see `stdin`), that writer's serial
+    /// queue owns it exclusively - NSFileHandle must not be used from
+    /// multiple threads simultaneously, and this method runs on the caller's
+    /// thread while the writer queue may still be mid-write (e.g. failing
+    /// fast with EPIPE right after the child was killed). Callers that need
+    /// stdin closed await `FramedWriter.closeStdinAndWait` first; if no
+    /// writer was ever created, the pipe's deinit closes the descriptor.
     func cleanup() {
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
-        stdinPipe.fileHandleForWriting.closeFile()
         stdoutContinuation?.finish()
     }
 }
@@ -177,6 +187,10 @@ final class FramedWriter: FrameSending {
     private let stateLock = NSLock()
     private var backlog: WriteBacklogTracker
     private var isForceClosed = false
+    /// Set (under `stateLock`) by the queued close the moment it has
+    /// actually executed on `writeQueue` - the observable fact the
+    /// `closeStdinAndWait` teardown barrier waits for.
+    private var stdinCloseHasRun = false
     /// Diagnostics beyond the tracker's backlog accounting: queued writes
     /// that threw (EPIPE after the child died, or writes landing after the
     /// handle closed) and sends rejected because `forceCloseStdin` already
@@ -268,9 +282,45 @@ final class FramedWriter: FrameSending {
     }
 
     func closeStdinAfterDraining() {
+        enqueueStdinClose()
+    }
+
+    /// The single place the stdin handle is ever closed - always on
+    /// `writeQueue`, preserving single-queue handle ownership (round-2 gate
+    /// blocker: BackendProcess.cleanup used to close the same handle
+    /// cross-thread while this queue could be mid-write). Idempotent: a
+    /// second queued close lands on an already-closed handle and `try?`
+    /// swallows it.
+    private func enqueueStdinClose() {
         writeQueue.async {
             try? self.handle.close()
+            self.stateLock.withLock { self.stdinCloseHasRun = true }
         }
+    }
+
+    /// Teardown barrier: reject further sends, enqueue the close, and wait
+    /// - bounded - for the queue to have actually EXECUTED it, so callers
+    /// (finalize / failed-start teardown) know the writer is done with the
+    /// handle before tearing down the rest of the process plumbing. By the
+    /// time this is called the child has exited or been killed, so a write
+    /// blocked on the full pipe has failed over with EPIPE and the queue is
+    /// draining - the timeout is defensive. Returns whether the close ran;
+    /// on `false` (or task cancellation) the caller must simply proceed
+    /// WITHOUT touching stdin itself - the queued close still runs whenever
+    /// the queue unblocks, and the pipe's deinit is the final backstop.
+    func closeStdinAndWait(timeoutSeconds: Double) async -> Bool {
+        stateLock.withLock { isForceClosed = true }
+        enqueueStdinClose()
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if stateLock.withLock({ self.stdinCloseHasRun }) { return true }
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                break // cancelled: report the current state promptly
+            }
+        }
+        return stateLock.withLock { self.stdinCloseHasRun }
     }
 
     /// Stop-path hardening for a wedged reader (2026-07-16 RCA rec #6).
@@ -294,9 +344,7 @@ final class FramedWriter: FrameSending {
     /// `closeStdinAfterDraining`.
     func forceCloseStdin() {
         stateLock.withLock { isForceClosed = true }
-        writeQueue.async {
-            try? self.handle.close()
-        }
+        enqueueStdinClose()
     }
 
     /// Returns whether both writes succeeded (runs on `writeQueue` only).
