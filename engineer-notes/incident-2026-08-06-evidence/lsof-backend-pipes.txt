@@ -1,0 +1,4 @@
+COMMAND   PID  USER   FD      TYPE             DEVICE  SIZE/OFF                NODE NAME
+Python  53049 david    0      PIPE 0xf8b945c0c3af84b3     16384                     ->0xd23e15b7d20b5dd6
+Python  53049 david    1      PIPE 0x4c2f021205880da6     16384                     ->0x8a5c186166736f00
+Python  53049 david    2      PIPE 0xdcca69cdea17b901     16384                     ->0x867dc7884be1a3ea

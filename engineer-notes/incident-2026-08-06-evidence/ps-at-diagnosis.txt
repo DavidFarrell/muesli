@@ -1,0 +1,3 @@
+  PID  PPID STAT  %CPU ELAPSED COMM
+39594     1 R    100.4   21:03 /Applications/MuesliApp.app/Contents/MacOS/MuesliApp
+53049 39594 S      0.3   10:24 /opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python

@@ -1,0 +1,97 @@
+Backend folder: /Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only
+PATH: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin
+Command: /Users/david/git/ai-sandbox/projects/muesli/backend/fast_mac_transcribe_diarise_local_models_only/.venv/bin/python -m diarise_transcribe.muesli_backend --emit-meters --transcribe-stream both --output-dir /Users/david/Library/Application Support/Muesli/Meetings/2026_08_06 - Meeting 2 -/audio --keep-wav --live-asr-only
+[audio] engine.select context=meeting engine=avaudioengine pinned=false resolvedID=200
+[audio] engine.start.begin captureSession=false gen=1 pinned=false resolvedID=200 vpio=false
+[audio] engine.bind.skip deviceID=200 reason=equals-default-follow
+[audio] engine.tap.format channels=1 sampleRate=16000.0 vpio=false
+[audio] engine.start.ok pinned=false preferredID=200 vpio=false
+Sent meeting_start
+[status] meeting_started
+Backend ready (meeting_started acknowledged)
+[audio] mic.first-frame msSinceStart=259
+ui.storm turns_per_sec=66.8 screen=session transcript_rows=0 meter_publishes_per_sec=8.4 history=1
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=1374927 start_sample=21999 last_sample_index=22252 dropped_bytes=506 cumulative_frames_dropped=1 cumulative_bytes_dropped=506
+[audio] heartbeat boundID=200 engineAlive=true frames=8 micLevel=0.001 sinceLastFrameMs=284 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=17 micLevel=0.001 sinceLastFrameMs=114 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=69.0 screen=session transcript_rows=0 meter_publishes_per_sec=7.6 history=1
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=6494929 start_sample=103919 last_sample_index=104176 dropped_bytes=514 cumulative_frames_dropped=5 cumulative_bytes_dropped=3328
+[audio] heartbeat boundID=200 engineAlive=true frames=25 micLevel=0.001 sinceLastFrameMs=203 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=33 micLevel=0.004 sinceLastFrameMs=136 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=68.0 screen=session transcript_rows=0 meter_publishes_per_sec=8.2 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=41 micLevel=0.004 sinceLastFrameMs=108 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=11623127 start_sample=185970 last_sample_index=186145 dropped_bytes=350 cumulative_frames_dropped=10 cumulative_bytes_dropped=5610
+[audio] heartbeat boundID=200 engineAlive=true frames=49 micLevel=0.000 sinceLastFrameMs=181 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=mic duration=15.21s
+[audio] heartbeat boundID=200 engineAlive=true frames=58 micLevel=0.000 sinceLastFrameMs=43 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=system duration=15.02s
+[stderr] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+ui.storm turns_per_sec=66.0 screen=session transcript_rows=0 meter_publishes_per_sec=10.2 history=1
+[status] live_process_done stream=mic turns=1 duration=15.21s
+[status] live_process_done stream=system turns=1 duration=15.02s
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=16734790 start_sample=267757 last_sample_index=268012 dropped_bytes=510 cumulative_frames_dropped=17 cumulative_bytes_dropped=8646
+[audio] heartbeat boundID=200 engineAlive=true frames=66 micLevel=0.000 sinceLastFrameMs=21 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=74 micLevel=0.001 sinceLastFrameMs=63 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=67.0 screen=session transcript_rows=2 meter_publishes_per_sec=7.4 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=82 micLevel=0.019 sinceLastFrameMs=106 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=21854853 start_sample=349678 last_sample_index=350218 dropped_bytes=1080 cumulative_frames_dropped=23 cumulative_bytes_dropped=11730
+[audio] heartbeat boundID=200 engineAlive=true frames=90 micLevel=0.001 sinceLastFrameMs=77 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=98 micLevel=0.067 sinceLastFrameMs=89 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=65.4 screen=session transcript_rows=2 meter_publishes_per_sec=9.2 history=1
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=26974843 start_sample=431597 last_sample_index=431853 dropped_bytes=512 cumulative_frames_dropped=29 cumulative_bytes_dropped=14950
+[audio] heartbeat boundID=200 engineAlive=true frames=106 micLevel=0.003 sinceLastFrameMs=148 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=114 micLevel=0.003 sinceLastFrameMs=191 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=system duration=30.02s
+[status] live_process_start stream=mic duration=30.31s
+[status] live_process_done stream=system turns=1 duration=30.02s
+[status] live_process_done stream=mic turns=2 duration=30.31s
+ui.storm turns_per_sec=68.4 screen=session transcript_rows=3 meter_publishes_per_sec=9.0 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=123 micLevel=0.003 sinceLastFrameMs=45 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=32094968 start_sample=513519 last_sample_index=513774 dropped_bytes=510 cumulative_frames_dropped=34 cumulative_bytes_dropped=17918
+[audio] heartbeat boundID=200 engineAlive=true frames=131 micLevel=0.000 sinceLastFrameMs=23 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=64.8 screen=session transcript_rows=3 meter_publishes_per_sec=9.4 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=139 micLevel=0.195 sinceLastFrameMs=23 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=37220529 start_sample=595528 last_sample_index=595696 dropped_bytes=336 cumulative_frames_dropped=41 cumulative_bytes_dropped=20544
+[audio] heartbeat boundID=200 engineAlive=true frames=147 micLevel=0.080 sinceLastFrameMs=107 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=155 micLevel=0.046 sinceLastFrameMs=152 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=61.8 screen=session transcript_rows=3 meter_publishes_per_sec=4.4 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=163 micLevel=0.030 sinceLastFrameMs=210 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=42335017 start_sample=677360 last_sample_index=677614 dropped_bytes=508 cumulative_frames_dropped=46 cumulative_bytes_dropped=22598
+[audio] heartbeat boundID=200 engineAlive=true frames=172 micLevel=0.079 sinceLastFrameMs=37 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=system duration=45.02s
+[status] live_process_start stream=mic duration=45.41s
+[status] live_process_done stream=system turns=2 duration=45.02s
+[status] live_process_done stream=mic turns=4 duration=45.41s
+ui.storm turns_per_sec=64.0 screen=session transcript_rows=6 meter_publishes_per_sec=4.4 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=180 micLevel=0.066 sinceLastFrameMs=26 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=47455046 start_sample=759281 last_sample_index=759544 dropped_bytes=526 cumulative_frames_dropped=51 cumulative_bytes_dropped=25182
+[audio] heartbeat boundID=200 engineAlive=true frames=188 micLevel=0.001 sinceLastFrameMs=98 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=196 micLevel=0.157 sinceLastFrameMs=129 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=85.2 screen=session transcript_rows=6 meter_publishes_per_sec=5.8 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=204 micLevel=0.001 sinceLastFrameMs=202 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=52575121 start_sample=841202 last_sample_index=841455 dropped_bytes=506 cumulative_frames_dropped=55 cumulative_bytes_dropped=27154
+[audio] heartbeat boundID=200 engineAlive=true frames=212 micLevel=0.098 sinceLastFrameMs=167 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=97.4 screen=session transcript_rows=6 meter_publishes_per_sec=5.8 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=220 micLevel=0.055 sinceLastFrameMs=139 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=57695159 start_sample=923123 last_sample_index=923375 dropped_bytes=504 cumulative_frames_dropped=59 cumulative_bytes_dropped=29696
+[audio] heartbeat boundID=200 engineAlive=true frames=228 micLevel=0.113 sinceLastFrameMs=198 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=system duration=60.02s
+[status] live_process_start stream=mic duration=60.51s
+[status] live_process_done stream=system turns=4 duration=60.02s
+[status] live_process_done stream=mic turns=2 duration=60.51s
+ui.storm turns_per_sec=63.8 screen=session transcript_rows=9 meter_publishes_per_sec=3.4 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=236 micLevel=0.022 sinceLastFrameMs=200 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[audio] heartbeat boundID=200 engineAlive=true frames=244 micLevel=0.023 sinceLastFrameMs=160 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=62814891 start_sample=1005038 last_sample_index=1005325 dropped_bytes=574 cumulative_frames_dropped=64 cumulative_bytes_dropped=31810
+[audio] heartbeat boundID=200 engineAlive=true frames=252 micLevel=0.001 sinceLastFrameMs=252 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=64.8 screen=session transcript_rows=9 meter_publishes_per_sec=3.6 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=261 micLevel=0.110 sinceLastFrameMs=59 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=67934943 start_sample=1086959 last_sample_index=1087214 dropped_bytes=510 cumulative_frames_dropped=68 cumulative_bytes_dropped=33854
+[audio] heartbeat boundID=200 engineAlive=true frames=269 micLevel=0.002 sinceLastFrameMs=40 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+ui.storm turns_per_sec=62.2 screen=session transcript_rows=9 meter_publishes_per_sec=2.8 history=1
+[audio] heartbeat boundID=200 engineAlive=true frames=277 micLevel=0.028 sinceLastFrameMs=54 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[stderr] [muesli-backend] AUDIO DROP stream=mic pts_us=73054998 start_sample=1168880 last_sample_index=1169137 dropped_bytes=514 cumulative_frames_dropped=72 cumulative_bytes_dropped=35904
+[audio] heartbeat boundID=200 engineAlive=true frames=285 micLevel=0.037 sinceLastFrameMs=83 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_start stream=system duration=75.02s
+[audio] heartbeat boundID=200 engineAlive=true frames=293 micLevel=0.095 sinceLastFrameMs=37 snap=in[id=200 uid=28-11-A5-DC-75-03:input name='Bose QC35 II'] out[id=194 uid=28-11-A5-DC-75-03:output name='Bose QC35 II']
+[status] live_process_done stream=system turns=2 duration=75.02s
