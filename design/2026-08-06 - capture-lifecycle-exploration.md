@@ -1,6 +1,6 @@
 # Exploration: the capture lifecycle failure of 2026-08-06
 
-**Status:** exploration, pre-build. Round 2 of the GPT-5 convergence loop. Written by
+**Status:** exploration, pre-build. Round 3 of the GPT-5 convergence loop. Written by
 re-reading the preserved evidence in `engineer-notes/incident-2026-08-06-evidence/` rather
 than by trusting the incident note's narrative.
 
@@ -61,15 +61,17 @@ to stay full, not a reason an earlier block could not have cleared.
 
 **What is therefore established, and what is not.** Established: no persistent stderr deadlock
 at 14:25:25, and the drain has never been MainActor-dependent. Not established: that no
-transient backpressure ever occurred. But a transient block by definition clears, and mic
-capture never resumed for the remaining nine and a half minutes, so a transient cannot be the
-mechanism of the outage either way.
+transient or recurring intermittent backpressure ever occurred - one sample cannot exclude it.
+Nor can it be waved away on principle: a block that clears can still leave a stream terminated
+or some other state latched behind it. The defensible statement is narrower than my first one -
+**transient backpressure is not evidenced, and cannot by itself account for an outage that
+continued for nine and a half minutes.**
 
 Consequence: **the note's recommended fixes #1 (non-blocking backend diagnostics) and #2 (drain
 stdout/stderr off the MainActor) come out of the plan.** #2 describes something
-`BackendProcess` already does. #1 is a reasonable robustness idea in the abstract but is **not
-justified by this incident's evidence**, which is a different statement from "protects against
-a failure proven never to have occurred".
+`BackendProcess` already does. #1 stays out because **this incident's evidence does not justify
+it** - not because backpressure is incapable of causing lasting harm. If a later incident
+evidences it, #1 comes back.
 
 Also unverifiable: the note's evidence table says the stderr pipe was "paired with `MuesliApp`
 fd 13 and fd 20". The preserved `lsof-backend-pipes.txt` contains only the backend's own three
@@ -104,13 +106,21 @@ that effect over-read the sample: aggregation means repeated identical passes pr
 tree, and the 100% CPU reading minutes later cannot establish continuation of the *same*
 invocation.
 
-**What does narrow it, from a second source.** If the main thread were completing many fast
-passes and turning the run loop between them, MainActor tasks would have been scheduled in the
-gaps - and two log producers that hop to MainActor (`ui.storm`, and the `[stderr]` relay) would
-have kept writing. Both stopped dead at 14:23:52 and never resumed. So whatever the invocation
-count, **the main thread was not yielding usefully to queued MainActor work at any point in
-those nine and a half minutes.** For every purpose that matters here, that is equivalent to a
-wedge.
+**What narrows it, from a second source - and how far.** If the main thread were completing many
+fast passes and turning the run loop between them, MainActor tasks would have been scheduled in
+the gaps, and two log producers that hop to MainActor (`ui.storm`, and the `[stderr]` relay)
+would have kept writing. Both stopped dead at 14:23:52 and never resumed.
+
+**Strength of that argument: strongly suggestive, not established.** Neither producer is an
+unconditional heartbeat. The stderr relay emits nothing unless the backend writes to stderr;
+`ui.storm` emits nothing unless its threshold is crossed; and both share the one log sink, so a
+single fault upstream of the sink would silence both. Their silence is therefore consistent with
+a prolonged wedge without proving that queued MainActor work was unserviceable at every moment
+of nine and a half minutes.
+
+**Net:** the sample establishes starvation during its own 3.7 s window. The surrounding evidence
+supports a prolonged wedge. Neither its exact continuity nor the invocation count is settled, and
+the plan does not depend on settling them.
 
 **Open mechanisms, none preferred:**
 - a true cycle in the layout graph (unbounded recursion);
@@ -230,40 +240,72 @@ outage, and is deliberately left open.
 What kept working, and why: `system.pcm` (the backend writes it directly from frames the
 `CaptureEngine` queue sends), `recording.mp4`, `screenshots/`. All off-main.
 
-**Ownership, resolved from source, because both documents had it wrong.** The mp4 is written by
-**`SCRecordingOutput` inside the app** (`CaptureEngine.swift:205, 282-287`), not by the backend.
-The WAVs are the **backend's** (`muesli_backend.py:140` `writer.wav.close()`), produced from the
-PCM on its own exit. So the SIGTERM at ~14:30 finalised the mp4 because the *app* exited
-cleanly, and produced the WAVs because the *backend* exited cleanly. This matters for the fix
-and is dealt with in the plan: the app cannot finalise the WAVs at all, and the backend cannot
-finalise the mp4.
+**Ownership and pipeline shape, resolved from source, because both documents had it wrong twice.**
+
+The mp4 is written by **`SCRecordingOutput` inside the app** (`CaptureEngine.swift:205,
+282-287`). The WAVs are the **backend's** (`muesli_backend.py:140` `writer.wav.close()`),
+produced from the PCM it received over the pipe.
+
+The second correction matters more. `SCRecordingOutput` and the app's `SCStreamOutput` audio
+callback are **parallel outputs attached to the same `SCStream`**. They are not in series. The
+mp4 therefore does **not** pass through the app's audio callback, the PCM conversion, the pipe,
+or any backend timestamp padding. I had drawn them as one chain, which made "both tracks are
+zero" look like evidence about the shared downstream path. It is the opposite: **nothing
+downstream of the stream fork can be a common cause**, because the mp4 branch does not traverse
+any of it.
+
+Consequences: the app cannot finalise the WAVs at all - its only lever is closing stdin, which is
+what makes the backend finalise - and the backend cannot finalise the mp4. Dealt with in the plan.
 
 Note what this table does **not** prove. `backend.log` and `transcript_events.jsonl` freezing
 says nothing about whether the backend was still emitting - only that the app stopped writing
 what it received. The incident note's timeline treated those file mtimes as backend liveness
 data. They are app liveness data.
 
-**Mic stopping at 75.6 s is still open.** 6 Jul's fix #1 moved mic forwarding off MainActor and
-`MicAudioForwarder` is a plain actor, so on the face of it the mic path should have survived as
-the system path did. Either some part of it retains a MainActor dependency, or the mic engine
-died at the same moment for an unrelated reason. Worth an hour, not on the critical path.
+**Mic stopping at 75.6 s is open, and it now has planned work.** 6 Jul's fix #1 moved mic
+forwarding off MainActor and `MicAudioForwarder` is a plain actor, so on the face of it the mic
+path should have survived as the system path did. It did not, and **it destroyed the whole
+remainder of David's own track** - which is too consequential to leave as a curiosity, as an
+earlier draft of this document did. Either some part of the path retains a MainActor dependency,
+or the mic engine died at the same moment for an unrelated reason. A bounded audit rides along
+with the layout slice: enumerate every remaining MainActor hop on the mic path, and place
+off-main counters at three boundaries - the mic callback, `MicAudioForwarder`, and the backend's
+receive point - so the next occurrence says which boundary stopped first.
 
 ### F8. The primary open fault: system audio becoming digital zero at ~54 s
 
 `system.wav` is 641.8 s long and 91.9% digital zero, with real content confined to roughly the
 first 54 s plus brief passages at 148.8, 298.6, 319.4, 353.3, 523.7 and 578.5 s.
 `recording.mp4`'s audio track is **perfectly correlated** with it (`corr = 1.0000` after
-resampling; this is a correlation result, not a byte-equality test), which indicates both derive
-from the same ScreenCaptureKit buffers and that the mp4 contains no mic content.
+resampling; a correlation result, not a byte-equality test). That is consistent with the two
+tracks sharing a **common captured source**, and it also shows the mp4 carries no mic content.
 
 The important refinement: **the file kept growing.** `system.pcm` was still growing at 14:27:03,
 minutes after everything else stopped, and the finished file is full length. So this is not a
 stalled capture - zero-valued bytes were being written throughout.
 
-**The open boundary, stated precisely:** somewhere between the ScreenCaptureKit audio callback
-and the two persisted tracks, the samples became zero. The evidence does not locate it at the
-callback specifically - conversion, timestamp padding, or shared downstream processing are all
-still in scope.
+**The open boundary, stated precisely, and it is narrower than I first wrote it.** Because the
+mp4 and the WAV descend from **parallel** outputs on the same `SCStream` (F7), nothing downstream
+of that fork can be a shared cause: the mp4 never touches the app's audio callback, the PCM
+conversion, the pipe, or the backend. So the two tracks being identically zero leaves exactly two
+possibilities:
+
+1. **the common pre-fork stream** delivered zeros - i.e. the fault is at or above `SCStream`
+   itself, which is where the device-routing hypothesis would sit; or
+2. **two independent branch failures** that happen to coincide, which is possible but requires a
+   coincidence.
+
+Slice 1's callback-level telemetry bears on this, but **one-sidedly**, and this is worth stating
+precisely because both my first version and GPT-5's round-2 wording overstated it:
+
+- **callback sees non-zero samples while both files are silent** → establishes branch divergence,
+  i.e. possibility (2);
+- **callback sees zeros** → establishes only that the PCM conversion, the pipe and the backend did
+  **not** introduce the WAV's silence. It does **not** exclude an independent `SCRecordingOutput`
+  failure, so it does not prove (1).
+
+For the telemetry to establish even that much, it has to inspect the **raw callback buffer before
+the app's own PCM conversion**. Measured after conversion it cannot separate the two.
 
 This is the earliest failure in the timeline (54 s, versus 75 s for everything else), it
 happened while the app was fully healthy, and **F1 has removed the mechanism the note offered
@@ -291,7 +333,8 @@ transport profile, so this needs the experiment in slice 0, not more reasoning.
 | 75.4 s onward | No `mainactor.starved` line, per F3 | Observed absence; mechanism read from source |
 | to 641.9 s | System audio buffers, the mp4 and the screenshots all continue | Observed |
 | 14:25:25 | Both processes sampled: app 100% CPU in layout, backend idle | Observed |
-| ~14:30 | SIGTERM. App exits cleanly and finalises the mp4; backend exits cleanly and writes the WAVs | Observed |
+| ~14:30 | SIGTERM sent; both processes exited; afterwards the mp4 was playable and the WAVs existed | Observed |
+| ~14:30 | *How* they were finalised - that `stopCapture`/`removeRecordingOutput` completed and the recording-finished delegate fired, and that EOF or a signal handler reached `writer.wav.close()` | **Unknown.** Inferred from ownership plus finished files, which is not evidence that the shutdown path ran. A finished artefact does not attest the action that produced it |
 
 Net usable audio: of a 10m42s meeting, ~75 s of David's voice, plus roughly the first 54 s of
 the other party and the six later passages. `reprocess` **cannot restore the missing intervals**
