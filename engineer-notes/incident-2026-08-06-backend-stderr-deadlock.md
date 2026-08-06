@@ -1,34 +1,18 @@
 # Incident: UI storm now deadlocks the BACKEND via its unread stderr pipe (2026-08-06)
 
-> # 🔴 SUPERSEDED - THE TITLE AND CENTRAL DIAGNOSIS OF THIS NOTE ARE WRONG
+> # 🔴 SUPERSEDED - the mechanism in this note is not supported by its own evidence
 >
-> **Read `design/2026-08-06 - capture-lifecycle-exploration.md` instead.** Written
-> 2026-08-06 from the same evidence folder.
+> **Read `design/2026-08-06 - capture-lifecycle-exploration.md` instead**, and
+> `design/2026-08-06 - implementation-plan.md` for the fix. Both went through three rounds
+> of adversarial review; this note did not.
 >
-> **There was no stderr pipe deadlock.** The backend sample shows the child idle and
-> healthy: **3 samples out of 3,419 in `write()`** (a flush caught in flight, not a block),
-> the "contended" threads are workers waiting on an **empty** `SimpleQueue`, and the
-> buffered-writer-lock frame (`_enter_buffered_busy`) appears nowhere. The stderr drain was
-> never MainActor-dependent either - it is a `FileHandle.readabilityHandler` serviced on
-> `com.apple.NSFileHandle.fd_monitoring`.
+> The raw measurements below are still the record and are still worth having. The
+> **diagnosis, the title, and the recommended fixes are not** - do not build from them.
 >
-> Specifically wrong below, and NOT to be built:
-> - the title, and the whole of "### 2. NEW: the unread stderr pipe deadlocks the backend's
->   capture threads";
-> - recommended fixes **#1** and **#2** - #2 describes something `BackendProcess` already does;
-> - "#7 storm tripwire earned its keep" - the tripwire reports through MainActor, so its
->   lines prove MainActor was ALIVE, and a wedge drives its metric to zero. It measures the
->   opposite of the failure it is named for;
-> - the evidence table's "paired with `MuesliApp` fd 13 and fd 20" - not present in the
->   preserved `lsof-backend-pipes.txt`, unverifiable.
->
-> Still correct and still useful: the raw measurements, the data-loss section (both
-> corrections in it), and the observation that system audio died first at ~54 s. That last
-> point is now the **primary open fault**, because this note's mechanism was the thing that
-> was supposed to explain it.
->
-> Kept rather than deleted because the measurements are the record and the wrong turning is
-> worth being able to retrace.
+> Deliberately not summarised here: an earlier version of this banner tried to state the
+> corrected findings, and by the time the review rounds had finished weakening those very
+> claims the banner had itself gone stale. Two documents disagreeing about the same evidence
+> is the failure this incident is about. The design docs are the single authority.
 
 **Status: diagnosed live, from a wedged process, with the app still running.** This is
 the first time this failure has been caught in vivo rather than reconstructed from a
