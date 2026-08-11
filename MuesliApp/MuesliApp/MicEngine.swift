@@ -82,86 +82,96 @@ actor MicEngine: MicCapturing {
             }
         }
 
-        // The caller controls VPIO. If it was requested and cannot be enabled,
-        // let that throw out so the caller can decide to retry without it -
-        // swallowing it would run plain capture while reporting VPIO enabled.
-        if enableVoiceProcessing {
-            try inputNode.setVoiceProcessingEnabled(true)
-            if #available(macOS 14.0, *) {
-                inputNode.voiceProcessingOtherAudioDuckingConfiguration =
-                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                        enableAdvancedDucking: false,
-                        duckingLevel: .min
-                    )
-                print("[MicEngine] Ducking set to minimum")
-            } else {
-                print("[MicEngine] Ducking configuration unavailable (requires macOS 14+)")
-            }
-        }
-
-        // Read the format only after VPIO is enabled - enabling VPIO changes the
-        // input node format and is where the 0 Hz / 0 channel failure surfaces.
-        let nativeFormat = inputNode.outputFormat(forBus: 0)
-        print("[MicEngine] Native format: \(nativeFormat)")
-        // print() output isn't captured in backend.log - log it properly so
-        // the next incident's tap format is visible in the recorded log, not
-        // just stdout.
-        AudioLog.event("engine.tap.format", [
-            "sampleRate": nativeFormat.sampleRate,
-            "channels": nativeFormat.channelCount,
-            "vpio": enableVoiceProcessing
-        ])
-
-        guard isUsableInputFormat(
-            sampleRate: nativeFormat.sampleRate,
-            channelCount: nativeFormat.channelCount
-        ) else {
-            throw MicEngineError.invalidInputFormat(
-                sampleRate: nativeFormat.sampleRate,
-                channelCount: nativeFormat.channelCount,
-                deviceID: preferredInputDeviceID,
-                vpioRequested: enableVoiceProcessing
-            )
-        }
-
-        inputNode.installTap(
-            onBus: 0,
-            bufferSize: 4096,
-            format: nativeFormat
-        ) { [weak self] buffer, _ in
-            guard let data = AudioConverterHelper.convertToInt16(buffer: buffer) else {
-                // A tap that fires but fails to convert looks identical to a dead
-                // mic from the outside and silently defeats the no-audio health
-                // check - so count and log it (first failure carries the format).
-                Task { [weak self] in
-                    await self?.noteConversionFailure(format: "\(nativeFormat)")
-                }
-                return
-            }
-            Task { [weak self] in
-                await self?.emitAudio(data)
-            }
-        }
-
-        // Fire when the OS moves the route under a running engine (the event we
-        // previously could not see at all - e.g. a Bluetooth headset connecting).
-        if let onConfigurationChange {
-            let callback = onConfigurationChange
-            configChangeObserver = NotificationCenter.default.addObserver(
-                forName: .AVAudioEngineConfigurationChange,
-                object: engine,
-                queue: nil
-            ) { _ in
-                AudioLog.event("engine.configchange.notify")
-                callback()
-            }
-        }
-
+        // AVFoundation raises ObjC NSExceptions here when a device vanishes
+        // mid-configuration (the "Failed to create tap due to format mismatch"
+        // abort of 11 Aug). The bridge turns those into ordinary thrown errors
+        // so the caller's recovery ladder can absorb them.
         do {
-            engine.prepare()
-            try engine.start()
+            try catchingObjCExceptions {
+                // The caller controls VPIO. If it was requested and cannot be
+                // enabled, let that throw out so the caller can decide to retry
+                // without it - swallowing it would run plain capture while
+                // reporting VPIO enabled.
+                if enableVoiceProcessing {
+                    try inputNode.setVoiceProcessingEnabled(true)
+                    if #available(macOS 14.0, *) {
+                        inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                                enableAdvancedDucking: false,
+                                duckingLevel: .min
+                            )
+                        print("[MicEngine] Ducking set to minimum")
+                    } else {
+                        print("[MicEngine] Ducking configuration unavailable (requires macOS 14+)")
+                    }
+                }
+
+                // Read the format only after VPIO is enabled - enabling VPIO changes the
+                // input node format and is where the 0 Hz / 0 channel failure surfaces.
+                let nativeFormat = inputNode.outputFormat(forBus: 0)
+                print("[MicEngine] Native format: \(nativeFormat)")
+                // print() output isn't captured in backend.log - log it properly so
+                // the next incident's tap format is visible in the recorded log, not
+                // just stdout.
+                AudioLog.event("engine.tap.format", [
+                    "sampleRate": nativeFormat.sampleRate,
+                    "channels": nativeFormat.channelCount,
+                    "vpio": enableVoiceProcessing
+                ])
+
+                guard isUsableInputFormat(
+                    sampleRate: nativeFormat.sampleRate,
+                    channelCount: nativeFormat.channelCount
+                ) else {
+                    throw MicEngineError.invalidInputFormat(
+                        sampleRate: nativeFormat.sampleRate,
+                        channelCount: nativeFormat.channelCount,
+                        deviceID: preferredInputDeviceID,
+                        vpioRequested: enableVoiceProcessing
+                    )
+                }
+
+                inputNode.installTap(
+                    onBus: 0,
+                    bufferSize: 4096,
+                    format: nativeFormat
+                ) { [weak self] buffer, _ in
+                    guard let data = AudioConverterHelper.convertToInt16(buffer: buffer) else {
+                        // A tap that fires but fails to convert looks identical to a dead
+                        // mic from the outside and silently defeats the no-audio health
+                        // check - so count and log it (first failure carries the format).
+                        Task { [weak self] in
+                            await self?.noteConversionFailure(format: "\(nativeFormat)")
+                        }
+                        return
+                    }
+                    Task { [weak self] in
+                        await self?.emitAudio(data)
+                    }
+                }
+
+                // Fire when the OS moves the route under a running engine (the event we
+                // previously could not see at all - e.g. a Bluetooth headset connecting).
+                if let onConfigurationChange {
+                    let callback = onConfigurationChange
+                    configChangeObserver = NotificationCenter.default.addObserver(
+                        forName: .AVAudioEngineConfigurationChange,
+                        object: engine,
+                        queue: nil
+                    ) { _ in
+                        AudioLog.event("engine.configchange.notify")
+                        callback()
+                    }
+                }
+
+                engine.prepare()
+                try engine.start()
+            }
             self.engine = engine
         } catch {
+            // One cleanup path for every in-block failure, not just a failed
+            // start: removeTap with no tap and stop() on a never-started engine
+            // are no-ops, and the observer removal is guarded.
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
             if let observer = configChangeObserver {
