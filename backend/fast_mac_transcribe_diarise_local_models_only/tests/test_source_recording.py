@@ -82,6 +82,7 @@ def test_source_mode_never_opens_or_deletes_source_files(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "run_pipeline", lambda **kw: SimpleNamespace(turns=[]))
     monkeypatch.setattr(backend.TranscriptEmitter, "emit_transcript", lambda *a, **kw: None)
     args = backend.create_parser().parse_args(["--output-dir", str(tmp_path), "--source-recording", "--no-live"])
+    args.observed_runtime_identity = {"schema_version": 1, "observation": "process_preflight"}
     output = io.StringIO()
     writer = backend.StdoutWriter(output)
     assert backend._run_backend(args, tmp_path, writer) == 0
@@ -89,6 +90,10 @@ def test_source_mode_never_opens_or_deletes_source_files(tmp_path, monkeypatch):
     for name, data in before.items():
         assert (tmp_path / name).read_bytes() == data
     assert "meeting_stopped" in output.getvalue()
+    identity = next(json.loads(line) for line in output.getvalue().splitlines()
+                    if json.loads(line).get("type") == "runtime_identity")
+    assert identity["source_session_id"] == "session-a"
+    assert identity["identity"] == args.observed_runtime_identity
 
 
 def test_stdout_close_delivers_all_final_events_without_daemon_tail_loss():

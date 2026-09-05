@@ -106,11 +106,13 @@ def preflight(model_id: str = DEFAULT_ASR_MODEL, *, diarisation: bool = False, h
     if diarisation:
         paths += senko_asset_paths()
     files = []
-    for path in paths:
+    for index, path in enumerate(paths):
         for file in sorted(path.rglob("*")) if path.is_dir() else [path]:
             if not file.is_file():
                 continue
-            entry = {"path": str(file), "bytes": file.stat().st_size}
+            logical_name = ("asr/" + file.name if index < len(ASR_FILES) else
+                            "senko/" + path.name + ("/" + file.relative_to(path).as_posix() if path.is_dir() else ""))
+            entry = {"path": str(file), "logical_name": logical_name, "bytes": file.stat().st_size}
             if hashes:
                 digest = hashlib.sha256()
                 with file.open("rb") as handle:

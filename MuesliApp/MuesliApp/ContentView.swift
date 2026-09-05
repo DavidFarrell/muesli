@@ -27,6 +27,12 @@ struct RootView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.12))
             }
+            if let notice = model.metadataEditNotice {
+                Label(notice, systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.callout).padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.12))
+            }
             content
         }
             .padding(.top, 28)
@@ -496,6 +502,7 @@ struct NewMeetingView: View {
         }
         .onAppear {
             refreshTitleRolloverIfSafe()
+            model.loadMeetingHistory()
             Task { await model.startHomeLevelPreview() }
         }
         .onDisappear {
@@ -521,12 +528,20 @@ struct NewMeetingView: View {
         let trimmed = renameFieldText.trimmingCharacters(in: .whitespacesAndNewlines)
         editingMeetingID = nil
         guard !trimmed.isEmpty, trimmed != item.title else { return }
-        do {
-            try model.renameMeeting(item, to: trimmed)
-            rowRenameErrorID = nil
-        } catch {
-            rowRenameErrorID = item.id
-            rowRenameError = "Couldn't rename: \(error.localizedDescription)"
+        Task {
+            do {
+                try await model.renameMeeting(item, to: trimmed)
+                rowRenameErrorID = nil
+            } catch {
+                if let failure = error as? TranscriptPersistenceStore.Failure {
+                    switch failure {
+                    case .timedOut, .cancelled: return // Shared notice tracks the original owner.
+                    default: break
+                    }
+                }
+                rowRenameErrorID = item.id
+                rowRenameError = "Couldn't rename: \(error.localizedDescription)"
+            }
         }
     }
 

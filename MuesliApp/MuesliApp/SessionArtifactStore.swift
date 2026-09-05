@@ -50,6 +50,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     private let completion = TaskCompletion()
     private let pngWriter: PNGWriter
     private var ledger: FileHandle?
+    private var ownerLease: FileHandle?
     private var ledgerFailed = false
     private var closing = false
     private var closed = false
@@ -86,6 +87,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         guard !fm.fileExists(atPath: directory.path) else { throw Self.error("Artifact session already exists") }
         try fm.createDirectory(at: directory.appendingPathComponent("screenshots"), withIntermediateDirectories: true)
         try fm.createDirectory(at: directory.appendingPathComponent("video"), withIntermediateDirectories: false)
+        ownerLease = try Self.acquireLease(directory: directory, create: true)
         let ledgerURL = directory.appendingPathComponent("assets.jsonl")
         let fd = open(ledgerURL.path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND, S_IRUSR | S_IWUSR)
         guard fd >= 0 else { throw Self.posixError() }
@@ -287,7 +289,36 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
             lock.withLock { closed = true }
         } catch { recordError(error) }
         ledger = nil
+        // The queue has retired every screenshot and actual native output.
+        // A deadline never reaches here while those owners remain outstanding.
+        do { try ownerLease?.close(); ownerLease = nil }
+        catch { recordError(error) } // Retain a failed close's handle through deinit.
         completion.markCompleted()
+    }
+
+    /// Caller retains this lease across a destructive folder operation. Missing
+    /// leases identify old sessions; current stores create theirs before their
+    /// first ledger write. Process death also releases the kernel-held lease.
+    static func acquireInactiveLease(directory: URL) throws -> FileHandle? {
+        try acquireLease(directory: directory, create: false)
+    }
+    private static func acquireLease(directory: URL, create: Bool) throws -> FileHandle? {
+        let path = directory.appendingPathComponent(".artifact-owner.lock").path
+        let flags = (create ? O_RDWR | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW
+        let descriptor = open(path, flags, S_IRUSR | S_IWUSR)
+        if descriptor < 0 {
+            if !create && errno == ENOENT { return nil }
+            throw posixError()
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let failure = errno
+            Darwin.close(descriptor)
+            if failure == EWOULDBLOCK || failure == EAGAIN {
+                throw error("Screenshot or video files are still owned by their original save operation.")
+            }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
     private func relativePath(_ url: URL) -> String {

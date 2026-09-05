@@ -10,6 +10,7 @@ __pycache__/
 xcuserdata/
 *.xcuserstate
 DerivedData/
+com.apple.DeveloperTools/
 
 # Meeting data - NEVER commit transcripts or recordings
 Meetings/

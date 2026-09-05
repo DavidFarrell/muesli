@@ -19,6 +19,7 @@ nonisolated struct TranscriptReplacement: Sendable {
         metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
         metadata.durationSeconds = max(result.duration, result.sources?.map { $0.timelineOffsetSeconds + $0.durationSeconds }.max() ?? 0)
         metadata.speakerNames = [:]
+        metadata.lastReprocessIdentity = result.runtimeIdentity?.isSafeDiagnosticValue == true ? result.runtimeIdentity : nil
         // Reprocessing cannot certify or repair capture integrity.
         self.metadata = metadata
         files = try Self.files(segments: segments, text: TranscriptModel.plainText(from: segments),
@@ -29,7 +30,8 @@ nonisolated struct TranscriptReplacement: Sendable {
     static func commitStoppedMeeting(context: TranscriptPersistenceStore.Context,
         timestampOffset: Double, segments initialSegments: [TranscriptSegment], speakerNames: [String: String],
         journalURL: URL?, journalStatus: BackendStdoutStatus?, sourceManifest: LocalAudioRecorder.Manifest?,
-        artifactResult: SessionArtifactFinishResult?, incomplete: Bool) throws -> MeetingMetadata {
+        artifactResult: SessionArtifactFinishResult?, incomplete: Bool,
+        acceptedSpeakerNames: [String: String] = [:]) throws -> MeetingMetadata {
         var accumulator = TranscriptAccumulator(timestampOffset: timestampOffset,
             segments: initialSegments, speakerNames: speakerNames)
         let replay: TranscriptEventJournal.Replay
@@ -46,7 +48,15 @@ nonisolated struct TranscriptReplacement: Sendable {
         var metadata = prior.finalized(segments: segments, sourceManifest: sourceManifest,
             artifactResult: artifactResult, incomplete: incomplete || replay.error != nil,
             sourceProblems: problems)
+        if let last = metadata.sessions.indices.last, let sourceID = metadata.sessions[last].sourceSessionID {
+            // Only the acknowledged durable journal may establish this identity.
+            // A lossy UI event is never the authority for persisted provenance.
+            metadata.sessions[last].observedRuntimeIdentity = replay.lines.reduce(nil) { previous, line in
+                ObservedRuntimeIdentity.event(line, sourceSessionID: sourceID) ?? previous
+            }
+        }
         metadata.speakerNames.merge(accumulator.speakerNames) { reviewed, _ in reviewed }
+        metadata.speakerNames.merge(acceptedSpeakerNames) { _, latestAccepted in latestAccepted }
         try context.commit(files: TranscriptReplacement.files(segments: segments,
             text: TranscriptModel.plainText(from: segments, names: metadata.speakerNames), metadata: metadata))
         return metadata

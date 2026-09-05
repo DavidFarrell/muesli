@@ -26,6 +26,7 @@ from .diarisation import DiarSegment
 from .merge import merge_transcript_with_diarisation
 from .source_recording import CommittedSource, committed_sources
 from .local_assets import MissingLocalAssets, preflight
+from .runtime_identity import observe_runtime
 
 MSG_AUDIO = 1
 MSG_SCREENSHOT_EVENT = 2
@@ -863,7 +864,11 @@ def main() -> int:
     sys.stdout = sys.stderr
     try:
         try:
-            preflight(args.asr_model, diarisation=not args.live_asr_only)
+            selected = preflight(args.asr_model, diarisation=not args.live_asr_only)
+            args.observed_runtime_identity = observe_runtime(selected)
+            if selected is not None:
+                # Use the exact selected local directory whose bytes were observed.
+                args.asr_model = selected["asr_directory"]
             result = _run_backend(args, output_dir, stdout_writer)
         except MissingLocalAssets as exc:
             emit_jsonl({"type": "error", "code": "missing_local_assets", "message": str(exc)}, stdout_writer)
@@ -952,6 +957,10 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                     )
 
             emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_writer)
+            identity = getattr(args, "observed_runtime_identity", None)
+            if identity is not None:
+                emit_jsonl({"type": "runtime_identity", "source_session_id": state.source_session_id,
+                            "identity": identity}, stdout_writer)
 
         elif msg_type == MSG_AUDIO:
             if args.source_recording:

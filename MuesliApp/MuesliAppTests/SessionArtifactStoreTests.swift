@@ -142,15 +142,28 @@ final class SessionArtifactStoreTests: XCTestCase {
         delegate.recordingOutputDidStartRecording(output)
         guard case .timedOut(let pending) = await store.finish(timeoutSeconds: 0.02) else { return XCTFail("missing SDK finish") }
         XCTAssertEqual(pending.pendingVideos, 1)
+        XCTAssertThrowsError(try SessionArtifactStore.acquireInactiveLease(directory: store.directory))
         XCTAssertNil(store.nextVideoURL())
         delegate.recordingOutputDidFinishRecording(output)
         guard case .completed(let status) = await store.finish(timeoutSeconds: 2) else { return XCTFail("late completion") }
         XCTAssertTrue(status.isComplete)
         XCTAssertEqual(status.finishedVideos, 1)
+        let inactiveLease = try SessionArtifactStore.acquireInactiveLease(directory: store.directory)
+        try inactiveLease?.close()
         XCTAssertEqual(try ledger(store).last?["status"] as? String, "finished")
         XCTAssertNotNil(try ledger(store).last?["requested_t"])
         XCTAssertNil(try ledger(store).last?["t"])
         XCTAssertNil(status.mediaEndSeconds)
+    }
+
+    func testDroppingUnusedArtifactStoreReleasesKernelLease() throws {
+        var current: SessionArtifactStore? = try store(folder())
+        let directory = try XCTUnwrap(current?.directory)
+        XCTAssertThrowsError(try SessionArtifactStore.acquireInactiveLease(directory: directory))
+        current = nil
+        let released = try SessionArtifactStore.acquireInactiveLease(directory: directory)
+        XCTAssertNotNil(released)
+        try released?.close()
     }
 
     func testNativeFailureAndUnregisteredReservationRemainIncomplete() async throws {
@@ -220,6 +233,23 @@ final class SessionArtifactStoreTests: XCTestCase {
         try await assertBlockedInvocationIsReported(callbackBeforeBlocking: false)
     }
 
+    func testIndependentDeadlineDoesNotConsumeItsOnlyEventOnClockRecheck() async throws {
+        let root = try folder(), artifacts = try store(root)
+        let invoked = TaskCompletion(), deadline = TaskCompletion()
+        let scheduler = ScreenshotScheduler(requestTimeoutSeconds: 0.03, now: { 0 },
+            onRequestTimeout: { deadline.markCompleted() })
+        scheduler.start(every: 60, store: artifacts, request: { _ in invoked.markCompleted() }) { _ in }
+        scheduler.requestNow()
+        let began = await invoked.wait(timeoutSeconds: 2)
+        XCTAssertEqual(began, .completed)
+        let expired = await deadline.wait(timeoutSeconds: 2)
+        XCTAssertEqual(expired, .completed)
+        scheduler.stop()
+        let result = await artifacts.finish(timeoutSeconds: 2)
+        XCTAssertFalse(result.status.isComplete)
+        XCTAssertTrue(try ledger(artifacts).contains { $0["kind"] as? String == "screenshot_unavailable" })
+    }
+
     func testEarlyCallbackCannotReleaseAnInvocationThatStillBlocks() async throws {
         try await assertBlockedInvocationIsReported(callbackBeforeBlocking: true)
     }
@@ -245,7 +275,9 @@ final class SessionArtifactStoreTests: XCTestCase {
         }
         let invocation = Invocation(), root = try folder()
         defer { invocation.release.signal() }
-        let scheduler = ScreenshotScheduler(requestTimeoutSeconds: 0.05)
+        let deadlineObserved = TaskCompletion()
+        let scheduler = ScreenshotScheduler(requestTimeoutSeconds: 0.05,
+            onRequestTimeout: { deadlineObserved.markCompleted() })
         let first = try store(root)
         let request: ScreenshotScheduler.Request = { reply in invocation.invoke(reply, early: callbackBeforeBlocking) }
         scheduler.start(every: 60, store: first, request: request) { _ in XCTFail("unexpected image") }
@@ -253,7 +285,9 @@ final class SessionArtifactStoreTests: XCTestCase {
         XCTAssertEqual(invocation.entered.wait(timeout: .now() + 2), .success)
         // Only the independent deadline can report this: no scheduler tick is
         // manually requested after the invocation blocks.
-        try await Task.sleep(for: .milliseconds(150))
+        let observed = await deadlineObserved.wait(timeoutSeconds: 2)
+        XCTAssertEqual(observed, .completed,
+                       "The actual deadline must report before the test closes its artifact store")
         let firstResult = await first.finish(timeoutSeconds: 1)
         XCTAssertFalse(firstResult.status.isComplete)
         XCTAssertTrue(try ledger(first).contains { $0["kind"] as? String == "screenshot_unavailable" })

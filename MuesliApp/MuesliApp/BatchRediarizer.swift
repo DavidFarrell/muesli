@@ -40,6 +40,11 @@ actor BatchRediarizer {
         let speakers: [String]
         let duration: Double
         var sources: [SourceInventory]? = nil
+        var runtimeIdentity: ObservedRuntimeIdentity? = nil
+        enum CodingKeys: String, CodingKey {
+            case turns, speakers, duration, sources
+            case runtimeIdentity = "runtime_identity"
+        }
     }
 
     nonisolated struct SourceInventory: Codable, Sendable {
@@ -73,6 +78,11 @@ actor BatchRediarizer {
         let speakers: [String]
         let duration: Double
         let sources: [SourceInventory]?
+        let runtimeIdentity: ObservedRuntimeIdentity?
+        enum CodingKeys: String, CodingKey {
+            case type, turns, speakers, duration, sources
+            case runtimeIdentity = "runtime_identity"
+        }
     }
 
     nonisolated private final class ProcessStore: @unchecked Sendable {
@@ -114,7 +124,7 @@ actor BatchRediarizer {
                 lock.withLock { if error == nil { error = failure.message ?? "Batch reprocess failed." } }
             } else if let value = try? JSONDecoder().decode(ResultEnvelope.self, from: data), value.type == "result" {
                 lock.withLock { result = Result(turns: value.turns, speakers: value.speakers,
-                                               duration: value.duration, sources: value.sources) }
+                                               duration: value.duration, sources: value.sources, runtimeIdentity: value.runtimeIdentity) }
             } else if let status = try? JSONDecoder().decode(StatusEnvelope.self, from: data), status.type == "status" {
                 // A future progress stage is harmless; a malformed result is not.
                 return nil

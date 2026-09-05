@@ -236,9 +236,15 @@ struct SessionView: View {
                     isEditing: $isEditingTitle
                 ) { newTitle in
                     do {
-                        try model.renameCurrentMeeting(to: newTitle)
+                        try await model.renameCurrentMeeting(to: newTitle)
                         return nil
                     } catch {
+                        if let failure = error as? TranscriptPersistenceStore.Failure {
+                            switch failure {
+                            case .timedOut, .cancelled: return nil // The retained owner's notice remains authoritative.
+                            default: break
+                            }
+                        }
                         return "Couldn't rename: \(error.localizedDescription)"
                     }
                 }

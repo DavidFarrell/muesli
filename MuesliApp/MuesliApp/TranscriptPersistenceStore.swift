@@ -51,22 +51,38 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     static let shared = TranscriptPersistenceStore()
     static let journalDirectoryName = ".transcript-transaction"
     private final class Registry: @unchecked Sendable {
+        private struct Pending: Sendable { let id: UUID; let work: @Sendable () -> Void }
         let lock = NSLock()
         var owners: [String: UUID] = [:]
-        func reserve(_ folder: URL) throws -> UUID {
+        private var pending: [String: Pending] = [:]
+        func admit(_ folder: URL, id: UUID, afterCurrent: Bool,
+                   work: @escaping @Sendable () -> Void) throws -> Bool {
             try lock.withLock {
                 let key = folder.standardizedFileURL.path
-                guard owners[key] == nil, owners.count < 8 else { throw Failure.busy }
-                let id = UUID()
+                if owners[key] != nil {
+                    // Only terminal finalization may retain one intent behind
+                    // an existing owner. Further edits and finalizers stay bounded.
+                    guard afterCurrent, pending[key] == nil else { throw Failure.busy }
+                    pending[key] = Pending(id: id, work: work)
+                    return false
+                }
+                guard owners.count < 8 else { throw Failure.busy }
                 owners[key] = id
-                return id
+                return true
             }
         }
         func release(_ folder: URL, id: UUID) {
-            lock.withLock {
+            let next: Pending? = lock.withLock {
                 let key = folder.standardizedFileURL.path
-                if owners[key] == id { owners.removeValue(forKey: key) }
+                guard owners[key] == id else { return nil }
+                if let next = pending.removeValue(forKey: key) {
+                    owners[key] = next.id
+                    return next
+                }
+                owners.removeValue(forKey: key)
+                return nil
             }
+            if let next { DispatchQueue.global(qos: .utility).async(execute: next.work) }
         }
         func isBusy(_ folder: URL) -> Bool {
             lock.withLock { owners[folder.standardizedFileURL.path] != nil }
@@ -95,6 +111,13 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
         fileprivate func finish(_ result: Result<Output, Failure>) {
             lock.withLock { self.result = result }
             completion.markCompleted()
+        }
+
+        /// Only for an original worker that has observed its terminal callback.
+        /// This takes a short state lock and never waits for completion.
+        func completedValue() throws -> Output {
+            guard let result = lock.withLock({ result }) else { throw Failure.busy }
+            return try result.get()
         }
 
         @concurrent func wait(timeoutSeconds: Double) async -> WaitResult<Output> {
@@ -146,9 +169,25 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     func start<Output: Sendable>(in folder: URL,
                                 onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void = { _ in },
                                 operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
-        let id = try Self.registry.reserve(folder)
+        try admit(in: folder, afterCurrent: false, onCompletion: onCompletion, operation: operation)
+    }
+
+    /// Stop must not discard its final save merely because an earlier metadata
+    /// edit is still writing. Retain one terminal intent and hand it the same
+    /// folder only after the original worker really finishes. Waiter deadlines
+    /// do not remove either owner or start a competing disk operation.
+    func startAfterCurrent<Output: Sendable>(in folder: URL,
+                                onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void = { _ in },
+                                operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
+        try admit(in: folder, afterCurrent: true, onCompletion: onCompletion, operation: operation)
+    }
+
+    private func admit<Output: Sendable>(in folder: URL, afterCurrent: Bool,
+                                onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void,
+                                operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
+        let id = UUID()
         let owner = Operation<Output>()
-        DispatchQueue.global(qos: .utility).async { [self] in
+        let work: @Sendable () -> Void = { [self] in
             let result: Result<Output, Failure>
             do {
                 try recoverOwned(in: folder)
@@ -161,6 +200,9 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
             Self.registry.release(folder, id: id)
             owner.finish(result)
             onCompletion(result)
+        }
+        if try Self.registry.admit(folder, id: id, afterCurrent: afterCurrent, work: work) {
+            DispatchQueue.global(qos: .utility).async(execute: work)
         }
         return owner
     }

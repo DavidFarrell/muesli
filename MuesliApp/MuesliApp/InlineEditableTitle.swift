@@ -13,9 +13,10 @@ struct InlineEditableTitle: View {
     var font: Font = .title2.bold()
     @Binding var isEditing: Bool
     /// Returns an error message to display, or nil on success.
-    let onCommit: (String) -> String?
+    let onCommit: (String) async -> String?
 
     @State private var pendingTitle = ""
+    @State private var isSaving = false
     @State private var errorMessage: String?
     @FocusState private var isFocused: Bool
 
@@ -47,9 +48,10 @@ struct InlineEditableTitle: View {
                 Text(title)
                     .font(font)
                     .onTapGesture {
-                        isEditing = true
+                        if !isSaving { isEditing = true }
                     }
             }
+            if isSaving { Text("Saving…").font(.caption).foregroundStyle(.secondary) }
             if let errorMessage {
                 Text(errorMessage)
                     .font(.caption)
@@ -63,7 +65,11 @@ struct InlineEditableTitle: View {
         let trimmed = pendingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         isEditing = false
         guard !trimmed.isEmpty, trimmed != title else { return }
-        errorMessage = onCommit(trimmed)
+        isSaving = true
+        Task {
+            errorMessage = await onCommit(trimmed)
+            isSaving = false
+        }
     }
 
     private func cancel() {

@@ -447,6 +447,9 @@ def _main() -> int:
         streams = ["system", "mic"] if args.stream == "both" else [args.stream]
 
         emit_status("preparing")
+        from .runtime_identity import prepare_observation
+        runtime_identity, args.asr_model = prepare_observation(
+            args.asr_model, diarisation=args.diar_backend == "senko")
 
         all_turns = []
         all_speakers = set()
@@ -532,6 +535,7 @@ def _main() -> int:
             "speakers": sorted(all_speakers),
             "duration": duration,
             "sources": source_inventory,
+            "runtime_identity": runtime_identity,
         })
         return 0
     except Exception as error:
