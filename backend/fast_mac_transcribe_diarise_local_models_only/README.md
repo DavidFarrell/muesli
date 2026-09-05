@@ -26,7 +26,7 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 Use uv **0.11.3** and Python **3.12.13** for the qualified dependency set. From this repository's backend directory:
 
 ```bash
-uv sync --locked --python 3.12.13
+uv sync --config-file uv.toml --locked --python 3.12.13
 ```
 
 This is an explicit online dependency preparation step. The lock pins package versions and Senko's source commit. Prepare model assets separately using the exact-revision command below before recording. Runtime commands must not resolve or install dependencies:
@@ -35,7 +35,7 @@ This is an explicit online dependency preparation step. The lock pins package ve
 .venv/bin/python -m diarise_transcribe --in audio.mp4 --out transcript.txt
 ```
 
-For developer/CI verification, use `uv sync --locked --extra dev --python 3.12.13`. The root `scripts/verify.sh` creates its own fresh environment, checks the lock remains unchanged, runs the backend and Swift tests, compiles Release and records runtime/build provenance. It requires an Apple Silicon Mac with Xcode 26.6 and uv 0.11.3. It does not replace or modify the app's selected runtime.
+The tracked `uv.toml` fixes the existing lock's package cutoff at `2026-05-29T14:22:51.381105Z`; dependency updates require an intentional policy and lock review. For developer/CI verification, run the root `scripts/verify.sh` with a fresh output directory. It ignores discovered user/system uv configuration, clears inherited UV/PIP/Python overrides, creates a fresh environment and package cache, checks the lock remains unchanged, runs backend and Swift tests, compiles Release and records runtime/build provenance. It requires an Apple Silicon Mac with Xcode 26.6 and uv 0.11.3. It does not replace or modify the app's selected runtime.
 
 ## Usage
 
