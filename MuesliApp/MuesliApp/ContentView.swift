@@ -33,6 +33,12 @@ struct RootView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.12))
             }
+            if let notice = model.transcriptExportNotice {
+                Label(notice, systemImage: "square.and.arrow.up")
+                    .font(.callout).padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.10))
+            }
             content
         }
             .padding(.top, 28)

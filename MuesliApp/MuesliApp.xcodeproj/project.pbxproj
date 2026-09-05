@@ -76,6 +76,7 @@
 				TranscriptModel.swift,
 				TranscriptPersistenceStore.swift,
 				TranscriptReplacement.swift,
+				TranscriptExportOwner.swift,
 				WriteBacklogTracker.swift,
 			);
 			target = AA0000010000000000000005 /* MuesliAppTests */;

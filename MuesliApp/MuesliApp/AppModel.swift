@@ -605,38 +605,9 @@ final class AppModel: ObservableObject {
         url?.stopAccessingSecurityScopedResource()
     }
 
-    private func resetBackendLog(in folderURL: URL) {
-        let logURL = folderURL.appendingPathComponent("backend.log")
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        backendLogURL = logURL
-        backendLogHandle = try? FileHandle(forWritingTo: logURL)
-        backendLogWriter.reset(handle: backendLogHandle)
-    }
-
     private func closeBackendLog() {
         backendLogWriter.close()
         backendLogHandle = nil
-    }
-
-    private func resetTranscriptEventsLog(in audioDirectory: URL) throws {
-        let logURL = audioDirectory.appendingPathComponent("transcript_events.jsonl")
-        // Each source session has its own journal. Never truncate or append
-        // into a prior session while its timed-out reader may still own it.
-        try Data().write(to: logURL, options: .withoutOverwriting)
-        currentTranscriptEventsStartOffset = 0
-        transcriptEventsURL = logURL
-    }
-
-    private func loadTranscriptFromDisk(in folderURL: URL) {
-        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
-        guard FileManager.default.fileExists(atPath: transcriptURL.path) else { return }
-        guard let data = try? Data(contentsOf: transcriptURL),
-              let content = String(data: data, encoding: .utf8) else {
-            return
-        }
-        for line in content.split(whereSeparator: \.isNewline) {
-            transcriptModel.ingest(jsonLine: String(line))
-        }
     }
 
     private func closeTranscriptEventsLog() {
@@ -1818,75 +1789,69 @@ final class AppModel: ObservableObject {
         return Float(min(1.0, rms))
     }
 
-    private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
-        // Legacy export wrapper. Authoritative saves use the throwing encoder
-        // through TranscriptReplacement and TranscriptPersistenceStore.
-        do { return try TranscriptModel.jsonLines(from: segments) }
-        catch {
-            appendBackendLog("Failed to encode transcript JSONL: \(error.localizedDescription)", toTail: true)
-            return ""
-        }
-    }
-
-    private func writeTranscriptData(
-        _ data: Data?,
-        to url: URL,
-        encodeFailure: String,
-        writeFailure: String,
-        logToTail: Bool = true,
-        logHandle: FileHandle? = nil
-    ) {
-        guard let data else {
-            appendBackendLog(encodeFailure, toTail: logToTail, handle: logHandle)
-            return
-        }
-        do {
-            try data.write(to: url)
-        } catch {
-            appendBackendLog(
-                "\(writeFailure): \(error.localizedDescription)",
-                toTail: logToTail,
-                handle: logHandle
-            )
-        }
-    }
+    @Published var transcriptExportNotice: String?
+    private let transcriptExportOwner = TranscriptExportOwner()
+    private var transcriptExportID: UUID?
 
     func exportTranscriptFiles() {
         guard let session = currentSession else {
-            appendBackendLog("Export failed: no active session.", toTail: true)
+            transcriptExportNotice = "Open a saved meeting to export its transcript."
             return
         }
+        presentTranscriptExport(sourceDirectory: session.folderURL, title: session.title)
+    }
 
+    private func presentTranscriptExport(sourceDirectory: URL, title: String) {
+        guard transcriptExportID == nil else {
+            transcriptExportNotice = "The original transcript export is still running. Its result will appear here."
+            return
+        }
+        if currentSession?.folderURL == sourceDirectory, isCapturing || isFinalizing {
+            transcriptExportNotice = "Stop and finish saving this meeting before exporting its transcript."
+            return
+        }
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "\(session.title)-transcript.txt"
+        panel.title = "Export transcript folder"
+        panel.nameFieldLabel = "Folder name:"
+        panel.nameFieldStringValue = "\(title)-transcript"
         panel.prompt = "Export"
-        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
+        panel.message = "Create a new folder containing transcript.txt and transcript.jsonl. Existing folders are never replaced."
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        beginTranscriptExport(sourceDirectory: sourceDirectory, destinationDirectory: destination)
+    }
 
-        if panel.runModal() == .OK, let url = panel.url {
-            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
-            let targetDir = url.deletingLastPathComponent()
-
-            let textString = transcriptModel.asPlainText()
-            let textData = textString.data(using: .utf8)
-            writeTranscriptData(
-                textData,
-                to: url,
-                encodeFailure: "Failed to encode exported transcript text.",
-                writeFailure: "Failed to export transcript text"
-            )
-
-            let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
-            let jsonlData = jsonlString.data(using: .utf8)
-            writeTranscriptData(
-                jsonlData,
-                to: jsonlURL,
-                encodeFailure: "Failed to encode exported transcript JSONL.",
-                writeFailure: "Failed to export transcript JSONL"
-            )
-
-            appendBackendLog("Transcript exported to \(targetDir.path).", toTail: true)
+    /// The selected URLs are immutable; late completion never reads a different
+    /// viewer's model. Every actual outcome is visible outside the backend log.
+    private func beginTranscriptExport(sourceDirectory: URL, destinationDirectory: URL) {
+        let id = UUID()
+        transcriptExportID = id
+        transcriptExportNotice = "Exporting the selected meeting's saved transcript…"
+        do {
+            let attempt = try transcriptExportOwner.start(sourceDirectory: sourceDirectory,
+                destinationDirectory: destinationDirectory, onCompletion: { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.transcriptExportID == id else { return }
+                        self.transcriptExportID = nil
+                        switch result {
+                        case .success(let receipt):
+                            self.transcriptExportNotice = "Exported transcript folder “\(receipt.directory.lastPathComponent)”."
+                        case .failure(let error): self.transcriptExportNotice = error.localizedDescription
+                        }
+                    }
+                })
+            Task { @MainActor [weak self] in
+                let outcome = await attempt.wait(timeoutSeconds: 5)
+                guard let self, self.transcriptExportID == id else { return }
+                switch outcome {
+                case .timedOut, .cancelled:
+                    self.transcriptExportNotice = "The transcript export is still pending. Its original operation remains active; the actual result will appear here."
+                case .completed: break // Only the original callback publishes once.
+                }
+            }
+        } catch {
+            transcriptExportID = nil
+            transcriptExportNotice = error.localizedDescription
         }
     }
 
@@ -3467,41 +3432,7 @@ final class AppModel: ObservableObject {
     }
 
     func exportTranscriptFiles(for meeting: MeetingHistoryItem) {
-        let panel = NSSavePanel()
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "\(meeting.title)-transcript.txt"
-        panel.prompt = "Export"
-        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
-
-        if panel.runModal() == .OK, let url = panel.url {
-            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
-
-            let transcriptURL = meeting.folderURL.appendingPathComponent("transcript.jsonl")
-            let jsonlData: Data?
-            if FileManager.default.fileExists(atPath: transcriptURL.path),
-               let diskData = try? Data(contentsOf: transcriptURL) {
-                jsonlData = diskData
-            } else {
-                let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
-                jsonlData = jsonlString.data(using: .utf8)
-            }
-            writeTranscriptData(
-                jsonlData,
-                to: jsonlURL,
-                encodeFailure: "Failed to encode exported transcript JSONL.",
-                writeFailure: "Failed to export transcript JSONL"
-            )
-
-            let textString = transcriptModel.asPlainText()
-            let textData = textString.data(using: .utf8)
-            writeTranscriptData(
-                textData,
-                to: url,
-                encodeFailure: "Failed to encode exported transcript text.",
-                writeFailure: "Failed to export transcript text"
-            )
-        }
+        presentTranscriptExport(sourceDirectory: meeting.folderURL, title: meeting.title)
     }
 
     @Published var transcriptLoadError: String?
