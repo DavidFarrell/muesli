@@ -34,6 +34,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AECMode.swift,
+				ArchiveReceipt.swift,
 				Attachment.swift,
 				AttachmentPersistence.swift,
 				AttachmentPreviewReader.swift,
