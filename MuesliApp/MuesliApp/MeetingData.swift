@@ -28,6 +28,7 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
     var timelineOffsetSeconds: Double? = nil
     var durationSeconds: Double? = nil
     var artifactsFolder: String? = nil
+    var artifactFinalization: MeetingArtifactFinalization? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -38,6 +39,46 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
         case timelineOffsetSeconds = "timeline_offset_seconds"
         case durationSeconds = "duration_seconds"
         case artifactsFolder = "artifacts_folder"
+        case artifactFinalization = "artifact_finalization"
+    }
+}
+
+/// A caller's observed finish outcome is retained even if the original SDK
+/// owner later updates its asset ledger after a deadline.
+nonisolated struct MeetingArtifactFinalization: Codable, Hashable, Sendable {
+    let outcome: String
+    let sourceSessionID: String
+    let pendingVideos: Int
+    let finishedVideos: Int
+    let committedScreenshots: Int
+    let error: String?
+    let mediaEndSeconds: Double?
+    let closed: Bool
+    var isComplete: Bool { outcome == "completed" && closed && pendingVideos == 0 && error == nil }
+
+    init(_ result: SessionArtifactFinishResult) {
+        switch result {
+        case .completed: outcome = "completed"
+        case .timedOut: outcome = "timed_out"
+        case .cancelled: outcome = "cancelled"
+        }
+        let status = result.status
+        sourceSessionID = status.sourceSessionID
+        pendingVideos = status.pendingVideos
+        finishedVideos = status.finishedVideos
+        committedScreenshots = status.committedScreenshots
+        error = status.error
+        mediaEndSeconds = status.mediaEndSeconds
+        closed = status.closed
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case outcome, error, closed
+        case sourceSessionID = "source_session_id"
+        case pendingVideos = "pending_videos"
+        case finishedVideos = "finished_videos"
+        case committedScreenshots = "committed_screenshots"
+        case mediaEndSeconds = "media_end_seconds"
     }
 }
 

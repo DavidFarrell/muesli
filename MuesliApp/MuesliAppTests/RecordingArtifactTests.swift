@@ -3,6 +3,19 @@ import ScreenCaptureKit
 
 @MainActor
 final class RecordingArtifactTests: XCTestCase {
+    func testPersistedDeadlineCannotBecomeSuccessfulWhenStatusClosesConcurrently() throws {
+        let status = SessionArtifactStatus(sourceSessionID: "source-a", pendingVideos: 0,
+            finishedVideos: 1, committedScreenshots: 3, error: nil, mediaEndSeconds: 42, closed: true)
+        let record = MeetingArtifactFinalization(.timedOut(status))
+        let saved = try JSONEncoder().encode(record)
+        let restored = try JSONDecoder().decode(MeetingArtifactFinalization.self, from: saved)
+        XCTAssertEqual(restored.sourceSessionID, "source-a")
+        XCTAssertEqual(restored.outcome, "timed_out")
+        XCTAssertFalse(restored.isComplete)
+        XCTAssertTrue(MeetingArtifactFinalization(.completed(status)).isComplete)
+        XCTAssertEqual(restored.mediaEndSeconds, 42)
+    }
+
     private func pair() -> (RecordingDelegate, SCRecordingOutput) {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
         let delegate = RecordingDelegate(url: url)

@@ -2636,6 +2636,7 @@ final class AppModel: ObservableObject {
         wasResume: Bool,
         priorMetadata: MeetingMetadata?
     ) async {
+        let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         screenshotScheduler.stop()
@@ -2658,6 +2659,7 @@ final class AppModel: ObservableObject {
         await micAudioForwarder.endMeeting()
         let hadSourceRecorder = sourceRecorder != nil
         let sourceResult = await sourceRecorder?.finish()
+        let artifactResult = await stoppingArtifacts?.finish(timeoutSeconds: 5)
         sourceRecorder = nil
         sourceTimeline = nil
         micStartTime = nil
@@ -2702,7 +2704,8 @@ final class AppModel: ObservableObject {
         if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
-            finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult, incomplete: true)
+            finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
+                                    artifactResult: artifactResult, incomplete: true)
         } else {
             rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
         }
@@ -2754,6 +2757,7 @@ final class AppModel: ObservableObject {
         guard isCapturing else { return }
 
         isFinalizing = true
+        let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         micEngineBoundDeviceID = 0
@@ -2783,6 +2787,7 @@ final class AppModel: ObservableObject {
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
         let sourceResult = await sourceRecorder?.finish()
+        let artifactResult = await stoppingArtifacts?.finish(timeoutSeconds: 5)
         sourceRecorder = nil
         sourceTimeline = nil
         micStartTime = nil
@@ -2868,6 +2873,7 @@ final class AppModel: ObservableObject {
                 timestampOffsetSnapshot: stoppingTimestampOffset,
                 writer: stoppingWriter,
                 sourceManifest: sourceResult,
+                artifactResult: artifactResult,
                 inferenceFailed: stoppingInferenceFailed
             )
         }
@@ -2886,6 +2892,7 @@ final class AppModel: ObservableObject {
         timestampOffsetSnapshot: Double,
         writer: FramedWriter? = nil,
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        artifactResult: SessionArtifactFinishResult? = nil,
         inferenceFailed: Bool = false
     ) async {
         defer {
@@ -2992,6 +2999,7 @@ final class AppModel: ObservableObject {
         )
         finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments,
                                 sourceManifest: sourceManifest,
+                                artifactResult: artifactResult,
                                 incomplete: inferenceFailed || exitStatus != 0 || !journalComplete || replay.error != nil)
         if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
            let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
@@ -3256,6 +3264,7 @@ final class AppModel: ObservableObject {
     /// native stop. Taking it closes screenshot admission immediately; pending
     /// SDK video callbacks continue to address this original session's ledger.
     private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        screenshotScheduler.stop()
         let store = sessionArtifactStore
         sessionArtifactStore = nil
         store?.stopScreenshots()
@@ -3268,10 +3277,14 @@ final class AppModel: ObservableObject {
         for session: MeetingSession,
         finalizedSegments: [TranscriptSegment],
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        artifactResult: SessionArtifactFinishResult? = nil,
         incomplete: Bool = false
     ) {
         do {
             var metadata = try readMeetingMetadata(from: session.folderURL)
+            let artifacts = artifactResult.map(MeetingArtifactFinalization.init)
+            let artifactsRequired = metadata.sessions.last?.artifactsFolder != nil
+            let artifactsIncomplete = artifactsRequired && artifacts?.isComplete != true
             let lastTimestamp = max(
                 metadata.lastTimestamp,
                 finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
@@ -3281,21 +3294,26 @@ final class AppModel: ObservableObject {
                 Double(manifest.timeline_offset_us) / 1_000_000
                 + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
             } ?? metadata.durationSeconds
-            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration)
+            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration,
+                                      artifacts?.mediaEndSeconds ?? 0)
 
             metadata.updatedAt = Date()
             metadata.durationSeconds = durationSeconds
             metadata.lastTimestamp = lastTimestamp
             metadata.segmentCount = segmentCount
-            metadata.status = incomplete || sourceManifest?.completed != true ? .degraded : .completed
+            metadata.status = incomplete || artifactsIncomplete || sourceManifest?.completed != true ? .degraded : .completed
             if let lastIndex = metadata.sessions.indices.last {
                 var lastSession = metadata.sessions[lastIndex]
+                lastSession.artifactFinalization = artifacts
                 if lastSession.endedAt == nil {
                     lastSession.endedAt = Date()
                 }
                 if let sourceManifest {
                     lastSession.timelineOffsetSeconds = Double(sourceManifest.timeline_offset_us) / 1_000_000
                     lastSession.durationSeconds = Double(sourceManifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
+                }
+                if let mediaEnd = artifacts?.mediaEndSeconds, let offset = lastSession.timelineOffsetSeconds {
+                    lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, mediaEnd - offset)
                 }
                 metadata.sessions[lastIndex] = lastSession
             }
