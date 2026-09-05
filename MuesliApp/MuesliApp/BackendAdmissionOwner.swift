@@ -139,13 +139,20 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         queue.async { [self] in
             var resources: Resources?
             var meetingLease: FileHandle?
+            var meetingAccess: MeetingFileAccess?
             do {
                 try attempt.checkAdmission()
-                if let meetingFolder { meetingLease = try BackendMeetingLease.acquire(in: meetingFolder, exclusive: false) }
+                if let meetingFolder {
+                    meetingAccess = try MeetingFileAccess.acquire(in: meetingFolder)
+                    meetingLease = try BackendMeetingLease.acquire(in: meetingFolder, exclusive: false)
+                }
                 try attempt.checkAdmission()
                 let value = try factory()
                 resources = value
                 attempt.installed(value)
+                if let meetingAccess, let meetingLease {
+                    try value.backend.installMeetingLease(access: meetingAccess, backendLease: meetingLease)
+                }
                 try attempt.checkAdmission()
                 try value.backend.start(checkAdmission: { try attempt.checkAdmission() })
                 attempt.offer()
@@ -155,9 +162,11 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
             // retains this admission until every original resource really closes.
             let ownedResources = resources
             let ownedMeetingLease = meetingLease
+            let ownedAccess = meetingAccess
             Task.detached { [self] in
                 if let ownedResources { await Self.maintain(ownedResources, attempt: attempt) }
                 try? ownedMeetingLease?.close()
+                withExtendedLifetime(ownedAccess) {}
                 lock.withLock { if active === attempt { active = nil } }
                 attempt.finished.markCompleted()
             }
