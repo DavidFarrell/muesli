@@ -1,7 +1,7 @@
 # Watchdog and stdout-wait slice
 
-5 September 2026. This implements only the independent starvation diagnostic
-and stdout-drain wait portions of F8. It does not establish bounded SCStream or
+5 September 2026. This implements the independent starvation diagnostic and a
+tested completion/deadline primitive for F8. It does not establish bounded SCStream or
 microphone teardown, lifecycle ownership, or truthful artifact finalization.
 
 The watchdog now owns its probe state on a serial queue. A monotonic clock
@@ -25,12 +25,16 @@ CompletionTrackedTask installs a completion signal in the original operation's
 defer. Each TaskCompletion wait registers only a continuation and timer; timeout,
 cancellation, and completion arbitrate under a lock and remove the registration.
 Repeated waits do not create observer tasks suspended on task.value. A timeout
-means only that the wait expired. AppModel requests stdout-task cancellation and
-logs that completion is unconfirmed; its consumer checks cancellation before
-processing a late buffered line, preserving the MainActor ordering with session
-file closure. This is not cancellation or termination of an arbitrary hardware
-operation. A caller resuming on a blocked executor can still be delayed by that
-executor even after the independent deadline has fired.
+means only that the wait expired. This is not cancellation or termination of an
+arbitrary hardware operation. A caller resuming on a blocked executor can still
+be delayed by that executor even after the independent deadline has fired.
+
+The AppModel stdout consumer and wait are deliberately unchanged in this slice
+following independent review. Expiring its wait without first moving authoritative
+event persistence out of that consumer could discard buffered events and still
+finalize the meeting as completed. Integrating the helper there belongs with the
+F7 durable-event changes and truthful finalization; the pre-existing task-group
+timeout remains a known F8 defect until that integration lands.
 
 Verification:
 
@@ -50,7 +54,8 @@ Verification:
   treated as errors. Existing unrelated app isolation warnings remain.
 - Test output: `/private/tmp/muesli-watchdog-tests-runtime.log` and
   `/private/tmp/muesli-watchdog-tests-runtime.xcresult`. Release output:
-  `/private/tmp/muesli-watchdog-release-verified.log`. Xcode is selected through
+  `/private/tmp/muesli-watchdog-release-revised.log` (after deferring stdout
+  integration). Xcode is selected through
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`; derived data and
   module caches remain under `/private/tmp`.
 

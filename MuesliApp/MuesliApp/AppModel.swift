@@ -278,7 +278,7 @@ final class AppModel: ObservableObject {
     private var transcriptEventsURL: URL?
     private var currentTranscriptEventsStartOffset: UInt64 = 0
     private var backendAccessURL: URL?
-    private var stdoutTask: CompletionTrackedTask?
+    private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let aecModeKey = "aecMode"
     private let inputSelectionModeKey = "inputSelectionMode"
@@ -2409,12 +2409,8 @@ final class AppModel: ObservableObject {
                 try backend.start()
                 self.backend = backend
                 stdoutTask?.cancel()
-                stdoutTask = CompletionTrackedTask { @MainActor in
+                stdoutTask = Task { @MainActor in
                     for await line in backend.stdoutLines {
-                        // A bounded drain may request cancellation and close
-                        // this session's files before a pending next() resumes.
-                        // Never process a late buffered line after that point.
-                        guard !Task.isCancelled else { break }
                         let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
                         self.handleBackendJSONLine(
                             line,
@@ -2817,7 +2813,7 @@ final class AppModel: ObservableObject {
     private func finalizeStoppedMeeting(
         session: MeetingSession,
         backend: BackendProcess?,
-        stdoutTask: CompletionTrackedTask?,
+        stdoutTask: Task<Void, Never>?,
         backendLogHandle: FileHandle?,
         transcriptEventsHandle: FileHandle?,
         backendAccessURL: URL?,
@@ -2899,7 +2895,7 @@ final class AppModel: ObservableObject {
             )
         }
         backend?.cleanup()
-        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0, logHandle: backendLogHandle)
+        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
         synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
         backendLogWriter.synchronize(label: "backend log")
 
@@ -2968,16 +2964,27 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    private func waitForStdoutDrain(task: CompletionTrackedTask?, timeoutSeconds: Double, logHandle: FileHandle?) async {
+    private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {
         guard let task else { return }
-        let outcome = await task.wait(timeoutSeconds: timeoutSeconds)
-        if outcome != .completed {
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await task.value
+                return true
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                } catch {
+                    return false
+                }
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+        if !finished {
             task.cancel()
-            appendBackendLog(
-                "Stdout drain \(outcome == .timedOut ? "timed out" : "wait cancelled"); cancellation requested, completion unconfirmed.",
-                toTail: false,
-                handle: logHandle
-            )
         }
     }
 
