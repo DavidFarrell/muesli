@@ -52,10 +52,13 @@ final class MeetingMetadataEdits {
     private var retired: Set<URL> = []
     private var transferredNameIDs: [URL: Set<UUID>] = [:]
     private var superseded: Set<UUID> = []
+    private let shutdown: ShutdownWorkRegistry
+    private var quitChains: [URL: ShutdownWorkRegistry.Token] = [:]
     init(store: TranscriptPersistenceStore = .shared, timeoutSeconds: Double = 5,
+         shutdown: ShutdownWorkRegistry = .shared,
          deliver: @escaping Delivery = { publication in Task { @MainActor in publication() } },
          onEvent: @escaping @MainActor (Event) -> Void) {
-        self.store = store; self.timeoutSeconds = timeoutSeconds; self.onEvent = onEvent
+        self.store = store; self.timeoutSeconds = timeoutSeconds; self.onEvent = onEvent; self.shutdown = shutdown
         self.deliver = deliver
     }
     func isPending(in folder: URL) -> Bool { active[folder] != nil || retired.contains(folder) }
@@ -93,6 +96,7 @@ final class MeetingMetadataEdits {
 
     func submitNames(_ names: [String: String], in folder: URL, contentGeneration: UInt64, expectedNames: [String: String]? = nil) {
         guard !names.isEmpty else { return }
+        guard shutdown.acceptsUserWork else { return }
         guard !retired.contains(folder) else {
             onEvent(.failed(folder, "This meeting is finishing its saved transcript. Wait for that save before editing speakers.", UUID()))
             return
@@ -115,6 +119,7 @@ final class MeetingMetadataEdits {
     }
 
     func rename(in folder: URL, to title: String) async throws -> String {
+        guard shutdown.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         guard active[folder] == nil, !retired.contains(folder) else { throw TranscriptPersistenceStore.Failure.busy }
         let operation = try start(in: folder, patch: .init(title: title))
         return try await operation.value(timeoutSeconds: timeoutSeconds).title
@@ -123,11 +128,13 @@ final class MeetingMetadataEdits {
     @discardableResult
     private func start(in folder: URL, patch: MeetingMetadataMutation.Patch) throws -> TranscriptPersistenceStore.Operation<MeetingMetadata> {
         let id = UUID()
+        let chain = try quitChains[folder] ?? shutdown.begin("Saving accepted title and speaker edits")
         let operation = try MeetingMetadataMutation.start(in: folder, patch: patch, store: store) { [weak self, deliver] result in
             guard let self else { return }
             deliver { self.finish(id: id, folder: folder, result: result) }
         }
         active[folder] = Active(id: id, patch: patch, operation: operation)
+        quitChains[folder] = chain
         Task { @MainActor [weak self, deliver] in
             let outcome = await operation.wait(timeoutSeconds: self?.timeoutSeconds ?? 5)
             guard let self else { return }
@@ -148,6 +155,11 @@ final class MeetingMetadataEdits {
     private func finish(id: UUID, folder: URL,
                         result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>) {
         guard let current = active[folder], current.id == id else { return }
+        defer {
+            // Includes accepted coalesced intent and the publication gap before
+            // its successor is admitted, not just the previous disk operation.
+            if active[folder] == nil && desiredNames[folder] == nil { quitChains.removeValue(forKey: folder)?.finish() }
+        }
         active.removeValue(forKey: folder) // Retire before any late timeout UI task.
         if superseded.remove(id) == nil {
             switch result {

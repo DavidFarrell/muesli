@@ -48,6 +48,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "muesli.session-artifacts", qos: .utility)
     private let lock = NSLock()
     private let completion = TaskCompletion()
+    private let quitWork: ShutdownWorkRegistry.Token
     private let pngWriter: PNGWriter
     private var ledger: FileHandle?
     private var ownerLease: FileHandle?
@@ -74,7 +75,9 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
 
     /// Creates a fresh directory; call away from the UI executor.
     init(meetingDirectory: URL, sourceSessionID: String, timeline: CaptureTimeline,
-         timelineOffsetUs: Int64, meetingAccess: MeetingFileAccess? = nil, pngWriter: @escaping PNGWriter = SessionArtifactStore.writePNG) throws {
+         timelineOffsetUs: Int64, meetingAccess: MeetingFileAccess? = nil, shutdown: ShutdownWorkRegistry = .shared,
+         pngWriter: @escaping PNGWriter = SessionArtifactStore.writePNG) throws {
+        quitWork = try shutdown.begin("Finishing video and screenshots")
         guard UUID(uuidString: sourceSessionID) != nil, timelineOffsetUs >= 0 else {
             throw Self.error("Invalid artifact session identity or offset")
         }
@@ -296,6 +299,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         do { try ownerLease?.close(); ownerLease = nil }
         catch { recordError(error) } // Retain a failed close's handle through deinit.
         meetingAccess = nil
+        quitWork.finish(failure: ledgerFailed || !closed ? "The final artifact ledger could not be saved or closed." : nil)
         completion.markCompleted()
     }
 

@@ -133,11 +133,20 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
     private let queue = DispatchQueue(label: "muesli.backend-admission", qos: .utility)
     private let lock = NSLock()
     private var active: Attempt?
+    private let shutdown: ShutdownWorkRegistry
+    private let cancelClaimedOnQuit: Bool
+    init(shutdown: ShutdownWorkRegistry = .shared, cancelClaimedOnQuit: Bool = false) {
+        self.shutdown = shutdown; self.cancelClaimedOnQuit = cancelClaimedOnQuit
+    }
     var isBusy: Bool { lock.withLock { active != nil } }
 
     func start(protecting meetingFolder: URL? = nil, timeoutSeconds: Double = 8, factory: @escaping @Sendable () throws -> Resources) throws -> Attempt {
         precondition(timeoutSeconds.isFinite && timeoutSeconds >= 0)
         let attempt = Attempt(timeoutSeconds: timeoutSeconds)
+        let cancelClaimed = cancelClaimedOnQuit
+        let quitWork = try shutdown.begin("Closing transcription process and journal", onQuit: { [weak attempt] in
+            attempt?.abandon(onlyUnclaimed: !cancelClaimed)
+        })
         try lock.withLock {
             guard active == nil else { throw Failure.busy }
             active = attempt
@@ -178,6 +187,7 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
                 withExtendedLifetime(ownedAccess) {}
                 ownedAccess = nil
                 lock.withLock { if active === attempt { active = nil } }
+                quitWork.finish()
                 attempt.finished.markCompleted()
             }
         }

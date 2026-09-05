@@ -26,14 +26,18 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
     }
     private let lock = NSLock()
     private var active: Operation?
+    private let shutdown: ShutdownWorkRegistry
+    init(shutdown: ShutdownWorkRegistry = .shared) { self.shutdown = shutdown }
     var isBusy: Bool { lock.withLock { active != nil } }
 
     @concurrent
     func perform(timeoutSeconds: Double = 8,
+                 preservesRecording: Bool = false,
                  onFailure: @escaping @Sendable (Error) -> Void = { _ in },
                  operation: @escaping @Sendable () async throws -> Void,
                  cleanupIfAbandoned: @escaping @Sendable () async -> Void = {}) async throws {
         let state = Operation()
+        let quitWork = preservesRecording ? try shutdown.begin("Waiting for native recording cleanup") : nil
         guard lock.withLock({ if active != nil { return false }; active = state; return true }) else {
             onFailure(Failure.busy)
             throw Failure.busy
@@ -54,6 +58,7 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
                 await cleanupIfAbandoned()
                 lock.withLock { if active === state { active = nil } }
             }
+            quitWork?.finish()
             state.completion.markCompleted()
         }
         let wait = await state.completion.wait(timeoutSeconds: timeoutSeconds)

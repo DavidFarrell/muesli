@@ -132,6 +132,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var omittedPowerEvents: Int64 = 0
     private var closedManifest: Manifest?
     private let closeCompletion = TaskCompletion()
+    private let quitWork: ShutdownWorkRegistry.Token
 
     // Queue-owned fields.
     private var handles: [Source: FileHandle] = [:]
@@ -148,7 +149,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
          maxPendingBytes: Int = 2 * 1024 * 1024,
          maximumDurationSeconds: Int64 = 24 * 60 * 60,
          commitInterval: TimeInterval = 0.5,
+         shutdown: ShutdownWorkRegistry = .shared,
          beforeIO: (@Sendable (Checkpoint) throws -> Void)? = nil) throws {
+        quitWork = try shutdown.begin("Finishing audio recording")
         self.directory = directory
         self.maxPendingBytes = max(2, maxPendingBytes)
         maximumDurationUs = max(1, min(maximumDurationSeconds, 24 * 60 * 60)) * 1_000_000
@@ -519,6 +522,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         try? sourceLease?.close()
         sourceLease = nil
         meetingAccess = nil
+        quitWork.finish(failure: dirty ? "The final source recording could not be saved." : nil)
         closeCompletion.markCompleted()
     }
 

@@ -33,6 +33,8 @@
 		AA000001000000000000000B /* Exceptions for "MuesliApp" folder in "MuesliAppTests" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+                ShutdownWorkRegistry.swift,
+                ApplicationQuitCoordinator.swift,
 				AECMode.swift,
 				ArchiveReceipt.swift,
 				ArchiveProcessingEvidence.swift,

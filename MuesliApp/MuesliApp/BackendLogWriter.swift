@@ -23,16 +23,27 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     private var ringBuffer: [String] = []
     private let ringBufferLimit: Int
     private let beforeWrite: @Sendable () -> Void
+    private let shutdown: ShutdownWorkRegistry
+    private var quitWork: ShutdownWorkRegistry.Token?
+    private var saveFailure: String?
 
-    init(ringBufferLimit: Int, beforeWrite: @escaping @Sendable () -> Void = {}) {
+    init(ringBufferLimit: Int, shutdown: ShutdownWorkRegistry = .shared, beforeWrite: @escaping @Sendable () -> Void = {}) {
         self.beforeWrite = beforeWrite
         self.ringBufferLimit = ringBufferLimit
+        self.shutdown = shutdown
     }
 
     /// Adopt a freshly-opened log file and clear the tail (new meeting).
     func reset(handle: FileHandle?, access: MeetingFileAccess? = nil) {
+        let work: ShutdownWorkRegistry.Token?
+        do { work = handle == nil ? nil : try shutdown.begin("Closing the meeting log") }
+        catch { return } // Admission is sealed; no new queued file writes.
         queue.async { [self] in
-            if self.handle !== handle { try? self.handle?.close() }
+            if self.handle !== handle {
+                do { try self.handle?.close() } catch { saveFailure = error.localizedDescription }
+            }
+            quitWork?.finish(failure: saveFailure)
+            quitWork = work; saveFailure = nil
             self.handle = handle
             meetingAccess = access
             ringBuffer.removeAll()
@@ -57,6 +68,7 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
             do {
                 try target.write(contentsOf: data)
             } catch {
+                saveFailure = error.localizedDescription
                 if toTail {
                     appendTailOnQueue("[backend.log write failed] \(error.localizedDescription)")
                 }
@@ -81,6 +93,7 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
             do {
                 try handle.synchronize()
             } catch {
+                saveFailure = error.localizedDescription
                 appendTailOnQueue("Failed to flush \(label): \(error.localizedDescription)")
             }
         }
@@ -94,10 +107,12 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     func close(handle target: FileHandle? = nil, onClosed: @escaping @Sendable () -> Void = {}) {
         queue.async { [self] in
             let closing = target ?? handle
-            try? closing?.close()
+            do { try closing?.close() } catch { saveFailure = error.localizedDescription }
             if target == nil || handle === target {
                 handle = nil
                 meetingAccess = nil
+                quitWork?.finish(failure: saveFailure)
+                quitWork = nil; saveFailure = nil
             }
             onClosed()
         }

@@ -191,7 +191,7 @@ actor BatchRediarizer {
     }
 
     private let timeoutSeconds: Double
-    private let admission = BackendAdmissionOwner()
+    private let admission = BackendAdmissionOwner(cancelClaimedOnQuit: true)
     init(timeoutSeconds: Double = 60 * 60) { self.timeoutSeconds = timeoutSeconds }
 
     func run(
@@ -249,6 +249,7 @@ actor BatchRediarizer {
 
     private func execute(protecting folder: URL, evidenceByteLimit: Int?, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
                          factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         if let evidenceByteLimit, !(1...64 * 1024 * 1024).contains(evidenceByteLimit) {
             throw Self.failure(4, "Invalid processing evidence budget.")
         }

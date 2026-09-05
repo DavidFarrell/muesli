@@ -64,6 +64,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
         private var claimed = false
         private var prepared: Prepared?
         private var failure: String?
+        var quitWork: ShutdownWorkRegistry.Token?
 
         func check() throws { if lock.withLock({ abandoned }) { throw Abandoned() } }
         func publish(_ value: Prepared) -> Bool {
@@ -112,14 +113,16 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
     private let store: TranscriptPersistenceStore
     private let checkpoint: @Sendable (Step) throws -> Void
     private let createRecorder: @Sendable (URL, String, Int64) throws -> LocalAudioRecorder
+    private let shutdown: ShutdownWorkRegistry
 
-    init(store: TranscriptPersistenceStore = .shared,
-         createRecorder: @escaping @Sendable (URL, String, Int64) throws -> LocalAudioRecorder = {
-             try LocalAudioRecorder(directory: $0, sessionID: $1, timelineOffsetUs: $2)
-         },
+    init(store: TranscriptPersistenceStore = .shared, shutdown: ShutdownWorkRegistry = .shared,
+         createRecorder: (@Sendable (URL, String, Int64) throws -> LocalAudioRecorder)? = nil,
          checkpoint: @escaping @Sendable (Step) throws -> Void = { _ in }) {
         self.store = store
-        self.createRecorder = createRecorder
+        self.shutdown = shutdown
+        self.createRecorder = createRecorder ?? {
+            try LocalAudioRecorder(directory: $0, sessionID: $1, timelineOffsetUs: $2, shutdown: shutdown)
+        }
         self.checkpoint = checkpoint
     }
     var isBusy: Bool { lock.withLock { active != nil } }
@@ -127,6 +130,8 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
     @concurrent func prepare(_ request: Request, timeoutSeconds: Double = 8) async -> Outcome {
         guard !Task.isCancelled else { return .cancelled }
         let attempt = Attempt()
+        do { attempt.quitWork = try shutdown.begin("Preparing or closing a new meeting", onQuit: { [weak attempt] in attempt?.abandon() }) }
+        catch { return .failed(error.localizedDescription) }
         let admitted = lock.withLock {
             guard active == nil else { return false }
             active = attempt
@@ -156,8 +161,50 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
         }
     }
 
+    /// The async preparation result may have been claimed just before Quit
+    /// reached MainActor. Retain a new cleanup owner before its Start bridge
+    /// releases; never close these handles on the UI executor.
+    func discardUnadopted(_ prepared: Prepared) {
+        guard let work = try? shutdown.begin("Closing an unstarted meeting") else { return }
+        queue.async { [self] in
+            let sourceClosed = DispatchSemaphore(value: 0)
+            prepared.recorder.observeClosed { sourceClosed.signal() }
+            prepared.recorder.requestFinish()
+            sourceClosed.wait()
+            if let artifacts = prepared.artifacts {
+                let closed = DispatchSemaphore(value: 0)
+                artifacts.observeClosed { closed.signal() }
+                artifacts.requestFinish()
+                closed.wait()
+            }
+            do { try prepared.logHandle.close() }
+            catch { work.finish(failure: error.localizedDescription); return }
+            do {
+                _ = try store.startAfterCurrent(in: prepared.folderURL, onCompletion: { result in
+                    if case .failure(let error) = result { work.finish(failure: error.localizedDescription) }
+                    else { work.finish() }
+                }) { context in
+                    var metadata = try context.readMetadata()
+                    guard let index = metadata.sessions.firstIndex(where: { $0.sourceSessionID == prepared.sourceID }) else {
+                        throw TranscriptPersistenceStore.Failure.invalidFiles
+                    }
+                    metadata.status = .interrupted
+                    metadata.updatedAt = Date()
+                    metadata.sessions[index].endedAt = prepared.startedAt
+                    metadata.sessions[index].durationSeconds = 0
+                    metadata.sessions[index].finalizationStatus = "interrupted"
+                    metadata.sessions[index].artifactsFolder = nil
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    try context.commit(files: ["meeting.json": encoder.encode(metadata)])
+                }
+            } catch { work.finish(failure: error.localizedDescription) }
+        }
+    }
+
     private func release(_ attempt: Attempt) {
         lock.withLock { if active === attempt { active = nil } }
+        attempt.quitWork?.finish()
     }
 
     /// Everything in this closure, including cleanup, belongs to the same
@@ -215,7 +262,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
             let timeline = CaptureTimeline()
             if request.video {
                 artifacts = try SessionArtifactStore(meetingDirectory: folder, sourceSessionID: sourceID,
-                    timeline: timeline, timelineOffsetUs: Int64(offset * 1_000_000), meetingAccess: context.access)
+                    timeline: timeline, timelineOffsetUs: Int64(offset * 1_000_000), meetingAccess: context.access, shutdown: shutdown)
                 updated.sessions[updated.sessions.count - 1].artifactsFolder = artifacts?.relativeDirectory
                 metadata = updated
                 try commit(updated, context: context)

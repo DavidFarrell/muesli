@@ -759,8 +759,24 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    private var quitStartIntent = UUID()
+
+    func prepareForApplicationQuit() async {
+        quitStartIntent = UUID()
+        meetingCatalog.invalidate()
+        backendAdmission.retireAdmission()
+        pendingMicOperation = nil
+        captureEngine.retireCaptureIntent()
+        if isCapturing, !isFinalizing { await stopMeeting() }
+        await stopHomeLevelPreview()
+    }
+
+    func applicationQuitCancelled() {
+        if wantsHomeLevelPreview { Task { await self.startHomeLevelPreview() } }
+    }
+
     private var wantsHomeLevelPreview: Bool {
-        CapturePreviewPolicy.wantsPreview(isCapturing: isCapturing, isStarting: isStartingMeeting,
+        ShutdownWorkRegistry.shared.acceptsUserWork && CapturePreviewPolicy.wantsPreview(isCapturing: isCapturing, isStarting: isStartingMeeting,
                                          isFinalizing: isFinalizing, isStartScreenActive: isStartScreenActive,
                                          onboarding: shouldShowOnboarding)
     }
@@ -827,7 +843,7 @@ final class AppModel: ObservableObject {
             self?.invalidateMicrophone(generation: generation, preview: preview)
         }
         let changed = invalidation.callback()
-        try await micOperationOwner.perform(onFailure: { error in
+        try await micOperationOwner.perform(preservesRecording: !preview, onFailure: { error in
             problem(.unknown(generation: generation, message: "Microphone start failed: \(error.localizedDescription)"))
         }, operation: {
             defer { withExtendedLifetime(access) {} }
@@ -848,7 +864,7 @@ final class AppModel: ObservableObject {
         let generation = preview ? previewMicGeneration : micEngineGeneration
         let problem = ingress?.problemCallback()
         do {
-            try await micOperationOwner.perform(onFailure: { error in
+            try await micOperationOwner.perform(preservesRecording: !preview, onFailure: { error in
                 problem?(.unknown(generation: generation, message: "Microphone stop failed: \(error.localizedDescription)"))
             }) {
                 defer { withExtendedLifetime(access) {} }
@@ -1037,6 +1053,7 @@ final class AppModel: ObservableObject {
     }
 
     private func startHomeLevelPreviewNow() async {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { await stopHomeLevelPreviewNow(); return }
         startMicFramesWatchdog()
         guard !isCapturing else { return }
         guard !isStartingMeeting else { return }
@@ -1456,6 +1473,7 @@ final class AppModel: ObservableObject {
     /// Stop-then-start the meeting mic engine. MUST run on the mic lifecycle
     /// serializer (via `enqueueMicLifecycle`) - never spawn it in a bare Task.
     private func restartMeetingMicEngineForInputSwitch() async {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard isCapturing else { return }
         guard transcribeMic else { return }
         // A stop in progress poisons any queued/in-flight restart - the
@@ -1784,6 +1802,7 @@ final class AppModel: ObservableObject {
     private var transcriptExportID: UUID?
 
     func exportTranscriptFiles() {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard let session = currentSession else {
             transcriptExportNotice = "Open a saved meeting to export its transcript."
             return
@@ -1792,6 +1811,7 @@ final class AppModel: ObservableObject {
     }
 
     private func presentTranscriptExport(sourceDirectory: URL, title: String) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard transcriptExportID == nil else {
             transcriptExportNotice = "The original transcript export is still running. Its result will appear here."
             return
@@ -1814,6 +1834,7 @@ final class AppModel: ObservableObject {
     /// The selected URLs are immutable; late completion never reads a different
     /// viewer's model. Every actual outcome is visible outside the backend log.
     private func beginTranscriptExport(sourceDirectory: URL, destinationDirectory: URL) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         let id = UUID()
         transcriptExportID = id
         transcriptExportNotice = "Exporting the selected meeting's saved transcript…"
@@ -2078,6 +2099,10 @@ final class AppModel: ObservableObject {
     }
 
     private func startMeeting(resuming meeting: MeetingHistoryItem?) async {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork,
+              let startWork = try? ShutdownWorkRegistry.shared.begin("Starting or retiring a meeting") else { return }
+        defer { startWork.finish() }
+        let startIntent = quitStartIntent
         meetingCatalog.invalidate()
         guard !isStartingMeeting else { return }
         guard !meetingStartPreparation.isBusy else {
@@ -2102,6 +2127,7 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
+        guard startIntent == quitStartIntent, ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         refreshPermissions()
         loadInputDevices()
         backendFolderError = nil
@@ -2183,6 +2209,10 @@ final class AppModel: ObservableObject {
             return
         case .busy:
             shareableContentError = "The previous meeting preparation is still closing its files."
+            return
+        }
+        guard startIntent == quitStartIntent, ShutdownWorkRegistry.shared.acceptsUserWork else {
+            meetingStartPreparation.discardUnadopted(prepared)
             return
         }
         let title = prepared.title
@@ -2394,7 +2424,7 @@ final class AppModel: ObservableObject {
             }
         }
         let outcome = await attempt.waitUntilReady()
-        guard isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork, isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
             attempt.cancel()
             throw CancellationError()
         }
@@ -2530,7 +2560,9 @@ final class AppModel: ObservableObject {
     }
 
     func stopMeeting() async {
-        guard isCapturing, !isFinalizing else { return }
+        guard isCapturing, !isFinalizing,
+              let stopWork = try? ShutdownWorkRegistry.shared.begin("Stopping accepted recording") else { return }
+        defer { stopWork.finish() }
         retirePowerBinding()
         let stoppingAccess = currentMeetingAccess
 
@@ -2638,8 +2670,9 @@ final class AppModel: ObservableObject {
             return
         }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        let finalizationWork = try? ShutdownWorkRegistry.shared.begin("Saving the final transcript and session")
+        Task { @MainActor [self] in
+            defer { finalizationWork?.finish() }
             await self.finalizeStoppedMeeting(
                 session: stoppingSession,
                 backend: stoppingBackend,
@@ -2799,6 +2832,7 @@ final class AppModel: ObservableObject {
             // its older title/count/status snapshot back into history.
             loadMeetingHistory()
         case .failure(let error):
+            ShutdownWorkRegistry.shared.recordFailure("The final meeting save failed: \(error.localizedDescription)")
             metadataEdits.completeRetirement(in: folder, successorSucceeded: false)
             meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
@@ -2988,6 +3022,7 @@ final class AppModel: ObservableObject {
     }
 
     func renameSpeaker(id: String, to name: String) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         let folder: URL?
         if let session = currentSession { folder = session.folderURL }
         else if case .viewing(let item) = activeScreen { folder = item.folderURL }
@@ -3060,6 +3095,7 @@ final class AppModel: ObservableObject {
     }
 
     private func saveAttachment(type: AttachmentType, data: @escaping @Sendable () throws -> Data) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard isCapturing, !isFinalizing, let timeline = sourceTimeline,
               let sourceID = diagnosticSourceID, let session = currentSession else { return }
         let timestamp = transcriptModel.timestampOffset
@@ -3071,6 +3107,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteAttachment(_ attachment: Attachment) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard isCapturing, !isFinalizing, let session = currentSession,
               let sourceID = diagnosticSourceID else { return }
         performAttachmentEdit(folder: session.folderURL, sourceID: sourceID) { context in
@@ -3181,6 +3218,7 @@ final class AppModel: ObservableObject {
     }
 
     func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL else {
             throw TranscriptPersistenceStore.Failure.superseded
         }
@@ -3206,6 +3244,7 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func renameMeeting(folderURL: URL, to newTitle: String) async throws -> String {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         try transcriptModel.assertNoPendingReplacement(in: folderURL)
         meetingCatalog.invalidate()
         return try await metadataEdits.rename(in: folderURL, to: newTitle)
@@ -3230,6 +3269,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteMeeting(_ item: MeetingHistoryItem) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         let folder = item.folderURL
         guard !isFinalizing, currentSession?.folderURL != folder,
               !metadataEdits.isPending(in: folder), pendingDeletes[folder.path] == nil else {
@@ -3293,6 +3333,7 @@ final class AppModel: ObservableObject {
     }
 
     func exportTranscriptFiles(for meeting: MeetingHistoryItem) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         presentTranscriptExport(sourceDirectory: meeting.folderURL, title: meeting.title)
     }
 

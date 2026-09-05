@@ -60,9 +60,13 @@ nonisolated private final class NativeSystemCapture: @unchecked Sendable {
     let relay: SystemAudioCaptureRelay
     private let lock = NSLock()
     private var retired = false
+    private let quitWork: ShutdownWorkRegistry.Token?
+    let preservesRecording: Bool
     private var meetingAccess: MeetingFileAccess?
     var isRetired: Bool { lock.withLock { retired } }
-    init(stream: SCStream, relay: SystemAudioCaptureRelay, meetingAccess: MeetingFileAccess?) {
+    init(stream: SCStream, relay: SystemAudioCaptureRelay, meetingAccess: MeetingFileAccess?, preservesRecording: Bool) throws {
+        self.preservesRecording = preservesRecording
+        quitWork = preservesRecording ? try ShutdownWorkRegistry.shared.begin("Retiring native system recording") : nil
         self.stream = stream; self.relay = relay; self.meetingAccess = meetingAccess
     }
     func start() async throws {
@@ -89,7 +93,7 @@ nonisolated private final class NativeSystemCapture: @unchecked Sendable {
         try? stream.removeStreamOutput(relay, type: .audio)
         try? stream.removeStreamOutput(relay, type: .screen)
         await relay.finish()
-        lock.withLock { retired = true }
+        lock.withLock { retired = true; quitWork?.finish() }
         meetingAccess = nil
     }
 }
@@ -207,7 +211,7 @@ final class CaptureEngine: NSObject {
         let stream = SCStream(filter: contentFilter, configuration: config, delegate: relay)
         self.stream = stream
         var attemptedRecordingDelegate: RecordingDelegate?
-        let native = NativeSystemCapture(stream: stream, relay: relay, meetingAccess: meetingAccess)
+        let native = try NativeSystemCapture(stream: stream, relay: relay, meetingAccess: meetingAccess, preservesRecording: writer != nil || url != nil)
         nativeSource = native
         do {
             try stream.addStreamOutput(relay, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
@@ -229,7 +233,7 @@ final class CaptureEngine: NSObject {
                 try stream.addRecordingOutput(output)
                 recordingOutput = output
             }
-            try await operationOwner.perform(onFailure: { error in
+            try await operationOwner.perform(preservesRecording: native.preservesRecording, onFailure: { error in
                 reportProblem(.unknown(generation: currentGeneration, message: "System audio start failed: \(error.localizedDescription)"))
             }, operation: { try await native.start() }, cleanupIfAbandoned: { try? await native.stop() })
             guard desiredIntent.matches(intent) else { throw CaptureOperationOwner.Failure.cancelled }
@@ -238,7 +242,7 @@ final class CaptureEngine: NSObject {
                 // A public Stop superseded this start. The same native owner
                 // must finish cleanup; an old continuation cannot restore intent.
                 if !native.isRetired, !operationOwner.isBusy {
-                    try? await operationOwner.perform { try await native.stop() }
+                    try? await operationOwner.perform(preservesRecording: native.preservesRecording) { try await native.stop() }
                 }
                 if nativeSource === native {
                     if native.isRetired { clearRetiredSource(); if request == nil { health.reset() } }
@@ -254,7 +258,7 @@ final class CaptureEngine: NSObject {
                 retirementPending = true
                 health.fail(error.localizedDescription, quarantined: true)
             } else {
-                do { try await operationOwner.perform { try await native.stop() } }
+                do { try await operationOwner.perform(preservesRecording: native.preservesRecording) { try await native.stop() } }
                 catch { retirementPending = true }
                 if !retirementPending { clearRetiredSource() }
                 health.fail(error.localizedDescription, quarantined: retirementPending)
@@ -283,7 +287,7 @@ final class CaptureEngine: NSObject {
             return false
         }
         do {
-            try await operationOwner.perform(onFailure: { error in
+            try await operationOwner.perform(preservesRecording: native.preservesRecording, onFailure: { error in
                 writer?.reportFailure(stream: .system, message: "System audio stop failed: \(error.localizedDescription)")
             }) { try await native.stop() }
             clearRetiredSource()

@@ -103,9 +103,11 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     private static let registry = Registry()
     private static let allowed = Set(["transcript.txt", "transcript.jsonl", "meeting.json", "transcript_sources.json", "attachments.json"])
     private let fault: @Sendable (Step) throws -> Void
+    private let shutdown: ShutdownWorkRegistry
 
-    init(fault: @escaping @Sendable (Step) throws -> Void = { _ in }) {
+    init(shutdown: ShutdownWorkRegistry = .shared, fault: @escaping @Sendable (Step) throws -> Void = { _ in }) {
         self.fault = fault
+        self.shutdown = shutdown
     }
 
     enum WaitResult<Output: Sendable>: Sendable {
@@ -161,13 +163,16 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
         let folder: URL
         let access: MeetingFileAccess
         private let transaction: MeetingFileAccess.Transaction
-        fileprivate init(store: TranscriptPersistenceStore, folder: URL, transaction: MeetingFileAccess.Transaction) {
+        private let permitsWrites: Bool
+        fileprivate init(store: TranscriptPersistenceStore, folder: URL, transaction: MeetingFileAccess.Transaction, permitsWrites: Bool) {
             self.store = store
             self.folder = folder
             self.transaction = transaction
             access = transaction.access
+            self.permitsWrites = permitsWrites
         }
         func commit(files: [String: Data]) throws {
+            guard permitsWrites else { throw Failure.invalidFiles }
             try access.validate()
             try store.commitOwned(files: files, in: folder)
         }
@@ -186,10 +191,11 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     /// Reserve immediately; all recovery, reads, preparation, and mutation run
     /// on the independently scheduled owner. A timed-out/cancelled waiter never
     /// releases this reservation or starts a replacement worker.
-    func start<Output: Sendable>(in folder: URL,
+    enum Purpose: Sendable { case saveOrRecovery, previewRead }
+    func start<Output: Sendable>(in folder: URL, purpose: Purpose = .saveOrRecovery,
                                 onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void = { _ in },
                                 operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
-        try admit(in: folder, afterCurrent: false, onCompletion: onCompletion, operation: operation)
+        try admit(in: folder, afterCurrent: false, purpose: purpose, onCompletion: onCompletion, operation: operation)
     }
 
     /// Stop must not discard its final save merely because an earlier metadata
@@ -209,18 +215,21 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     }
 
     private func admit<Output: Sendable>(in folder: URL, afterCurrent: Bool, mode: MeetingFileAccess.Mode = .shared,
+                                purpose: Purpose = .saveOrRecovery,
                                 onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void,
                                 operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
         let id = UUID()
         let owner = Operation<Output>()
+        let quitWork = purpose == .saveOrRecovery ? try shutdown.begin("Saving or recovering meeting files") : nil
         let work: @Sendable (LeaseHandoff?) -> Void = { [self] inherited in
             var lease = inherited?.take()
             let result: Result<Output, Failure>
             do {
                 if lease == nil { lease = try MeetingFileAccess.acquire(in: folder, mode: mode).transaction() }
                 try lease!.access.validate()
-                try recoverOwned(in: folder)
-                result = .success(try operation(Context(store: self, folder: folder, transaction: lease!)))
+                if purpose == .previewRead { try Self.refuseRecoveryForPreview(in: folder) }
+                else { try recoverOwned(in: folder) }
+                result = .success(try operation(Context(store: self, folder: folder, transaction: lease!, permitsWrites: purpose != .previewRead)))
             } catch let error as Failure {
                 result = .failure(error)
             } catch {
@@ -231,11 +240,26 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
             Self.registry.release(folder, id: id, handoff: handoff)
             owner.finish(result)
             onCompletion(result)
+            if case .failure(let failure) = result { quitWork?.finish(failure: failure.localizedDescription) }
+            else { quitWork?.finish() }
         }
         if try Self.registry.admit(folder, id: id, afterCurrent: afterCurrent, work: work) {
             DispatchQueue.global(qos: .utility).async { work(nil) }
         }
         return owner
+    }
+
+    /// Dispensable thumbnails may read a stable canonical snapshot, but must
+    /// never start delayed recovery or commit after the Quit barrier seals.
+    private static func refuseRecoveryForPreview(in folder: URL) throws {
+        let descriptor = open(folder.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Failure.operationFailed("The preview folder is unavailable.") }
+        defer { Darwin.close(descriptor) }
+        var journal = stat()
+        let result = fstatat(descriptor, journalDirectoryName, &journal, AT_SYMLINK_NOFOLLOW)
+        guard result < 0 && errno == ENOENT else {
+            throw Failure.recoveryRequired("Open the meeting to finish recovery before loading its preview.")
+        }
     }
 
     /// Legacy synchronous metadata callers may refuse unresolved folders, but

@@ -134,7 +134,7 @@ nonisolated final class AttachmentPreviewReader: @unchecked Sendable {
         }
         for request in admitted {
             do {
-                _ = try store.start(in: request.folder, onCompletion: { [self] (result: Result<Content, TranscriptPersistenceStore.Failure>) in
+                _ = try store.start(in: request.folder, purpose: .previewRead, onCompletion: { [self] (result: Result<Content, TranscriptPersistenceStore.Failure>) in
                     switch result {
                     case .success(let content): complete(request, event: .loaded(content))
                     case .failure(let error): complete(request, event: .failed(error.localizedDescription))
