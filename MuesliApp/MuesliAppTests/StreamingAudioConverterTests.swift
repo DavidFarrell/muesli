@@ -72,6 +72,23 @@ final class StreamingAudioConverterTests: XCTestCase {
         XCTAssertEqual(stereo, single)
     }
 
+    func testActiveStereoZeroCrossingsUseStableDivisorAcrossPartitions() throws {
+        let count = 16017 // exercise the final partial analysis window too
+        let source: (Int, Int) -> Float = { index, channel in
+            channel == 0 ? 0.4 : Float(0.2 * sin(2 * .pi * 1000 * Double(index) / 16000))
+        }
+        let whole = try render(rate: 16000, count: count, partitions: [count], channels: 2, sample: source)
+        let partitioned = try render(rate: 16000, count: count, partitions: [1, 17, 997, 53], channels: 2, sample: source)
+        XCTAssertEqual(whole, partitioned)
+        let samples = whole.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
+        XCTAssertEqual(samples.count, count)
+        for index in samples.indices {
+            let expected = Double((source(index, 0) + source(index, 1)) / 2)
+            XCTAssertEqual(Double(samples[index]) / 32767, expected, accuracy: 0.00005,
+                           "Stereo must not double the remaining lane at zero crossing \(index)")
+        }
+    }
+
     func testProcessorPreservesSourceGapAndResetsOnlyAtFormatEpoch() {
         let store = ConverterPacketStore()
         let processor = MicCaptureProcessor(generation: 7) { store.append($0) }

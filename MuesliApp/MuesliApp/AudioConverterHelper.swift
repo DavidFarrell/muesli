@@ -15,6 +15,9 @@ nonisolated final class AudioConverterHelper {
     private var inputFrameCount: Int64 = 0
     private var emittedFrameCount: Int64 = 0
     private var pendingOutput = Data()
+    private var pendingChannels: [[Float]] = []
+    private var pendingSourceOffset = 0
+    private var analysisWindowFrames = 1
 
     init(targetSampleRate: Double = 16000, mixPolicy: ChannelMixPolicy = .meanOfActiveChannels) {
         self.targetSampleRate = targetSampleRate
@@ -26,13 +29,15 @@ nonisolated final class AudioConverterHelper {
     func convertToInt16(buffer: AVAudioPCMBuffer) throws -> Data {
         guard buffer.frameLength > 0 else { return Data() }
         if !matches(buffer.format) { try configure(buffer.format) }
-        guard let monoFormat,
-              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
-              let destination = mono.floatChannelData?[0] else { throw ConversionError.invalidFormat }
-        mono.frameLength = buffer.frameLength
-        try Self.downmix(buffer, into: destination, policy: mixPolicy)
+        try appendSource(buffer)
         inputFrameCount += Int64(buffer.frameLength)
-        return try takeSourceDurationOutput(convert(mono, ending: false))
+        let useActivityWindow = mixPolicy == .meanOfActiveChannels && buffer.format.channelCount > 1
+        var produced = Data()
+        while pendingSourceFrames >= (useActivityWindow ? analysisWindowFrames : 1) {
+            let count = useActivityWindow ? analysisWindowFrames : pendingSourceFrames
+            produced.append(try convert(takeMixedSource(count: count), ending: false))
+        }
+        return takeSourceDurationOutput(produced)
     }
 
     func finish() throws -> Data {
@@ -40,8 +45,14 @@ nonisolated final class AudioConverterHelper {
         defer {
             converter = nil; nativeFormat = nil; monoFormat = nil; outputFormat = nil
             inputFrameCount = 0; emittedFrameCount = 0; pendingOutput.removeAll()
+            pendingChannels.removeAll(); pendingSourceOffset = 0
         }
-        return try takeSourceDurationOutput(convert(nil, ending: true))
+        var produced = Data()
+        if pendingSourceFrames > 0 {
+            produced.append(try convert(takeMixedSource(count: pendingSourceFrames), ending: false))
+        }
+        produced.append(try convert(nil, ending: true))
+        return takeSourceDurationOutput(produced)
     }
 
     /// SRC end-of-stream includes filter padding. Deliver only the original
@@ -70,6 +81,9 @@ nonisolated final class AudioConverterHelper {
         nativeFormat = format
         monoFormat = input
         outputFormat = output
+        pendingChannels = Array(repeating: [], count: Int(format.channelCount))
+        pendingSourceOffset = 0
+        analysisWindowFrames = max(1, Int((format.sampleRate * 0.020).rounded()))
     }
 
     private func convert(_ input: AVAudioPCMBuffer?, ending: Bool) throws -> Data {
@@ -119,12 +133,9 @@ nonisolated final class AudioConverterHelper {
         }
     }
 
-    /// Preserve the intentional mean-of-active-channel microphone policy:
-    /// silent USB receiver channels never attenuate a live channel. Evaluate
-    /// activity per sample, so changing callback partitions cannot change the
-    /// downmix or duration. Genuine stereo is averaged where both channels
-    /// carry signal; the mean never exceeds the loudest input.
-    private static func downmix(_ buffer: AVAudioPCMBuffer, into destination: UnsafeMutablePointer<Float>, policy: ChannelMixPolicy) throws {
+    private var pendingSourceFrames: Int { (pendingChannels.first?.count ?? 0) - pendingSourceOffset }
+
+    private func appendSource(_ buffer: AVAudioPCMBuffer) throws {
         let channels = Int(buffer.format.channelCount)
         let interleaved = buffer.format.isInterleaved
         let read: (Int, Int) -> Float
@@ -135,16 +146,47 @@ nonisolated final class AudioConverterHelper {
         } else if let values = buffer.int32ChannelData {
             read = { frame, channel in Float(interleaved ? values[0][frame * channels + channel] : values[channel][frame]) / 2147483648 }
         } else { throw ConversionError.unsupportedPCM }
-        for frame in 0..<Int(buffer.frameLength) {
-            var total: Float = 0
-            var active = 0
-            for channel in 0..<channels {
+        for channel in 0..<channels {
+            for frame in 0..<Int(buffer.frameLength) {
                 let value = read(frame, channel)
-                guard value.isFinite else { continue }
-                if policy == .meanOfAllChannels || abs(value) >= 1e-4 { total += value; active += 1 }
+                pendingChannels[channel].append(value.isFinite ? value : 0)
             }
-            destination[frame] = active == 0 ? 0 : total / Float(active)
         }
+    }
+
+    /// Determine active lanes across fixed 20 ms source-frame windows, then
+    /// use one divisor for that entire window. A genuine stereo lane remains
+    /// active at its zero crossings; a silent receiver lane never attenuates
+    /// another lane. Retaining incomplete windows makes analysis independent
+    /// of native callback partitioning. Mono/system mixing needs no lookahead.
+    private func takeMixedSource(count: Int) throws -> AVAudioPCMBuffer {
+        guard let monoFormat,
+              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(count)),
+              let destination = mono.floatChannelData?[0] else { throw ConversionError.invalidFormat }
+        mono.frameLength = AVAudioFrameCount(count)
+        let range = pendingSourceOffset..<(pendingSourceOffset + count)
+        let allChannels = Array(pendingChannels.indices)
+        var activeChannels = allChannels
+        if mixPolicy == .meanOfActiveChannels {
+            activeChannels = allChannels.filter { channel in
+                range.contains { abs(pendingChannels[channel][$0]) >= 1e-4 }
+            }
+            if activeChannels.isEmpty { activeChannels = allChannels }
+        }
+        for frame in 0..<count {
+            var total: Float = 0
+            for channel in activeChannels { total += pendingChannels[channel][pendingSourceOffset + frame] }
+            destination[frame] = total / Float(activeChannels.count)
+        }
+        pendingSourceOffset += count
+        if pendingSourceOffset == pendingChannels[0].count {
+            for channel in pendingChannels.indices { pendingChannels[channel].removeAll(keepingCapacity: true) }
+            pendingSourceOffset = 0
+        } else if pendingSourceOffset >= analysisWindowFrames * 4 {
+            for channel in pendingChannels.indices { pendingChannels[channel].removeFirst(pendingSourceOffset) }
+            pendingSourceOffset = 0
+        }
+        return mono
     }
 
     enum ConversionError: Error { case invalidFormat, unsupportedPCM, converterFailed, invalidTimestamp }
