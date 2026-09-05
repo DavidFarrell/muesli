@@ -275,4 +275,20 @@ final class MeetingScreenshotInputTests: XCTestCase {
         } catch EndBeforeModel.fixture { }
     }
 
+
+    func testCaseVariantArtifactUUIDCannotDuplicateTheSameRecordedImage() async throws {
+        let root = try folder(), pair = try await session(root)
+        try metadata(root, [pair.1])
+        try editLedger(pair.0) { rows in
+            var rows = rows, alias = rows[1]
+            let path = alias["path"] as! String
+            alias["path"] = pair.0.relativeDirectory + "/screenshots/" + URL(fileURLWithPath: path).lastPathComponent.lowercased()
+            alias["t"] = 3
+            rows.append(alias)
+            return rows
+        }
+        do { _ = try await read(root); XCTFail("Duplicate artifact UUID was admitted through a case alias") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("duplicate screenshot identity"), error.localizedDescription) }
+    }
+
 }

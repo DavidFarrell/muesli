@@ -47,12 +47,12 @@ nonisolated struct MeetingScreenshotInput: Sendable {
         if FileManager.default.fileExists(atPath: root.appendingPathComponent("meeting.json").path) {
             let metadata = try context.readMetadata()
             guard metadata.sessions.count <= 1_000 else { throw CocoaError(.fileReadTooLarge) }
-            var sources = Set<String>()
+            var sources = Set<UUID>()
             for session in metadata.sessions {
                 guard let relative = session.artifactsFolder else { continue }
                 let parts = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-                guard parts.count == 2, parts[0] == "artifacts", UUID(uuidString: parts[1]) != nil,
-                      sources.insert(parts[1]).inserted else { throw invalid("invalid or repeated artifact session.") }
+                guard parts.count == 2, parts[0] == "artifacts", let sourceID = UUID(uuidString: parts[1]),
+                      sources.insert(sourceID).inserted else { throw invalid("invalid or repeated artifact session.") }
                 let source = parts[1]
                 if let expected = session.sourceSessionID, expected != source {
                     throw invalid("the indexed source and artifact session do not match.")
@@ -75,6 +75,7 @@ nonisolated struct MeetingScreenshotInput: Sendable {
                 guard remaining <= 64 * 1024 * 1024 - ledgerBytes else { throw CocoaError(.fileReadTooLarge) }
                 ledgerBytes += remaining
                 try handle.seek(toOffset: 0)
+                var artifactIDs = Set<UUID>()
                 var row = Data(), sawHeader = false, offset: Double?, previousTime: Double?, captureEnd: Double?
                 while remaining > 0 {
                     let chunk = try handle.read(upToCount: Int(min(remaining, 16 * 1024))) ?? Data()
@@ -117,10 +118,11 @@ nonisolated struct MeetingScreenshotInput: Sendable {
                               let path = event["path"] as? String else { throw invalid("a screenshot timestamp is invalid.") }
                         let pathParts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
                         guard pathParts.count == 4, Array(pathParts.prefix(3)) == ["artifacts", source, "screenshots"],
-                              UUID(uuidString: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent) != nil,
+                              let artifactID = UUID(uuidString: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent),
                               URL(fileURLWithPath: path).pathExtension.lowercased() == "png" else {
                             throw invalid("a screenshot path does not belong to its recorded source.")
                         }
+                        guard artifactIDs.insert(artifactID).inserted else { throw invalid("duplicate screenshot identity.") }
                         let image = Image(url: try safeURL(root: root, relative: path, directory: false),
                                           origin: .committed(sourceSessionID: source, meetingTime: time), relativePath: path)
                         guard imagePaths.insert(image.url.path).inserted, images.count < limit else {

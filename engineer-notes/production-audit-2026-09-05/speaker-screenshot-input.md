@@ -78,3 +78,10 @@ This slice extends the reviewed archive-ownership integration at `1765bef`.
 real identifier, selection and encoding code can be included in the test target.
 It does not qualify a model's naming accuracy or change native capture, backend
 runtime selection, sandbox entitlements, or the external archive workflow.
+
+A follow-up canonicalizes source UUID and per-source artifact UUID duplicate
+keys before file reads, while retaining each record's original spelling in
+provenance. This rejects case-alias duplicate events on both case-sensitive and
+case-insensitive volumes. The focused suite now has **14 passing tests**, including
+an actual modified-ledger regression:
+`/private/tmp/muesli-screenshot-case-identity-tests.log`.
