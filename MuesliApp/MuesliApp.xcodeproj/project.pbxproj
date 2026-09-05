@@ -52,6 +52,7 @@
 				ObjCExceptionCatcher.m,
 				ObjCExceptionCatching.swift,
 				OrphanedMeetingRecovery.swift,
+				RecordingArtifact.swift,
 				PendingAudioGate.swift,
 				TempTranscriptCleanup.swift,
 				TaskCompletion.swift,

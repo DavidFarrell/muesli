@@ -55,7 +55,7 @@ final class CaptureEngine: NSObject {
     private var forwarder: MicAudioForwarder?
     private var generation = 0
     private var recordingOutput: SCRecordingOutput?
-    private let recordingDelegate = RecordingDelegate()
+    private var recordingDelegate: RecordingDelegate?
     private(set) var meetingStartPTS: CMTime?
 
     var systemLevel: Float = 0
@@ -111,6 +111,7 @@ final class CaptureEngine: NSObject {
         config.excludesCurrentProcessAudio = true
         let stream = SCStream(filter: contentFilter, configuration: config, delegate: relay)
         self.stream = stream
+        var attemptedRecordingDelegate: RecordingDelegate?
         do {
             try stream.addStreamOutput(relay, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
             try stream.addStreamOutput(relay, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop", qos: .userInitiated))
@@ -118,6 +119,9 @@ final class CaptureEngine: NSObject {
                 let configuration = SCRecordingOutputConfiguration()
                 configuration.outputURL = recordURL
                 configuration.outputFileType = .mp4
+                let recordingDelegate = RecordingDelegate(url: recordURL)
+                attemptedRecordingDelegate = recordingDelegate
+                self.recordingDelegate = recordingDelegate
                 let output = SCRecordingOutput(configuration: configuration, delegate: recordingDelegate)
                 try stream.addRecordingOutput(output)
                 recordingOutput = output
@@ -129,6 +133,7 @@ final class CaptureEngine: NSObject {
                 }
             }
         } catch {
+            attemptedRecordingDelegate?.recordingSetupFailed(error)
             try? stream.removeStreamOutput(relay, type: .audio)
             try? stream.removeStreamOutput(relay, type: .screen)
             await relay.finish()
@@ -195,5 +200,3 @@ final class CaptureEngine: NSObject {
         return configuration
     }
 }
-
-nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate {}
