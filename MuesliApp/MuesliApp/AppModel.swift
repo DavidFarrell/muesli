@@ -469,16 +469,6 @@ final class AppModel: ObservableObject {
         loadMeetingHistory()
         Task { await loadShareableContent() }
 
-        Task.detached(priority: .background) { [weak self] in
-            let removed = TempTranscriptCleanup.sweep(temporaryDirectory: FileManager.default.temporaryDirectory)
-            guard removed > 0 else { return }
-            await MainActor.run { [weak self] in
-                self?.appendBackendLog(
-                    "Cleaned up \(removed) stale transcript temp folder(s) from previous launches.",
-                    toTail: false
-                )
-            }
-        }
     }
 
     var systemLevel: Float { captureEngine.systemLevel }

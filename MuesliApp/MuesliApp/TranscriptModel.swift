@@ -73,7 +73,7 @@ nonisolated struct TranscriptSegment: Identifiable, Sendable {
 }
 
 extension String {
-    func isEchoOf(_ other: String) -> Bool {
+    nonisolated func isEchoOf(_ other: String) -> Bool {
         let s1 = self.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let s2 = other.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 

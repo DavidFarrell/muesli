@@ -1,0 +1,13 @@
+# Historical transcript temp cleanup retired
+
+The startup sweep is removed. Current source has no producer of the old transcript staging directories; stopped meetings use the owned transcript persistence transaction instead.
+
+The old sweeper recursively deleted shared user-temp directories based on age and either a `Muesli-` name with familiar filenames or placement under the predictable `MuesliTranscriptStaging` name. Neither rule established ownership. Its legacy child listing also skipped hidden files, so an old directory containing `transcript.txt` and a foreign hidden file could pass the shape check and lose both files. Including hidden files would only repair that one symptom: unrelated directories with the same visible shape would still be at risk, and enumeration followed by recursive removal permits a concurrent addition or replacement.
+
+Historical directories are deliberately retained. This change does not run a host temp sweep, move the old files, or replace the heuristic with another guess. A future temporary-file producer must retain explicit ownership of the individual files it creates and their live operation, and must not recursively delete unverified historical contents. Existing owned transaction recovery/cleanup is outside this removed legacy sweep and remains unchanged.
+
+The obsolete cleanup implementation and its tests asserting heuristic deletion are removed with the only call site. There is therefore no replacement automatic deletion path to exercise against historical fixture directories. Verification checks the removal in the source/build graph and runs the existing persistence/recovery tests; no real user temporary directories are touched.
+
+The independent pure-code isolation correction marks `String.isEchoOf` nonisolated. `TranscriptAccumulator` uses it during off-UI durable replay. A new test runs both echo arrival orders on a background queue while the MainActor is blocked, verifying that replay completes and keeps only the system transcript in both cases.
+
+Validation on 2026-09-05: all 45 selected transcript, persistence and orphan-recovery tests pass (`/private/tmp/muesli-temp-cleanup-tests-v2.log`); the actual Release build passes (`/private/tmp/muesli-temp-cleanup-release.log`). The exact String extension extracted from the changed source also compiles with Swift 6, default MainActor isolation, complete strict concurrency and warnings as errors (`/private/tmp/muesli-echo-isolation-probe-v2.log`). The Release build's remaining five weak-self callback warnings belong to the separately assigned root correction; no cleanup or echo isolation warning remains.

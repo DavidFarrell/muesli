@@ -72,7 +72,6 @@
 				SessionArtifactStore.swift,
 				ScreenshotScheduler.swift,
 				PendingAudioGate.swift,
-				TempTranscriptCleanup.swift,
 				TaskCompletion.swift,
 				TranscriptModel.swift,
 				TranscriptPersistenceStore.swift,
