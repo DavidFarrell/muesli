@@ -2,101 +2,90 @@ import Foundation
 
 // MARK: - Backend Process
 
-nonisolated final class BackendProcess {
+/// Process control/callback state is protected by `processLock`; output is
+/// owned by BackendOutputReader's separate queue. No event journal operation
+/// or stdout delivery depends on the UI actor.
+nonisolated final class BackendProcess: @unchecked Sendable {
     private let process = Process()
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
-    private let workingDirectory: URL?
-    private let environment: [String: String]?
+    private let output: BackendOutputReader
+    private let processLock = NSLock()
+    private let exitCompletion = TaskCompletion()
+    private let callbackQueue = DispatchQueue(label: "muesli.backend-exit", qos: .utility)
+    private var started = false
+    private var exitStatus: Int32?
+    private var exitCallback: (@Sendable (Int32) -> Void)?
 
-    private var buffer = Data()
-    private var stderrBuffer = Data()
-    private var stdoutContinuation: AsyncStream<String>.Continuation?
-    let stdoutLines: AsyncStream<String>
+    let stdoutLines: BackendEventLines
 
-    var onJSONLine: ((String) -> Void)?
-    var onStderrLine: ((String) -> Void)?
-    var onExit: ((Int32) -> Void)?
+    var onJSONLine: (@Sendable (String) -> Void)? {
+        get { output.onJSONLine }
+        set { output.onJSONLine = newValue }
+    }
+    var onStderrLine: (@Sendable (String) -> Void)? {
+        get { output.onStderrLine }
+        set { output.onStderrLine = newValue }
+    }
+    var onExit: (@Sendable (Int32) -> Void)? {
+        get { processLock.withLock { exitCallback } }
+        set { processLock.withLock { exitCallback = newValue } }
+    }
 
+    /// Ownership transfers to FramedWriter; cleanup never touches this handle.
     var stdin: FileHandle { stdinPipe.fileHandleForWriting }
 
-    init(command: [String], workingDirectory: URL? = nil, environment: [String: String]? = nil) throws {
+    init(command: [String], workingDirectory: URL? = nil, environment: [String: String]? = nil,
+         eventJournalURL: URL? = nil, maximumStdoutLineBytes: Int = 4 * 1024 * 1024,
+         beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil) throws {
         guard !command.isEmpty else {
             throw NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "Empty command"])
         }
-
         process.executableURL = URL(fileURLWithPath: command[0])
         process.arguments = Array(command.dropFirst())
-        self.workingDirectory = workingDirectory
-        self.environment = environment
-
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-
-        var continuation: AsyncStream<String>.Continuation?
-        self.stdoutLines = AsyncStream<String>(bufferingPolicy: .bufferingNewest(500)) { cont in
-            continuation = cont
+        process.currentDirectoryURL = workingDirectory
+        if let environment {
+            var env = ProcessInfo.processInfo.environment
+            for (key, value) in environment { env[key] = value }
+            process.environment = env
         }
-        self.stdoutContinuation = continuation
+        output = BackendOutputReader(stdoutHandle: stdoutPipe.fileHandleForReading,
+                                     stderrHandle: stderrPipe.fileHandleForReading,
+                                     journalURL: eventJournalURL, maximumLineBytes: maximumStdoutLineBytes,
+                                     beforeJournalIO: beforeEventJournalIO)
+        stdoutLines = output.lines
     }
 
     func start() throws {
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            guard let self else { return }
-            let chunk = handle.availableData
-            if chunk.isEmpty { return }
-            self.buffer.append(chunk)
-
-            while true {
-                if let range = self.buffer.firstRange(of: Data([0x0A])) {
-                    let lineData = self.buffer.subdata(in: 0..<range.lowerBound)
-                    self.buffer.removeSubrange(0..<range.upperBound)
-                    if let line = String(data: lineData, encoding: .utf8) {
-                        self.onJSONLine?(line)
-                        self.stdoutContinuation?.yield(line)
-                    }
-                } else {
-                    break
+        try output.prepare()
+        do {
+            try processLock.withLock {
+                guard !started else {
+                    throw NSError(domain: "Muesli", code: -1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Backend process cannot be restarted"])
                 }
-            }
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            guard let self else { return }
-            let chunk = handle.availableData
-            if chunk.isEmpty { return }
-            self.stderrBuffer.append(chunk)
-
-            while true {
-                if let range = self.stderrBuffer.firstRange(of: Data([0x0A])) {
-                    let lineData = self.stderrBuffer.subdata(in: 0..<range.lowerBound)
-                    self.stderrBuffer.removeSubrange(0..<range.upperBound)
-                    if let line = String(data: lineData, encoding: .utf8) {
-                        self.onStderrLine?(line)
+                process.terminationHandler = { [weak self] process in
+                    guard let self else { return }
+                    let status = process.terminationStatus
+                    let callback = self.processLock.withLock {
+                        self.exitStatus = status
+                        return self.exitCallback
                     }
-                } else {
-                    break
+                    self.exitCompletion.markCompleted()
+                    // Exit is NOT stdout EOF: output may still be in the pipe.
+                    self.callbackQueue.async { callback?(status) }
                 }
+                try process.run()
+                started = true
             }
+        } catch {
+            output.cleanup()
+            throw error
         }
-
-        if let workingDirectory {
-            process.currentDirectoryURL = workingDirectory
-        }
-        if let environment {
-            var env = ProcessInfo.processInfo.environment
-            for (key, value) in environment {
-                env[key] = value
-            }
-            process.environment = env
-        }
-
-        process.terminationHandler = { [weak self] proc in
-            self?.onExit?(proc.terminationStatus)
-        }
-
-        try process.run()
     }
 
     func stop() {
@@ -104,56 +93,38 @@ nonisolated final class BackendProcess {
         terminate()
     }
 
-    func waitForExit(timeoutSeconds: Double) async -> Int32? {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while process.isRunning && Date() < deadline {
-            do {
-                try await Task.sleep(nanoseconds: 200_000_000)
-            } catch {
-                // Cancelled: resolve promptly with the current state instead
-                // of silently spinning out the rest of the deadline.
-                break
-            }
-        }
-        return process.isRunning ? nil : process.terminationStatus
+    @concurrent func waitForExit(timeoutSeconds: Double) async -> Int32? {
+        guard processLock.withLock({ started }) else { return nil }
+        _ = await exitCompletion.wait(timeoutSeconds: timeoutSeconds)
+        return processLock.withLock { exitStatus }
     }
 
     func terminate() {
-        if process.isRunning {
-            process.terminate()
-        }
+        processLock.withLock { if process.isRunning { process.terminate() } }
     }
 
-    /// Whether the child is still running. Used by the startup readiness
-    /// gate to fail fast when the backend crashes during launch instead of
-    /// waiting out the full handshake timeout (2026-07-16 RCA rec #3).
-    var isRunning: Bool { process.isRunning }
+    var isRunning: Bool { processLock.withLock { process.isRunning } }
 
-    /// SIGKILL escalation for a child that ignores SIGTERM - the 2026-07-16
-    /// incident's backend was wedged pre-read-loop and could plausibly have
-    /// ignored SIGTERM too (RCA rec #6). Killing the child also closes the
-    /// pipe's read end, which is what actually unblocks a `FramedWriter`
-    /// write stuck on a full pipe. No-op if the process already exited.
     func forceKill() {
-        if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
+        processLock.withLock {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }
 
-    /// Tears down the stdout/stderr plumbing. Deliberately does NOT touch
-    /// stdin (round-2 gate blocker on the 2026-07-16 slice): once the write
-    /// end is handed to a `FramedWriter` (see `stdin`), that writer's serial
-    /// queue owns it exclusively - NSFileHandle must not be used from
-    /// multiple threads simultaneously, and this method runs on the caller's
-    /// thread while the writer queue may still be mid-write (e.g. failing
-    /// fast with EPIPE right after the child was killed). Callers that need
-    /// stdin closed await `FramedWriter.closeStdinAndWait` first; if no
-    /// writer was ever created, the pipe's deinit closes the descriptor.
-    func cleanup() {
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        stdoutContinuation?.finish()
+    func stdoutStatus() -> BackendStdoutStatus { output.status() }
+
+    /// Waits for the reader's EOF/closure and journal outcome, independently
+    /// of the lossy UI consumer. Timeout/cancellation leaves the reader running.
+    /// `.drained` requires `status.isComplete` before claiming complete events.
+    @concurrent func finishStdout(timeoutSeconds: Double) async -> BackendStdoutDrainResult {
+        await output.finish(timeoutSeconds: timeoutSeconds)
     }
+
+    /// Explicit queued abort of stdout/stderr. Prefer finishStdout after child
+    /// exit before cleanup. Aborting before EOF records incomplete output; this
+    /// method's return is NOT evidence that reading or journaling has finished.
+    /// Stdin remains exclusively owned by FramedWriter, including on failure.
+    func cleanup() { output.cleanup() }
 }
 
 // MARK: - Framed Writer

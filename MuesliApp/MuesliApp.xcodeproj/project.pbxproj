@@ -30,6 +30,7 @@
 				AudioMetersModel.swift,
 				BackendProcess.swift,
 				BackendLogWriter.swift,
+				BackendOutputReader.swift,
 				BackendStartupGate.swift,
 				DurationFormatting.swift,
 				LocalAudioRecorder.swift,
