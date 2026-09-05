@@ -42,7 +42,6 @@ nonisolated enum ArchiveProcessingEvidence {
         try require(!log.isEmpty && log.count <= maximumLogBytes && log.last == 10,
                     "The processing journal is empty, incomplete or exceeds its size limit.")
         let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
         var cursor = log.startIndex, records = 0
         var result: FinalResult?
         while cursor < log.endIndex {
@@ -52,6 +51,7 @@ nonisolated enum ArchiveProcessingEvidence {
                         "A processing journal record is empty or exceeds its limit.")
             let bytes = Data(log[cursor..<newline])
             cursor = newline + 1
+            try ArchiveSourceJSON.check(bytes)
             let envelope = try decoder.decode(Envelope.self, from: bytes)
             try require(result == nil, "Processing records occurred after the final result.")
             switch envelope.type {
@@ -119,6 +119,7 @@ nonisolated enum ArchiveProcessingEvidence {
         try require(result.speakers.count == speakers.count && Set(result.speakers) == speakers,
                     "The processing speaker inventory does not match its turns.")
         var entries: Set<String> = [], totalWindows = 0
+        var recoverySourceBytes: Int64 = 0
         for entry in processing.entries {
             guard let source = byID[entry.sourceSessionId], let stream = source.streams[entry.stream], let input = entry.sourceInput else {
                 throw Failure(message: "A processing entry has missing or unknown source evidence.")
@@ -150,7 +151,8 @@ nonisolated enum ArchiveProcessingEvidence {
             try require(model.frameCount == stream.pcmBytes / 2 && model.byteCount == stream.pcmBytes + 44
                         && model.sha256 == stream.modelWAVSHA256, "The model did not receive the verified source's exact normalized bytes.")
             try recovery(entry.recovery, sourceID: source.id, stream: entry.stream,
-                         duration: Double(stream.pcmBytes) / 32_000, totalWindows: &totalWindows, inputHash: recoveryInputHash)
+                         duration: Double(stream.pcmBytes) / 32_000, sourceBytes: stream.pcmBytes,
+                         totalWindows: &totalWindows, sourceBytesRead: &recoverySourceBytes, inputHash: recoveryInputHash)
         }
         try require(!result.turns.isEmpty, "Sources without any processed turns require review before archiving.")
         return Verified(sessionCount: expected.count, streamCount: entries.count, turnCount: result.turns.count)
@@ -163,7 +165,7 @@ nonisolated enum ArchiveProcessingEvidence {
                     "Recovery evidence is missing or contradictory.")
     }
     private static func recovery(_ value: Recovery, sourceID: String, stream: String, duration: Double,
-                                 totalWindows: inout Int, inputHash: RecoveryInputHash?) throws {
+                                 sourceBytes: Int64, totalWindows: inout Int, sourceBytesRead: inout Int64, inputHash: RecoveryInputHash?) throws {
         if value.outcome == "not_needed" { try emptyRecovery(value, outcome: "not_needed"); return }
         try require(value.outcome == "completed" && value.failureCode == nil && value.failedWindowCount == 0
                     && !value.windows.isEmpty && value.windows.count <= 1024 - totalWindows
@@ -182,6 +184,9 @@ nonisolated enum ArchiveProcessingEvidence {
             try require(upper > lower && model.frameCount == upper - lower,
                         "A recovery model input does not match its exact source frame range.")
             guard let inputHash else { throw Failure(message: "Recovery input bytes require independent verification before archiving.") }
+            try require(sourceBytes <= 16 * 1024 * 1024 * 1024 - sourceBytesRead,
+                        "Independent recovery verification exceeds its aggregate source-read budget.")
+            sourceBytesRead += sourceBytes
             let verifiedHash = try inputHash(sourceID, stream, lower..<upper)
             try require(hash(verifiedHash) && model.sha256 == verifiedHash,
                         "Recovery used bytes that differ from the verified source range.")
@@ -194,31 +199,111 @@ nonisolated enum ArchiveProcessingEvidence {
         try require(value.emptyWindowCount == empty && value.recoveredWindowCount == recovered
                     && value.recoveredWordCount == words, "Recovery totals do not match the actual window records.")
     }
-    private struct Envelope: Decodable { let type: String; let stage: String?; let stream: String? }
+    private struct Envelope: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case type
+            case stage
+            case stream
+        }
+ let type: String; let stage: String?; let stream: String? }
     private struct FinalResult: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case duration
+            case sources
+            case turns
+            case speakers
+            case processing
+        }
+
         let duration: Double; let sources: [Source]; let turns: [Turn]; let speakers: [String]; let processing: Processing
     }
     private struct Source: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case sourceSessionId = "source_session_id"
+            case audioFolder = "audio_folder"
+            case timelineOffsetSeconds = "timeline_offset_seconds"
+            case durationSeconds = "duration_seconds"
+            case storageKind = "storage_kind"
+        }
+
         let sourceSessionId: String; let audioFolder: String; let timelineOffsetSeconds: Double; let durationSeconds: Double; let storageKind: String
     }
     private struct Turn: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case sourceSessionId = "source_session_id"
+            case stream
+            case speakerId = "speaker_id"
+            case t0
+            case t1
+            case text
+        }
+
         let sourceSessionId: String; let stream: String; let speakerId: String; let t0: Double; let t1: Double; let text: String
     }
     private struct Processing: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case complete
+            case requestedStreams = "requested_streams"
+            case recoveryRequested = "recovery_requested"
+            case entries
+        }
+
         let schemaVersion: Int; let complete: Bool; let requestedStreams: [String]; let recoveryRequested: Bool; let entries: [Entry]
     }
     private struct Entry: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case sourceSessionId = "source_session_id"
+            case audioFolder = "audio_folder"
+            case stream
+            case status
+            case availability
+            case sourceInput = "source_input"
+            case modelInput = "model_input"
+            case asrWordCount = "asr_word_count"
+            case diarizationSegmentCount = "diarization_segment_count"
+            case turnCount = "turn_count"
+            case failureCode = "failure_code"
+            case recovery
+        }
+
         let sourceSessionId: String; let audioFolder: String; let stream: String; let status: String; let availability: String
         let sourceInput: SourceInput?; let modelInput: ModelInput?; let asrWordCount: Int?; let diarizationSegmentCount: Int?
         let turnCount: Int?; let failureCode: String?; let recovery: Recovery
     }
     private struct SourceInput: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case relativePath = "relative_path"
+            case storageKind = "storage_kind"
+            case byteCount = "byte_count"
+            case sha256
+            case manifestSha256 = "manifest_sha256"
+            case manifestRevision = "manifest_revision"
+            case committedBytes = "committed_bytes"
+            case sessionId = "session_id"
+            case timelineOffsetUs = "timeline_offset_us"
+            case completed
+            case sampleRate = "sample_rate"
+            case channels
+            case frameCount = "frame_count"
+            case encoding
+        }
+
         let relativePath: String; let storageKind: String; let byteCount: Int64; let sha256: String
         let manifestSha256: String; let manifestRevision: Int64; let committedBytes: Int64; let sessionId: String
         let timelineOffsetUs: Int64; let completed: Bool
         let sampleRate: Int; let channels: Int; let frameCount: Int64; let encoding: String
     }
     private struct ModelInput: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case format
+            case sampleRate = "sample_rate"
+            case channels
+            case frameCount = "frame_count"
+            case byteCount = "byte_count"
+            case sha256
+        }
+
         let format: String; let sampleRate: Int; let channels: Int; let frameCount: Int64; let byteCount: Int64; let sha256: String
         func validate(maximumFrames: Int64) throws {
             try require(format == "wav_pcm_s16le" && sampleRate == 16_000 && channels == 1 && frameCount > 0
@@ -227,10 +312,32 @@ nonisolated enum ArchiveProcessingEvidence {
         }
     }
     private struct Recovery: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case outcome
+            case plannedWindowCount = "planned_window_count"
+            case attemptedWindowCount = "attempted_window_count"
+            case failedWindowCount = "failed_window_count"
+            case emptyWindowCount = "empty_window_count"
+            case recoveredWindowCount = "recovered_window_count"
+            case recoveredWordCount = "recovered_word_count"
+            case failureCode = "failure_code"
+            case windows
+        }
+
         let outcome: String; let plannedWindowCount: Int; let attemptedWindowCount: Int; let failedWindowCount: Int
         let emptyWindowCount: Int; let recoveredWindowCount: Int; let recoveredWordCount: Int; let failureCode: String?; let windows: [Window]
     }
     private struct Window: Decodable {
+        enum CodingKeys: String, CodingKey {
+            case startSeconds = "start_seconds"
+            case endSeconds = "end_seconds"
+            case status
+            case modelInput = "model_input"
+            case asrWordCount = "asr_word_count"
+            case recoveredWordCount = "recovered_word_count"
+            case failureCode = "failure_code"
+        }
+
         let startSeconds: Double; let endSeconds: Double; let status: String; let modelInput: ModelInput?
         let asrWordCount: Int?; let recoveredWordCount: Int?; let failureCode: String?
     }

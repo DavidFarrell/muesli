@@ -51,8 +51,8 @@ final class ArchiveProcessingEvidenceTests: XCTestCase {
         var entries = processing["entries"] as! [[String: Any]]
         body(&entries[index]); processing["entries"] = entries; root["processing"] = processing
     }
-    private func assertRejected(_ value: [String: Any], file: StaticString = #filePath, line: UInt = #line) throws {
-        XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: encoded(value), observedExitCode: 0, expected: expected), file: file, line: line)
+    private func assertRejected(_ value: [String: Any], recoveryInputHash: ArchiveProcessingEvidence.RecoveryInputHash? = nil, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: encoded(value), observedExitCode: 0, expected: expected, recoveryInputHash: recoveryInputHash), file: file, line: line)
     }
     func testCompleteBothStreamsWithProvenEmptyStream() throws {
         let result = try ArchiveProcessingEvidence.validate(log: encoded(fixture()), observedExitCode: 0, expected: expected)
@@ -126,9 +126,36 @@ final class ArchiveProcessingEvidenceTests: XCTestCase {
                 return expectedHash
             }))
         try assertRejected(value) // No independent source-range verification.
-        recovery["recovered_word_count"] = 2; changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value)
+        recovery["recovered_word_count"] = 2; changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value, recoveryInputHash: { _, _, _ in expectedHash })
         recovery["recovered_word_count"] = 1; recovery["failed_window_count"] = 1
-        changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value)
+        changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value, recoveryInputHash: { _, _, _ in expectedHash })
+    }
+    func testAmbiguousJSONAndWireKeyAliasesCannotSupplyEvidence() throws {
+        let json = String(decoding: try encoded(fixture()), as: UTF8.self)
+        for bad in [json.replacingOccurrences(of: "\"complete\":true", with: "\"complete\":false,\"complete\":true"),
+                    json.replacingOccurrences(of: "\"complete\":true", with: "\"complete\":false,\"comple\\u0074e\":true"),
+                    json.replacingOccurrences(of: "source_session_id", with: "sourceSessionId")] {
+            XCTAssertNotEqual(bad, json)
+            XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: Data(bad.utf8), observedExitCode: 0, expected: expected))
+        }
+    }
+    func testRecoveryRequiresExactIndependentRangeHashAndFrameCount() throws {
+        var value = fixture(), recovery = emptyRecovery("completed")
+        recovery["planned_window_count"] = 1; recovery["attempted_window_count"] = 1
+        recovery["empty_window_count"] = 1
+        var window: [String: Any] = ["start_seconds": 0.25, "end_seconds": 0.5, "status": "processed_without_words",
+            "model_input": model(frames: 4000), "asr_word_count": 0, "recovered_word_count": 0, "failure_code": NSNull()]
+        recovery["windows"] = [window]; changeEntry(&value) { $0["recovery"] = recovery }
+        let goodHash = wavHash, wrongHash = pcmHash, id = sourceID
+        XCTAssertNoThrow(try ArchiveProcessingEvidence.validate(log: encoded(value), observedExitCode: 0, expected: expected,
+            recoveryInputHash: { source, stream, frames in
+                XCTAssertEqual(source, id); XCTAssertEqual(stream, "mic"); XCTAssertEqual(frames, 4000..<8000)
+                return goodHash
+            }))
+        try assertRejected(value, recoveryInputHash: { _, _, _ in wrongHash })
+        window["model_input"] = model(frames: 4001)
+        recovery["windows"] = [window]; changeEntry(&value) { $0["recovery"] = recovery }
+        try assertRejected(value, recoveryInputHash: { _, _, _ in goodHash })
     }
     func testUnknownSchemaMissingEvidenceAndOversizedJournalRefuse() throws {
         var value = fixture(), processing = value["processing"] as! [String: Any]

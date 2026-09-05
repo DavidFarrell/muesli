@@ -31,6 +31,50 @@ nonisolated enum ArchiveSourceEligibility {
         let inventory: ArchiveSourceInventory.Snapshot
         let sessions: [Session]
         private let reader: ArchiveSourceReader
+        /// Verify on a retained file worker: the process exit must come from
+        /// its actual native owner. This method never launches or deletes.
+        func verifyProcessing(log: Data, observedExitCode: Int32) throws -> ArchiveProcessingEvidence.Verified {
+            let expected = try sessions.map { session in
+                var streams: [String: ArchiveProcessingEvidence.Stream] = [:]
+                for name in ["mic", "system"] {
+                    guard let pcm = session.streams[name], let model = session.modelInputs[name] else {
+                        throw Failure(message: "Verified source stream evidence is missing.")
+                    }
+                    streams[name] = .init(pcmBytes: pcm.bytes, pcmSHA256: pcm.sha256, modelWAVSHA256: model.sha256)
+                }
+                return ArchiveProcessingEvidence.Session(id: session.sourceSessionID, audioFolder: session.audioFolder,
+                    offsetUs: session.timelineOffsetUs, manifestSHA256: session.manifest.sha256,
+                    manifestRevision: session.manifestRevision, streams: streams)
+            }
+            try reader.validate()
+            let result = try ArchiveProcessingEvidence.validate(log: log, observedExitCode: observedExitCode, expected: expected,
+                recoveryInputHash: { [self] source, stream, frames in
+                    try recoveryWAVHash(sourceID: source, stream: stream, frames: frames)
+                })
+            try reader.validate()
+            return result
+        }
+        /// Hash the canonical WAV for a frame range while also rechecking the
+        /// entire original PCM fingerprint. No temporary audio is created.
+        func recoveryWAVHash(sourceID: String, stream: String, frames: Range<Int64>) throws -> String {
+            guard let session = sessions.first(where: { $0.sourceSessionID == sourceID }),
+                  let pcm = session.streams[stream], frames.lowerBound >= 0,
+                  frames.upperBound > frames.lowerBound, frames.upperBound <= pcm.bytes / 2,
+                  pcm.bytes <= 86_400 * 32_000 else {
+                throw Failure(message: "Recovery range has no corresponding verified PCM source.")
+            }
+            let lower = frames.lowerBound * 2, upper = frames.upperBound * 2
+            var digest = SHA256(), offset: Int64 = 0
+            digest.update(data: wavHeader(UInt32(upper - lower)))
+            try reader.validate()
+            try reader.stream(pcm, maximumBytes: 86_400 * 32_000) { chunk in
+                let start = max(lower, offset), end = min(upper, offset + Int64(chunk.count))
+                if start < end { digest.update(data: chunk[Int(start - offset)..<Int(end - offset)]) }
+                offset += Int64(chunk.count)
+            }
+            try reader.validate()
+            return hex(digest.finalize())
+        }
         fileprivate init(inventory: ArchiveSourceInventory.Snapshot, sessions: [Session], reader: ArchiveSourceReader) {
             self.inventory = inventory; self.sessions = sessions; self.reader = reader
         }

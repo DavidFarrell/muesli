@@ -121,6 +121,23 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
         var bytes = try Data(contentsOf: wav); bytes[bytes.count - 1] ^= 1; try bytes.write(to: wav)
         rejected(root, contains: "compatibility WAV")
     }
+    func testRecoveryRangeHashUsesExactOwnedPCMAndRejectsChangedOriginal() throws {
+        let root = try folder(), id = try fixture(root)[0], source = try inspect(root)
+        XCTAssertEqual(try source.recoveryWAVHash(sourceID: id, stream: "mic", frames: 40..<120),
+                       "f16c609f6937f825d2c0626128f726261d27fe6d6a08be3773fe18512c5fb1ff")
+        XCTAssertThrowsError(try source.recoveryWAVHash(sourceID: id, stream: "mic", frames: 40..<161))
+        XCTAssertThrowsError(try source.recoveryWAVHash(sourceID: UUID().uuidString, stream: "mic", frames: 40..<120))
+        // Mutating outside the requested range still invalidates the original.
+        var pcm = try Data(contentsOf: root.appendingPathComponent("audio/mic.pcm")); pcm[0] ^= 1
+        try pcm.write(to: root.appendingPathComponent("audio/mic.pcm"))
+        XCTAssertThrowsError(try source.recoveryWAVHash(sourceID: id, stream: "mic", frames: 40..<120))
+    }
+    func testRecoveryRangeHashRefusesReplacedSourceAncestor() throws {
+        let root = try folder(), id = try fixture(root)[0], source = try inspect(root), foreign = try folder()
+        try FileManager.default.moveItem(at: root.appendingPathComponent("audio"), to: foreign.appendingPathComponent("audio"))
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("audio"), withDestinationURL: foreign.appendingPathComponent("audio"))
+        XCTAssertThrowsError(try source.recoveryWAVHash(sourceID: id, stream: "mic", frames: 40..<120))
+    }
     func testInitialAlignmentIsExplicitReviewWithoutLostSpeechClaim() throws {
         let root = try folder(); try fixture(root)
         try change(root, "audio/source-recording.json") { $0["losses"] = [["source": "mic", "reason": "initial_source_alignment", "frames": 1]] }
