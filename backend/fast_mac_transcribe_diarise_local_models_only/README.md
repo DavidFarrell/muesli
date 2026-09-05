@@ -13,7 +13,7 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 ## Requirements
 
 - macOS on Apple Silicon (M1/M2/M3/M4)
-- Python 3.10+
+- Python 3.12.13 for reproducible installation (the library metadata permits older versions, which are not this release qualification target)
 - ffmpeg (`brew install ffmpeg`)
 
 ### Optional (for Claude Code skill integration)
@@ -23,41 +23,29 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 
 ## Installation
 
-### Option 1: Using UV (recommended)
+Use uv **0.11.3** and Python **3.12.13** for the qualified dependency set. From this repository's backend directory:
 
 ```bash
-# Clone the repo
-git clone git@github.com:DavidFarrell/fast_mac_transcribe_diarise_local_models_only.git
-cd fast_mac_transcribe_diarise_local_models_only
-
-# Run directly with uv (handles venv automatically)
-uv run diarise-transcribe --in audio.mp4 --out transcript.txt
+uv sync --config-file uv.toml --locked --python 3.12.13
 ```
 
-### Option 2: Traditional pip
+This is an explicit online dependency preparation step. The lock pins package versions and Senko's source commit. Prepare model assets separately using the exact-revision command below before recording. Runtime commands must not resolve or install dependencies:
 
 ```bash
-# Clone the repo
-git clone git@github.com:DavidFarrell/fast_mac_transcribe_diarise_local_models_only.git
-cd fast_mac_transcribe_diarise_local_models_only
-
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install the package (includes Senko)
-pip install -e .
+.venv/bin/python -m diarise_transcribe --in audio.mp4 --out transcript.txt
 ```
+
+The tracked `uv.toml` fixes the existing lock's package cutoff at `2026-05-29T14:22:51.381105Z`; dependency updates require an intentional policy and lock review. For developer/CI verification, run the root `scripts/verify.sh` with a fresh output directory. It ignores discovered user/system uv configuration, clears inherited UV/PIP/Python overrides, creates a fresh environment and package cache, checks the lock remains unchanged, runs backend and Swift tests, compiles Release and records runtime/build provenance. It requires an Apple Silicon Mac with Xcode 26.6 and uv 0.11.3. It does not replace or modify the app's selected runtime.
 
 ## Usage
 
 ### With UV (no venv activation needed)
 
 ```bash
-uv run diarise-transcribe --in audio.mp4 --out transcript.txt
+uv run --no-sync diarise-transcribe --in audio.mp4 --out transcript.txt
 ```
 
-### With pip/venv
+### With the prepared environment
 
 ```bash
 source .venv/bin/activate
@@ -77,11 +65,11 @@ python -m diarise_transcribe --in audio.mp4 --out transcript.txt --verbose
 
 ## Muesli Backend (framed stdin)
 
-Muesli streams framed PCM audio to stdin and expects JSONL events on stdout.
+The app owns source PCM and a committed-byte manifest independently of inference. It launches the adapter with `--source-recording`; Python reads verified source prefixes and never deletes or overwrites them. Framed stdin carries controls in this mode and stdout carries JSONL events. The legacy framed-PCM adapter remains available for compatibility:
 Run the adapter like this:
 
 ```bash
-uv run muesli-backend --output-dir /tmp/muesli --emit-meters
+uv run --no-sync muesli-backend --output-dir /tmp/muesli --emit-meters
 ```
 
 By default it transcribes the system stream. Use `--transcribe-stream mic` to target mic audio.
