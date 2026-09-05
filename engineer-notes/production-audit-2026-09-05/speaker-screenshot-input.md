@@ -85,3 +85,29 @@ provenance. This rejects case-alias duplicate events on both case-sensitive and
 case-insensitive volumes. The focused suite now has **14 passing tests**, including
 an actual modified-ledger regression:
 `/private/tmp/muesli-screenshot-case-identity-tests.log`.
+
+The independent reviewer reproduced a replaced-ancestor read after the initial
+snapshot. The correction retains the opened admitted meeting directory and uses
+`openat` with `O_NOFOLLOW` for every component of metadata, artifact ownership
+lock, ledger, enumeration and image reads. Each image retains its captured file
+device/inode, size, modification time and change time; hashing and encoding
+reopen relative to that directory and reject changed identities. There is no
+absolute-path image fallback. Metadata is bounded to 4 MiB and only actual
+`ENOENT` permits a legacy-only snapshot; dangling symlinks are errors.
+
+Speaker suggestions now carry a frozen content-generation and names basis.
+Human name edits invalidate it even when content generation is unchanged. Both
+presentation and sheet confirmation check it, and the actual metadata
+transaction compares the saved names before writing. Pending edits prevent
+suggestion admission; conditional proposals are never converted into
+unconditional Stop-finalizer intent. Added actual ancestor replacement,
+file replacement/rewrite, dangling metadata/ledger path, and stale saved-name
+regressions cover the review findings.
+
+Correction validation: 350 full app tests passed, followed by all 43 selected
+screenshot/metadata/access tests on the final correction (20 screenshot tests).
+Strict Swift 6/default-MainActor compilation and Release passed. Logs:
+`/private/tmp/muesli-screenshot-descriptor-full.log`,
+`/private/tmp/muesli-screenshot-descriptor-final-focused.log`,
+`/private/tmp/muesli-screenshot-descriptor-strict.log`, and
+`/private/tmp/muesli-screenshot-descriptor-release.log`.

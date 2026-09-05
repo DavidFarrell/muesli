@@ -12,6 +12,15 @@ enum SpeakerIdStatus: Equatable {
     case error(String)
 }
 
+nonisolated struct SpeakerIdentificationBasis: Sendable, Equatable {
+    let contentGeneration: UInt64
+    let names: [String: String]
+    @MainActor init(_ model: TranscriptModel) { contentGeneration = model.contentGeneration; names = model.speakerNames }
+    @MainActor func matches(_ model: TranscriptModel) -> Bool {
+        contentGeneration == model.contentGeneration && names == model.speakerNames
+    }
+}
+
 /// Cancellation retires a waiter; a blocked image read or model request keeps
 /// its original admission until identifySpeakers actually returns.
 nonisolated private final class SpeakerIdentificationAdmission: @unchecked Sendable {
@@ -291,7 +300,7 @@ actor SpeakerIdentifier {
             try Task.checkCancellation()
             if lastSource != candidate.image.sourceKey { lastHash = nil; lastTimestamp = nil }
             lastSource = candidate.image.sourceKey
-            guard let hash = try averageHash(for: candidate.url) else {
+            guard let hash = try averageHash(for: candidate.image.file) else {
                 result.append(candidate)
                 lastHash = nil
                 lastTimestamp = candidate.timestamp
@@ -317,9 +326,9 @@ actor SpeakerIdentifier {
         return result
     }
 
-    private func averageHash(for url: URL) throws -> UInt64? {
+    private func averageHash(for file: MeetingScreenshotDirectory.Reference) throws -> UInt64? {
         let image: CGImage
-        do { image = try thumbnail(from: url, maximumPixels: 8) }
+        do { image = try thumbnail(from: file, maximumPixels: 8) }
         catch is CancellationError { throw CancellationError() }
         catch { return nil }
         let width = 8
@@ -362,7 +371,7 @@ actor SpeakerIdentifier {
         for input in images {
             try Task.checkCancellation()
             do {
-                let image = try thumbnail(from: input.url, maximumPixels: 1024)
+                let image = try thumbnail(from: input.file, maximumPixels: 1024)
                 guard let data = encodeJPEG(image, quality: 0.8) else { throw imageFailure("The image could not be encoded.") }
                 payloads.append(ImagePayload(mediaType: "image/jpeg", base64Data: data.base64EncodedString(), evidence: input.evidence))
             } catch is CancellationError { throw CancellationError() }
@@ -380,11 +389,11 @@ actor SpeakerIdentifier {
 
     /// Read a bounded regular file and inspect its dimensions before ImageIO
     /// decodes pixels. Hashing and model payloads both use small thumbnails.
-    private func thumbnail(from url: URL, maximumPixels: Int) throws -> CGImage {
+    private func thumbnail(from file: MeetingScreenshotDirectory.Reference, maximumPixels: Int) throws -> CGImage {
         try Task.checkCancellation()
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw imageFailure("A screenshot cannot be opened safely.") }
-        defer { _ = close(fd) }
+        let handle = try file.open()
+        defer { try? handle.close() }
+        let fd = handle.fileDescriptor
         let limit = 32 * 1024 * 1024
         var initial = stat()
         guard fstat(fd, &initial) == 0, initial.st_mode & S_IFMT == S_IFREG, initial.st_nlink == 1,

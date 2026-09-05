@@ -3141,9 +3141,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
+    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem, basis: SpeakerIdentificationBasis) {
         guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL,
               canEditTranscript(in: meeting.folderURL) else { return }
+        guard basis.matches(transcriptModel), !metadataEdits.isPending(in: meeting.folderURL) else {
+            transcriptLoadError = "The transcript or speaker names changed. Identify speakers again before applying suggestions."
+            return
+        }
         var assignments: [String: String] = [:]
         for mapping in mappings {
             let id = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3151,7 +3155,8 @@ final class AppModel: ObservableObject {
             guard !id.isEmpty, !name.isEmpty else { continue }
             assignments.merge(transcriptModel.speakerNameAssignments(id: id, name: name)) { _, latest in latest }
         }
-        submitSpeakerNames(assignments, to: meeting.folderURL)
+        meetingCatalog.invalidate()
+        metadataEdits.submitNames(assignments, in: meeting.folderURL, contentGeneration: basis.contentGeneration, expectedNames: basis.names)
     }
 
     func runBatchRediarization(

@@ -9,9 +9,10 @@ nonisolated struct MeetingScreenshotInput: Sendable {
             case committed(sourceSessionID: String, meetingTime: Double)
             case legacy
         }
-        let url: URL
+        let file: MeetingScreenshotDirectory.Reference
         let origin: Origin
-        var relativePath: String? = nil
+        var url: URL { file.url }
+        var relativePath: String { file.relativePath }
         var timestamp: Double? {
             if case .committed(_, let time) = origin { return time }
             return nil
@@ -23,7 +24,7 @@ nonisolated struct MeetingScreenshotInput: Sendable {
         var evidence: String {
             switch origin {
             case .committed(let source, let time):
-                return "Artifact \(relativePath ?? url.lastPathComponent) (image ID \(url.deletingPathExtension().lastPathComponent)); recorded source/session \(source), meeting-relative time \(String(format: "%.6f", time)) seconds."
+                return "Artifact \(relativePath) (image ID \(url.deletingPathExtension().lastPathComponent)); recorded source/session \(source), meeting-relative time \(String(format: "%.6f", time)) seconds."
             case .legacy:
                 return "Legacy image: source/session and meeting-relative time are unverified; its filename is not timing evidence."
             }
@@ -41,11 +42,12 @@ nonisolated struct MeetingScreenshotInput: Sendable {
 
     static func snapshot(context: TranscriptPersistenceStore.Context) throws -> MeetingScreenshotInput {
         try context.access.validate()
-        let root = context.folder
+        let files = try MeetingScreenshotDirectory(access: context.access)
         var images: [Image] = [], imagePaths = Set<String>()
         var ledgerBytes: UInt64 = 0, ledgerRows = 0
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent("meeting.json").path) {
-            let metadata = try context.readMetadata()
+        if let data = try files.readIfPresent("meeting.json", limit: 4 * 1024 * 1024) {
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            let metadata = try decoder.decode(MeetingMetadata.self, from: data)
             guard metadata.sessions.count <= 1_000 else { throw CocoaError(.fileReadTooLarge) }
             var sources = Set<UUID>()
             for session in metadata.sessions {
@@ -60,16 +62,14 @@ nonisolated struct MeetingScreenshotInput: Sendable {
                 if let expected = session.artifactFinalization?.sourceSessionID, expected != source {
                     throw invalid("the recorded artifact outcome belongs to another source.")
                 }
-                let directory = try safeURL(root: root, relative: relative, directory: true)
-                // A pending native writer can have appended a complete-looking
-                // line before fsync. Read only after its original owner closes.
-                _ = try safeURL(root: root, relative: relative + "/.artifact-owner.lock", directory: false)
-                guard let inactive = try SessionArtifactStore.acquireInactiveLease(directory: directory) else {
-                    throw invalid("the artifact session has no ownership evidence.")
-                }
+                // Retain the actual ownership lock, opened relative to the
+                // admitted directory. Never follow a replaced ancestor path.
+                let inactive = try files.open(relative + "/.artifact-owner.lock", isDirectory: false)
                 defer { try? inactive.close() }
-                let ledger = try safeURL(root: root, relative: relative + "/assets.jsonl", directory: false)
-                let handle = try FileHandle(forReadingFrom: ledger)
+                guard flock(inactive.fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+                    throw invalid("the artifact session is still being saved.")
+                }
+                let handle = try files.open(relative + "/assets.jsonl", isDirectory: false)
                 defer { try? handle.close() }
                 var remaining = try handle.seekToEnd()
                 guard remaining <= 64 * 1024 * 1024 - ledgerBytes else { throw CocoaError(.fileReadTooLarge) }
@@ -123,8 +123,8 @@ nonisolated struct MeetingScreenshotInput: Sendable {
                             throw invalid("a screenshot path does not belong to its recorded source.")
                         }
                         guard artifactIDs.insert(artifactID).inserted else { throw invalid("duplicate screenshot identity.") }
-                        let image = Image(url: try safeURL(root: root, relative: path, directory: false),
-                                          origin: .committed(sourceSessionID: source, meetingTime: time), relativePath: path)
+                        let image = Image(file: try files.reference(path),
+                                          origin: .committed(sourceSessionID: source, meetingTime: time))
                         guard imagePaths.insert(image.url.path).inserted, images.count < limit else {
                             throw invalid("duplicate or excessive screenshot records.")
                         }
@@ -139,19 +139,13 @@ nonisolated struct MeetingScreenshotInput: Sendable {
                 // The frozen trailing fragment is not a committed record.
             }
         }
-        let legacy = root.appendingPathComponent("screenshots", isDirectory: true)
-        if FileManager.default.fileExists(atPath: legacy.path) {
-            let folder = try safeURL(root: root, relative: "screenshots", directory: true)
-            guard let entries = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil,
-                options: [.skipsSubdirectoryDescendants]) else { throw CocoaError(.fileReadUnknown) }
-            var count = 0
-            for case let url as URL in entries {
-                count += 1
-                guard count <= limit, images.count < limit else { throw CocoaError(.fileReadTooLarge) }
-                guard ["png", "jpg", "jpeg"].contains(url.pathExtension.lowercased()) else { continue }
-                images.append(Image(url: try safeURL(root: root, relative: "screenshots/" + url.lastPathComponent,
-                                                    directory: false), origin: .legacy))
-            }
+        let legacyNames: [String]
+        do { legacyNames = try files.names(in: "screenshots", limit: limit) }
+        catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) { legacyNames = [] }
+        for name in legacyNames {
+            guard images.count < limit else { throw CocoaError(.fileReadTooLarge) }
+            guard ["png", "jpg", "jpeg"].contains(URL(fileURLWithPath: name).pathExtension.lowercased()) else { continue }
+            images.append(Image(file: try files.reference("screenshots/" + name), origin: .legacy))
         }
         try context.access.validate()
         return MeetingScreenshotInput(images: images.sorted { $0.url.path < $1.url.path }, access: context.access)
@@ -163,22 +157,118 @@ nonisolated struct MeetingScreenshotInput: Sendable {
         return number.isFinite && number >= 0 ? number : nil
     }
 
-    /// Reject traversal and every symlink component, including a legacy image
-    /// that would otherwise cause speaker-ID to read outside the meeting.
-    private static func safeURL(root: URL, relative: String, directory: Bool) throws -> URL {
+
+}
+
+/// Retain the admitted directory itself. Every subsequent read traverses from
+/// this descriptor, refusing symlinks and matching the snapshot's file identity.
+nonisolated final class MeetingScreenshotDirectory: Sendable {
+    let access: MeetingFileAccess
+    private let descriptor: Int32
+    init(access: MeetingFileAccess) throws {
+        try access.validate()
+        let fd = Darwin.open(access.folderURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var value = stat()
+        guard fstat(fd, &value) == 0, UInt64(value.st_dev) == access.identity.directoryDevice,
+              value.st_ino == access.identity.directoryInode else { _ = close(fd); throw MeetingFileAccess.Failure.changed }
+        self.access = access; descriptor = fd
+    }
+    deinit { _ = close(descriptor) }
+
+    struct Identity: Sendable, Equatable {
+        let device: Int32, inode: UInt64, bytes: Int64
+        let modifiedSeconds: Int, modifiedNanos: Int, changedSeconds: Int, changedNanos: Int
+        init(_ value: stat) {
+            device = value.st_dev; inode = value.st_ino; bytes = value.st_size
+            modifiedSeconds = value.st_mtimespec.tv_sec; modifiedNanos = value.st_mtimespec.tv_nsec
+            changedSeconds = value.st_ctimespec.tv_sec; changedNanos = value.st_ctimespec.tv_nsec
+        }
+    }
+    struct Reference: Sendable, Equatable {
+        let directory: MeetingScreenshotDirectory
+        let relativePath: String
+        let identity: Identity
+        var url: URL { directory.access.folderURL.appendingPathComponent(relativePath) }
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.directory.access.identity == rhs.directory.access.identity && lhs.relativePath == rhs.relativePath && lhs.identity == rhs.identity
+        }
+        func open() throws -> FileHandle {
+            let handle = try directory.open(relativePath, isDirectory: false)
+            var value = stat()
+            guard fstat(handle.fileDescriptor, &value) == 0, Identity(value) == identity else {
+                try? handle.close(); throw MeetingFileAccess.Failure.changed
+            }
+            return handle
+        }
+    }
+    func reference(_ relative: String) throws -> Reference {
+        let handle = try open(relative, isDirectory: false)
+        defer { try? handle.close() }
+        var value = stat()
+        guard fstat(handle.fileDescriptor, &value) == 0 else { throw MeetingFileAccess.Failure.changed }
+        return Reference(directory: self, relativePath: relative, identity: Identity(value))
+    }
+    func open(_ relative: String, isDirectory: Bool) throws -> FileHandle {
+        try access.validate()
         let parts = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }) else {
-            throw invalid("an artifact path is not a contained relative path.")
+            throw CocoaError(.fileReadNoPermission)
         }
-        var url = root
+        var current = descriptor, intermediates: [Int32] = []
+        defer { for fd in intermediates { _ = close(fd) } }
         for (index, part) in parts.enumerated() {
-            url.appendPathComponent(part)
+            let needsDirectory = index < parts.count - 1 || isDirectory
+            let fd = openat(current, part, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | (needsDirectory ? O_DIRECTORY : 0))
+            guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
             var value = stat()
-            guard lstat(url.path, &value) == 0 else { throw invalid("a recorded image or directory is missing.") }
-            let expected = index == parts.count - 1 && !directory ? S_IFREG : S_IFDIR
-            guard value.st_mode & S_IFMT == expected,
-                  expected != S_IFREG || value.st_nlink == 1 else { throw invalid("an image or directory has an unsafe file identity.") }
+            guard fstat(fd, &value) == 0,
+                  value.st_mode & S_IFMT == (needsDirectory ? S_IFDIR : S_IFREG),
+                  needsDirectory || value.st_nlink == 1 else { _ = close(fd); throw CocoaError(.fileReadNoPermission) }
+            if index == parts.count - 1 { return FileHandle(fileDescriptor: fd, closeOnDealloc: true) }
+            intermediates.append(fd); current = fd
         }
-        return url
+        throw CocoaError(.fileReadUnknown)
+    }
+    func readIfPresent(_ relative: String, limit: Int) throws -> Data? {
+        let handle: FileHandle
+        do { handle = try open(relative, isDirectory: false) }
+        catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) { return nil }
+        defer { try? handle.close() }
+        var initial = stat()
+        guard fstat(handle.fileDescriptor, &initial) == 0, initial.st_size >= 0, initial.st_size <= limit else { throw CocoaError(.fileReadTooLarge) }
+        var data = Data()
+        while let chunk = try handle.read(upToCount: min(64 * 1024, limit + 1 - data.count)), !chunk.isEmpty {
+            data.append(chunk)
+            guard data.count <= limit else { throw CocoaError(.fileReadTooLarge) }
+        }
+        var after = stat()
+        guard fstat(handle.fileDescriptor, &after) == 0, Identity(initial) == Identity(after), data.count == initial.st_size else {
+            throw MeetingFileAccess.Failure.changed
+        }
+        return data
+    }
+    func names(in relative: String, limit: Int) throws -> [String] {
+        let handle = try open(relative, isDirectory: true)
+        defer { try? handle.close() }
+        let duplicate = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0 else { throw CocoaError(.fileReadUnknown) }
+        guard let stream = fdopendir(duplicate) else { _ = close(duplicate); throw CocoaError(.fileReadUnknown) }
+        defer { _ = closedir(stream) }
+        var names: [String] = []
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                guard errno == 0 else { throw CocoaError(.fileReadUnknown) }
+                break
+            }
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+            }
+            guard name != ".", name != ".." else { continue }
+            guard names.count < limit else { throw CocoaError(.fileReadTooLarge) }
+            names.append(name)
+        }
+        return names
     }
 }

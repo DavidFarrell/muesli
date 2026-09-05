@@ -11,6 +11,11 @@ final class MeetingScreenshotInputTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return root
     }
+    private func image(_ url: URL, origin: MeetingScreenshotInput.Image.Origin) throws -> MeetingScreenshotInput.Image {
+        let access = try MeetingFileAccess.acquire(in: url.deletingLastPathComponent())
+        let directory = try MeetingScreenshotDirectory(access: access)
+        return MeetingScreenshotInput.Image(file: try directory.reference(url.lastPathComponent), origin: origin)
+    }
     private func pixel(width: Int = 2, height: Int = 2) -> CGImage {
         CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 4 * width,
                   space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
@@ -107,7 +112,7 @@ final class MeetingScreenshotInputTests: XCTestCase {
         let current = try XCTUnwrap(input.images.first { $0.timestamp != nil })
         XCTAssertEqual(current.timestamp, 27)
         XCTAssertTrue(current.evidence.contains(pair.0.sourceSessionID))
-        XCTAssertTrue(current.evidence.contains(try XCTUnwrap(current.relativePath)))
+        XCTAssertTrue(current.evidence.contains(current.relativePath))
         XCTAssertTrue(current.evidence.contains(current.url.deletingPathExtension().lastPathComponent))
         XCTAssertFalse(current.evidence.contains("99999"))
     }
@@ -170,8 +175,8 @@ final class MeetingScreenshotInputTests: XCTestCase {
     func testSamePixelsAcrossSourcesAreNotDeduplicatedIntoAnotherSource() async throws {
         let root = try folder(), first = root.appendingPathComponent("a.png"), second = root.appendingPathComponent("b.png")
         try png(first); try png(second)
-        let images = [MeetingScreenshotInput.Image(url: first, origin: .committed(sourceSessionID: "one", meetingTime: 1)),
-                      MeetingScreenshotInput.Image(url: second, origin: .committed(sourceSessionID: "two", meetingTime: 2))]
+        let images = [try image(first, origin: .committed(sourceSessionID: "one", meetingTime: 1)),
+                      try image(second, origin: .committed(sourceSessionID: "two", meetingTime: 2))]
         let selected = try await SpeakerIdentifier().selectScreenshots(from: images, targetCount: 16)
         XCTAssertEqual(selected, images)
     }
@@ -180,15 +185,15 @@ final class MeetingScreenshotInputTests: XCTestCase {
         let root = try folder(), valid = root.appendingPathComponent("valid.png"), corrupt = root.appendingPathComponent("bad.png")
         try png(valid); try Data("not an image".utf8).write(to: corrupt)
         let source = UUID().uuidString
-        let images = [MeetingScreenshotInput.Image(url: corrupt, origin: .legacy),
-                      MeetingScreenshotInput.Image(url: valid, origin: .committed(sourceSessionID: source, meetingTime: 27))]
+        let images = [try image(corrupt, origin: .legacy),
+                      try image(valid, origin: .committed(sourceSessionID: source, meetingTime: 27))]
         let payloads = try await SpeakerIdentifier().loadImagePayloads(from: images)
         XCTAssertEqual(payloads.count, 1)
         XCTAssertEqual(payloads[0].evidence, images[1].evidence)
         XCTAssertTrue(payloads[0].evidence.contains("27.000000"))
         XCTAssertFalse(payloads[0].base64Data.isEmpty)
         do {
-            _ = try await SpeakerIdentifier().loadImagePayloads(from: [.init(url: corrupt, origin: images[1].origin)])
+            _ = try await SpeakerIdentifier().loadImagePayloads(from: [try image(corrupt, origin: images[1].origin)])
             XCTFail("A corrupt committed image must not be silently omitted")
         } catch { }
     }
@@ -208,7 +213,7 @@ final class MeetingScreenshotInputTests: XCTestCase {
         XCTAssertEqual((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, 5_000)
         for (url, expected) in [(bytes, "32 MiB"), (dimensions, "16 megapixel")] {
             do {
-                _ = try await SpeakerIdentifier().loadImagePayloads(from: [.init(url: url, origin: .committed(sourceSessionID: "fixture", meetingTime: 0))])
+                _ = try await SpeakerIdentifier().loadImagePayloads(from: [try image(url, origin: .committed(sourceSessionID: "fixture", meetingTime: 0))])
                 XCTFail("Oversized image was decoded")
             } catch { XCTAssertTrue(error.localizedDescription.contains(expected), error.localizedDescription) }
         }
@@ -217,7 +222,7 @@ final class MeetingScreenshotInputTests: XCTestCase {
     func testActualPayloadThumbnailHasBoundedDimensionsAndDedupeHonorsCancellation() async throws {
         let root = try folder(), wide = root.appendingPathComponent("wide.png")
         try png(wide, width: 2_560, height: 100)
-        let image = MeetingScreenshotInput.Image(url: wide, origin: .legacy)
+        let image = try image(wide, origin: .legacy)
         let identifier = SpeakerIdentifier()
         let payload = try await identifier.loadImagePayloads(from: [image])[0]
         let source = try XCTUnwrap(CGImageSourceCreateWithData(try XCTUnwrap(Data(base64Encoded: payload.base64Data)) as CFData, nil))
@@ -289,6 +294,91 @@ final class MeetingScreenshotInputTests: XCTestCase {
         }
         do { _ = try await read(root); XCTFail("Duplicate artifact UUID was admitted through a case alias") }
         catch { XCTAssertTrue(error.localizedDescription.contains("duplicate screenshot identity"), error.localizedDescription) }
+    }
+
+
+    func testAncestorSwapAfterSnapshotCannotEncodeForeignImageWithOldProvenance() async throws {
+        let root = try folder(), pair = try await session(root)
+        try metadata(root, [pair.1])
+        let input = try await read(root)
+        let screenshots = pair.0.directory.appendingPathComponent("screenshots")
+        try FileManager.default.moveItem(at: screenshots, to: pair.0.directory.appendingPathComponent("original-screenshots"))
+        let foreign = try folder()
+        try png(foreign.appendingPathComponent(input.images[0].url.lastPathComponent), width: 32, height: 32)
+        try FileManager.default.createSymbolicLink(at: screenshots, withDestinationURL: foreign)
+        do { _ = try await SpeakerIdentifier().loadImagePayloads(from: input.images); XCTFail("Foreign ancestor image was encoded") }
+        catch { }
+    }
+
+    func testFileReplacementAndSameInodeRewriteAfterSnapshotAreRejected() async throws {
+        for replace in [true, false] {
+            let root = try folder(), pair = try await session(root)
+            try metadata(root, [pair.1])
+            let input = try await read(root), imageURL = input.images[0].url
+            if replace { try FileManager.default.moveItem(at: imageURL, to: pair.0.directory.appendingPathComponent("original.png")) }
+            try png(imageURL, width: 32, height: 32)
+            do { _ = try await SpeakerIdentifier().loadImagePayloads(from: input.images); XCTFail("Changed image retained its old evidence") }
+            catch { }
+        }
+    }
+
+    func testDanglingMetadataAndLedgerAncestorSymlinksNeverBecomeAbsentLegacyEvidence() async throws {
+        let missing = try folder()
+        try FileManager.default.createSymbolicLink(at: missing.appendingPathComponent("meeting.json"), withDestinationURL: missing.appendingPathComponent("absent.json"))
+        await assertInvalid(missing)
+        let root = try folder(), pair = try await session(root)
+        try metadata(root, [pair.1])
+        let original = root.appendingPathComponent("original-artifacts")
+        try FileManager.default.moveItem(at: root.appendingPathComponent("artifacts"), to: original)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("artifacts"), withDestinationURL: original)
+        await assertInvalid(root)
+    }
+
+    func testNameEditsInvalidateCapturedBasisAndStaleDiskMutationPreservesHumanName() async throws {
+        let model = TranscriptModel()
+        let before = SpeakerIdentificationBasis(model)
+        model.renameSpeaker(id: "speaker", to: "Human edit")
+        XCTAssertEqual(before.contentGeneration, model.contentGeneration)
+        XCTAssertFalse(before.matches(model), "Names changed without a content generation increment")
+        let presented = SpeakerIdentificationBasis(model)
+        model.renameSpeaker(id: "speaker", to: "Second human edit")
+        XCTAssertFalse(presented.matches(model), "An already presented suggestion must expire too")
+        let root = try folder()
+        try metadata(root, [])
+        let human = try MeetingMetadataMutation.start(in: root, patch: .init(names: ["speaker": "Human edit"]))
+        _ = try await human.value(timeoutSeconds: 2)
+        let stale = try MeetingMetadataMutation.start(in: root,
+            patch: .init(names: ["speaker": "Old suggestion"], expectedNames: [:]))
+        do { _ = try await stale.value(timeoutSeconds: 2); XCTFail("A stale suggestion replaced the saved human name") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("Speaker names changed")) }
+        let current = try TranscriptPersistenceStore().start(in: root) { try $0.readMetadata() }
+        let saved = try await current.value(timeoutSeconds: 2)
+        XCTAssertEqual(saved.speakerNames["speaker"], "Human edit")
+    }
+
+
+    func testConditionalNameProposalIsNotTransferredAsUnconditionalFinalizerIntent() async throws {
+        let root = try folder(), gate = PreparationGate(), finished = TaskCompletion()
+        try metadata(root, [])
+        let store = TranscriptPersistenceStore { step in if step == .stage("meeting.json") { gate.block() } }
+        let edits = MeetingMetadataEdits(store: store) { event in
+            if case .committed = event { finished.markCompleted() }
+        }
+        edits.submitNames(["speaker": "Reviewed suggestion"], in: root, contentGeneration: 0, expectedNames: [:])
+        let entered = await gate.entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(entered, .completed)
+        XCTAssertEqual(edits.retire(in: root), [:])
+        gate.release.signal()
+        let ended = await finished.wait(timeoutSeconds: 3)
+        XCTAssertEqual(ended, .completed)
+    }
+
+    func testOversizedMetadataDoesNotFallBackToLegacyImages() async throws {
+        let root = try folder(), path = root.appendingPathComponent("meeting.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: path.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: path)
+        try handle.truncate(atOffset: 4 * 1024 * 1024 + 1); try handle.close()
+        await assertInvalid(root)
     }
 
 }

@@ -7,6 +7,7 @@ nonisolated enum MeetingMetadataMutation {
         var title: String? = nil
         var names: [String: String] = [:]
         var contentGeneration: UInt64 = 0
+        var expectedNames: [String: String]? = nil
     }
     static func start(in folder: URL, patch: Patch, store: TranscriptPersistenceStore = .shared,
                       onCompletion: @escaping @Sendable (Result<MeetingMetadata, TranscriptPersistenceStore.Failure>) -> Void = { _ in }) throws -> TranscriptPersistenceStore.Operation<MeetingMetadata> {
@@ -14,6 +15,9 @@ nonisolated enum MeetingMetadataMutation {
         if title?.isEmpty == true { throw MeetingRenameError.emptyTitle }
         return try store.start(in: folder, onCompletion: onCompletion) { context in
             var metadata = try context.readMetadata()
+            if let expected = patch.expectedNames, expected != metadata.speakerNames {
+                throw TranscriptPersistenceStore.Failure.operationFailed("Speaker names changed after identification. Identify speakers again before applying suggestions.")
+            }
             if let title { metadata.title = title }
             metadata.speakerNames.merge(patch.names) { _, reviewed in reviewed }
             metadata.updatedAt = Date()
@@ -62,10 +66,13 @@ final class MeetingMetadataEdits {
     func retire(in folder: URL) -> [String: String] {
         retired.insert(folder)
         let operation = active[folder]
-        if let operation, operation.patch.title == nil, !operation.patch.names.isEmpty {
+        if let operation, operation.patch.expectedNames == nil, operation.patch.title == nil, !operation.patch.names.isEmpty {
             transferredNameIDs[folder, default: []].insert(operation.id)
         }
-        let current = operation?.patch.names ?? [:]
+        // Conditional suggestions must pass their own fresh-disk comparison.
+        // A finalizer reads any actual commit; it must not turn an unresolved
+        // conditional proposal into an unconditional transferred name intent.
+        let current = operation?.patch.expectedNames == nil ? (operation?.patch.names ?? [:]) : [:]
         let queued = desiredNames.removeValue(forKey: folder)?.names ?? [:]
         return current.merging(queued) { _, latest in latest }
     }
@@ -84,13 +91,17 @@ final class MeetingMetadataEdits {
         return transferred
     }
 
-    func submitNames(_ names: [String: String], in folder: URL, contentGeneration: UInt64) {
+    func submitNames(_ names: [String: String], in folder: URL, contentGeneration: UInt64, expectedNames: [String: String]? = nil) {
         guard !names.isEmpty else { return }
         guard !retired.contains(folder) else {
             onEvent(.failed(folder, "This meeting is finishing its saved transcript. Wait for that save before editing speakers.", UUID()))
             return
         }
         if active[folder] != nil {
+            guard expectedNames == nil else {
+                onEvent(.failed(folder, "A speaker edit is still pending. Wait before applying identification suggestions.", UUID()))
+                return
+            }
             var patch = desiredNames[folder] ?? MeetingMetadataMutation.Patch(contentGeneration: contentGeneration)
             // A new viewer generation supersedes queued UI edits to old labels.
             if patch.contentGeneration != contentGeneration { patch.names = [:] }
@@ -98,7 +109,7 @@ final class MeetingMetadataEdits {
             patch.names.merge(names) { _, latest in latest }
             desiredNames[folder] = patch
         } else {
-            do { _ = try start(in: folder, patch: .init(names: names, contentGeneration: contentGeneration)) }
+            do { _ = try start(in: folder, patch: .init(names: names, contentGeneration: contentGeneration, expectedNames: expectedNames)) }
             catch { onEvent(.failed(folder, error.localizedDescription, UUID())) }
         }
     }

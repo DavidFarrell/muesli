@@ -14,6 +14,7 @@ struct MeetingViewer: View {
     @State private var isIdentifyingSpeakers = false
     @State private var identificationProgress: SpeakerIdentifier.Progress?
     @State private var identificationError: String?
+    @State private var proposedBasis: SpeakerIdentificationBasis?
     @State private var proposedMappings: [SpeakerIdentifier.SpeakerMapping] = []
     @State private var showMappingSheet = false
     @State private var identificationTask: Task<Void, Never>?
@@ -177,7 +178,12 @@ struct MeetingViewer: View {
             SpeakerMappingSheet(
                 mappings: proposedMappings,
                 onConfirm: { mappings in
-                    model.applySpeakerMappings(mappings, for: meeting)
+                    guard let basis = proposedBasis, basis.matches(transcript) else {
+                        identificationError = "The transcript or speaker names changed. Identify speakers again before applying suggestions."
+                        showMappingSheet = false
+                        return
+                    }
+                    model.applySpeakerMappings(mappings, for: meeting, basis: basis)
                     showMappingSheet = false
                 },
                 onCancel: {
@@ -465,8 +471,8 @@ struct MeetingViewer: View {
 
         let transcript = transcriptForIdentification()
         let speakerIds = speakerIdsForIdentification()
-        let existingNames = self.transcript.speakerNames
-        let contentGeneration = self.transcript.contentGeneration
+        let basis = SpeakerIdentificationBasis(self.transcript)
+        let existingNames = basis.names
         let requestID = UUID()
         identificationGeneration = requestID
 
@@ -478,7 +484,7 @@ struct MeetingViewer: View {
                 }
                 let input = try await inputOwner.value(timeoutSeconds: 5)
                 try Task.checkCancellation()
-                guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                guard identificationGeneration == requestID, basis.matches(self.transcript) else {
                     throw TranscriptPersistenceStore.Failure.superseded
                 }
                 let identifier = SpeakerIdentifier()
@@ -492,20 +498,21 @@ struct MeetingViewer: View {
                     userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in
-                            guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else { return }
+                            guard identificationGeneration == requestID, basis.matches(self.transcript) else { return }
                             identificationProgress = progress
                         }
                     }
                 )
                 try Task.checkCancellation()
-                guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                guard identificationGeneration == requestID, basis.matches(self.transcript) else {
                     throw TranscriptPersistenceStore.Failure.superseded
                 }
                 try await MainActor.run {
-                    guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                    guard identificationGeneration == requestID, basis.matches(self.transcript) else {
                         throw TranscriptPersistenceStore.Failure.superseded
                     }
                     identificationGeneration = UUID()
+                    proposedBasis = basis
                     proposedMappings = result.mappings
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
