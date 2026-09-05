@@ -247,3 +247,25 @@ extension TranscriptPersistenceStoreTests {
         }
     }
 }
+
+extension TranscriptPersistenceStoreTests {
+    func testOlderReadSnapshotCannotPublishAfterSameViewerReplacement() async throws {
+        let (folder, _, replacement) = try fixture()
+        let model = makeModel()
+        model.resetForNewMeeting(keepSpeakerNames: false)
+        let readGeneration = model.contentGeneration
+        // Complete the old disk read, but delay its UI delivery. The save may
+        // acquire the now-free folder while this snapshot waits for MainActor.
+        let oldSnapshot = try await TranscriptPersistenceStore.shared.start(in: folder) { context in
+            (String(decoding: try context.readData(named: "transcript.jsonl"), as: UTF8.self),
+             try context.readMetadata().speakerNames)
+        }.value()
+        try await model.applyReplacement(replacement, in: folder)
+        XCTAssertFalse(model.applyLoadedTranscript(content: oldSnapshot.0, names: oldSnapshot.1, expectedGeneration: readGeneration))
+        XCTAssertEqual(model.segments.map(\.text), ["Alex", "Blair"])
+        XCTAssertTrue(model.speakerNames.isEmpty)
+        model.resetForNewMeeting(keepSpeakerNames: false)
+        XCTAssertTrue(model.applyLoadedTranscript(content: oldSnapshot.0, names: oldSnapshot.1, expectedGeneration: model.contentGeneration))
+        XCTAssertEqual(model.segments.map(\.text), ["old text"])
+    }
+}

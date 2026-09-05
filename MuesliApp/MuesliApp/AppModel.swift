@@ -3862,8 +3862,10 @@ final class AppModel: ObservableObject {
         transcriptLoadIntent = intent
         transcriptLoadError = nil
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        let contentGeneration = transcriptModel.contentGeneration
         Task { @MainActor [weak self] in
-            guard let self, self.transcriptLoadIntent == intent else { return }
+            guard let self, self.transcriptLoadIntent == intent,
+                  self.transcriptModel.contentGeneration == contentGeneration else { return }
             do {
                 let operation = try TranscriptPersistenceStore.shared.start(in: folderURL) { context in
                     let jsonl = try context.readData(named: "transcript.jsonl")
@@ -3873,10 +3875,10 @@ final class AppModel: ObservableObject {
                 let (content, names) = try await operation.value(timeoutSeconds: 5)
                 guard self.transcriptLoadIntent == intent,
                       case .viewing(let item) = self.activeScreen, item.folderURL == folderURL else { return }
-                for line in content.split(separator: "\n") { self.transcriptModel.ingest(jsonLine: String(line)) }
-                self.transcriptModel.speakerNames = names
+                self.transcriptModel.applyLoadedTranscript(content: content, names: names, expectedGeneration: contentGeneration)
             } catch {
-                guard self.transcriptLoadIntent == intent else { return }
+                guard self.transcriptLoadIntent == intent,
+                      self.transcriptModel.contentGeneration == contentGeneration else { return }
                 self.appendBackendLog("Transcript load is unresolved: \(error.localizedDescription)", toTail: true)
                 self.transcriptLoadError = "Transcript could not be loaded: \(error.localizedDescription) Reopen the meeting to retry."
             }

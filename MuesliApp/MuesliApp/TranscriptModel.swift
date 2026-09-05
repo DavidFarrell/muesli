@@ -172,6 +172,16 @@ final class TranscriptModel: ObservableObject {
         }
     }
 
+    /// A read can finish on disk before a newer replacement but reach the UI
+    /// afterward. Publishing it must not mix the old snapshot into new content.
+    @discardableResult
+    func applyLoadedTranscript(content: String, names: [String: String], expectedGeneration: UInt64) -> Bool {
+        guard contentGeneration == expectedGeneration else { return false }
+        for line in content.split(separator: "\n") { ingest(jsonLine: String(line)) }
+        speakerNames = names
+        return true
+    }
+
     func asPlainText(includePartials: Bool = false) -> String {
         Self.plainText(from: segments, names: speakerNames, includePartials: includePartials)
     }
