@@ -140,3 +140,32 @@ def test_broken_stdout_is_reported_as_failure():
     writer = StdoutWriter(BrokenOutput())
     writer.write("final")
     assert not writer.close()
+
+
+@pytest.mark.parametrize("no_live", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_failed_inference_is_nonzero_but_successful_empty_transcript_is_valid(tmp_path, monkeypatch, no_live, fail):
+    from diarise_transcribe import muesli_backend as backend
+    from types import SimpleNamespace
+    import io
+
+    make_source(tmp_path)
+    meta = json.dumps({"source_session_id": "session-a"}).encode()
+    data = backend.HDR_STRUCT.pack(backend.MSG_MEETING_START, 0, 0, len(meta)) + meta
+    data += backend.HDR_STRUCT.pack(backend.MSG_MEETING_STOP, 0, 0, 0)
+    monkeypatch.setattr(backend.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(data)))
+    def pipeline(**kwargs):
+        if fail:
+            raise RuntimeError("synthetic model unavailable")
+        return SimpleNamespace(turns=[])
+    monkeypatch.setattr(backend, "run_pipeline", pipeline)
+    monkeypatch.setattr(backend.TranscriptEmitter, "emit_transcript", lambda *a, **kw: None)
+    args = backend.create_parser().parse_args(["--output-dir", str(tmp_path), "--source-recording",
+        "--live-asr-only"] + (["--no-live"] if no_live else []))
+    output = io.StringIO()
+    writer = backend.StdoutWriter(output)
+    result = backend._run_backend(args, tmp_path, writer)
+    assert writer.close()
+    assert result == (1 if fail else 0)
+    assert (tmp_path / "mic.pcm").exists()
+    assert (tmp_path / "system.pcm").exists()

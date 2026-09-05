@@ -56,6 +56,42 @@ final class BackendStdoutDurabilityTests: XCTestCase {
         XCTAssertEqual(backend.stdoutStatus().bufferedUIBytes, 0)
     }
 
+    func testTimedOutReaderKeepsExclusiveJournalOwnershipUntilActualClose() async throws {
+        let url = try journalURL()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let old = try python("print('{\"id\":1}', flush=True)", journal: url, beforeWrite: {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+        })
+        try old.start()
+        defer { release.signal(); old.forceKill(); old.cleanup() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+        let pending = await old.finishStdout(timeoutSeconds: 0.02)
+        if case .timedOut = pending {} else { XCTFail("Expected blocked writer timeout") }
+        old.cleanup()
+        let competing = try python("print('{\"id\":2}')", journal: url)
+        XCTAssertThrowsError(try competing.start())
+        release.signal()
+        _ = await old.finishStdout(timeoutSeconds: 5)
+        let replacement = try python("print('{\"id\":3}')", journal: url)
+        try replacement.start()
+        defer { replacement.forceKill(); replacement.cleanup() }
+        assertComplete(await replacement.finishStdout(timeoutSeconds: 5))
+    }
+
+    func testReplayUsesOnlyDurablePrefixAndSurvivesTornUTF8Tail() throws {
+        let url = try journalURL()
+        let prefix = Data((0..<601).map { "{\"type\":\"segment\",\"id\":\($0)}\n" }.joined().utf8)
+        try (prefix + Data([0xE2])).write(to: url)
+        let replay = TranscriptEventJournal.replay(url: url, start: 0, byteCount: UInt64(prefix.count))
+        XCTAssertNil(replay.error)
+        XCTAssertEqual(replay.lines.count, 601)
+        let invalid = TranscriptEventJournal.replay(url: url, start: 0, byteCount: UInt64(prefix.count + 1))
+        XCTAssertEqual(invalid.lines.count, 601)
+        XCTAssertNotNil(invalid.error)
+    }
+
     func testExitDoesNotDiscardTailAndValidFinalObjectWithoutNewline() async throws {
         let url = try journalURL()
         let backend = try python("import sys\nsys.stdout.write('{\"id\":1}\\n{\"id\":2}')", journal: url)

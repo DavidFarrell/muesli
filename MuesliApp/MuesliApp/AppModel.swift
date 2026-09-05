@@ -586,21 +586,13 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
     }
 
-    private func resetTranscriptEventsLog(in folderURL: URL, append: Bool) throws {
-        let logURL = folderURL.appendingPathComponent("transcript_events.jsonl")
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            try Data().write(to: logURL, options: .withoutOverwriting)
-        }
-        let handle = try FileHandle(forWritingTo: logURL)
-        defer { try? handle.close() }
-        if append {
-            currentTranscriptEventsStartOffset = try handle.seekToEnd()
-        } else {
-            try handle.truncate(atOffset: 0)
-            currentTranscriptEventsStartOffset = 0
-        }
+    private func resetTranscriptEventsLog(in audioDirectory: URL) throws {
+        let logURL = audioDirectory.appendingPathComponent("transcript_events.jsonl")
+        // Each source session has its own journal. Never truncate or append
+        // into a prior session while its timed-out reader may still own it.
+        try Data().write(to: logURL, options: .withoutOverwriting)
+        currentTranscriptEventsStartOffset = 0
         transcriptEventsURL = logURL
-        // The BackendProcess reader exclusively owns the append handle.
     }
 
     private func loadTranscriptFromDisk(in folderURL: URL) {
@@ -1827,18 +1819,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func linesFromTranscriptEvents(
-        in folderURL: URL,
-        startingAt offset: UInt64
-    ) -> [String] {
-        let eventsURL = folderURL.appendingPathComponent("transcript_events.jsonl")
-        guard let data = try? Data(contentsOf: eventsURL) else { return [] }
-        let start = Int(min(offset, UInt64(data.count)))
-        let slice = data.subdata(in: start..<data.count)
-        guard let content = String(data: slice, encoding: .utf8) else { return [] }
-        return content.split(whereSeparator: \.isNewline).map(String.init)
-    }
-
     func exportTranscriptFiles() {
         guard let session = currentSession else {
             appendBackendLog("Export failed: no active session.", toTail: true)
@@ -2277,7 +2257,7 @@ final class AppModel: ObservableObject {
 
         do {
             resetBackendLog(in: folderURL)
-            try resetTranscriptEventsLog(in: folderURL, append: meeting != nil)
+            try resetTranscriptEventsLog(in: audioDir)
             if meeting == nil {
                 try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
             } else if let metadata {
@@ -2469,6 +2449,7 @@ final class AppModel: ObservableObject {
             eventJournalURL: transcriptEventsURL
         )
         let sessionFolderURL = folderURL
+        let sessionEventsURL = transcriptEventsURL
         let sessionLogHandle = backendLogHandle
         appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
         appendBackendLog("PATH: \(mergedPath)", toTail: true)
@@ -2477,6 +2458,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
                 if isActiveSession && !self.isFinalizing {
                     self.reportInferenceFailure("The transcription process exited (status \(status)).")
                 }
@@ -2491,6 +2473,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
                 self.appendBackendLog(
                     "[stderr] \(line)",
                     toTail: isActiveSession,
@@ -2505,6 +2488,7 @@ final class AppModel: ObservableObject {
             for await line in backend.stdoutLines {
                 guard !Task.isCancelled else { break }
                 let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
                 self.handleBackendJSONLine(
                     line,
                     backendLogHandle: sessionLogHandle,
@@ -2516,7 +2500,8 @@ final class AppModel: ObservableObject {
         let createdWriter = FramedWriter(stdinHandle: backend.stdin)
         createdWriter.onWriteError = { [weak self] error in
             Task { @MainActor in
-                self?.handleBackendWriteError(error)
+                guard let self, self.transcriptEventsURL == sessionEventsURL else { return }
+                self.handleBackendWriteError(error)
             }
         }
         self.writer = createdWriter
@@ -2566,6 +2551,7 @@ final class AppModel: ObservableObject {
         micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
+        let hadSourceRecorder = sourceRecorder != nil
         let sourceResult = await sourceRecorder?.finish()
         sourceRecorder = nil
         sourceTimeline = nil
@@ -2608,7 +2594,7 @@ final class AppModel: ObservableObject {
         closeTranscriptEventsLog()
         stopBackendAccess()
 
-        if let sourceResult {
+        if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
             finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult, incomplete: true)
@@ -2734,6 +2720,7 @@ final class AppModel: ObservableObject {
         let stoppingBackendLogHandle = backendLogHandle
         let stoppingBackendAccessURL = backendAccessURL
         let stoppingTranscriptEventsStartOffset = currentTranscriptEventsStartOffset
+        let stoppingTranscriptEventsURL = transcriptEventsURL
         let stoppingTranscriptSegments = transcriptModel.segments.filter { !$0.isPartial }
         let stoppingSpeakerNames = transcriptModel.speakerNames
         let stoppingTimestampOffset = transcriptModel.timestampOffset
@@ -2769,6 +2756,7 @@ final class AppModel: ObservableObject {
                 backendLogHandle: stoppingBackendLogHandle,
                 backendAccessURL: stoppingBackendAccessURL,
                 transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
+                transcriptEventsURL: stoppingTranscriptEventsURL,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
                 speakerNamesSnapshot: stoppingSpeakerNames,
                 timestampOffsetSnapshot: stoppingTimestampOffset,
@@ -2786,6 +2774,7 @@ final class AppModel: ObservableObject {
         backendLogHandle: FileHandle?,
         backendAccessURL: URL?,
         transcriptEventsStartOffset: UInt64,
+        transcriptEventsURL: URL?,
         transcriptSegmentsSnapshot: [TranscriptSegment],
         speakerNamesSnapshot: [String: String],
         timestampOffsetSnapshot: Double,
@@ -2877,9 +2866,15 @@ final class AppModel: ObservableObject {
         model.timestampOffset = timestampOffsetSnapshot
         model.segments = transcriptSegmentsSnapshot
         model.speakerNames = speakerNamesSnapshot
-        for line in linesFromTranscriptEvents(in: session.folderURL, startingAt: transcriptEventsStartOffset) {
-            model.ingest(jsonLine: line)
+        let replay: TranscriptEventJournal.Replay
+        if let url = transcriptEventsURL, let status = journalDrain?.status {
+            replay = TranscriptEventJournal.replay(url: url, start: status.journalStartOffset,
+                                                   byteCount: status.durableBytes)
+        } else {
+            replay = TranscriptEventJournal.Replay(error: "No authoritative transcript journal was available.")
         }
+        for line in replay.lines { model.ingest(jsonLine: line) }
+        if let error = replay.error { appendBackendLog(error, toTail: false, handle: backendLogHandle) }
 
         let finalizedSegments = model.segments.filter { !$0.isPartial }
         saveTranscriptFiles(
@@ -2891,7 +2886,7 @@ final class AppModel: ObservableObject {
         )
         finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments,
                                 sourceManifest: sourceManifest,
-                                incomplete: inferenceFailed || exitStatus != 0 || !journalComplete)
+                                incomplete: inferenceFailed || exitStatus != 0 || !journalComplete || replay.error != nil)
         if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
            let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
             meetingHistory[idx] = updatedItem
@@ -3601,9 +3596,12 @@ final class AppModel: ObservableObject {
 
     private func prepareResumeSession(for meeting: MeetingHistoryItem) throws -> (metadata: MeetingMetadata, sessionID: Int, audioFolderURL: URL) {
         let metadata = try readMeetingMetadata(from: meeting.folderURL)
-        let nextSessionID = (metadata.sessions.map(\.sessionID).max() ?? 0) + 1
-        let folderName = "audio-session-\(nextSessionID)"
-        let audioURL = meeting.folderURL.appendingPathComponent(folderName, isDirectory: true)
+        var nextSessionID = (metadata.sessions.map(\.sessionID).max() ?? 0) + 1
+        var audioURL = meeting.folderURL.appendingPathComponent("audio-session-\(nextSessionID)", isDirectory: true)
+        while FileManager.default.fileExists(atPath: audioURL.path) {
+            nextSessionID += 1
+            audioURL = meeting.folderURL.appendingPathComponent("audio-session-\(nextSessionID)", isDirectory: true)
+        }
         try FileManager.default.createDirectory(at: audioURL, withIntermediateDirectories: true)
         return (metadata, nextSessionID, audioURL)
     }

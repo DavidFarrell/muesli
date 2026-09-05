@@ -561,6 +561,7 @@ class LiveProcessor:
         self._event = threading.Event()
         self._stop_event = threading.Event()
         self._finalize_requested = False
+        self.finalization_succeeded = False
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -571,11 +572,12 @@ class LiveProcessor:
         if duration >= self._live_min_seconds and (duration - self._last_processed_duration) >= self._live_interval:
             self._event.set()
 
-    def stop(self, finalize: bool) -> None:
+    def stop(self, finalize: bool) -> bool:
         self._finalize_requested = finalize
         self._stop_event.set()
         self._event.set()
         self._thread.join()
+        return self.finalization_succeeded
 
     def _snapshot(self) -> Optional[StreamSnapshot]:
         if self._state.source_directory is not None:
@@ -598,13 +600,19 @@ class LiveProcessor:
         return snapshot_stream(writer, sample_rate, channels)
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._event.wait(timeout=0.5)
-            self._event.clear()
-            if self._maybe_process(finalize=False):
-                continue
-        if self._finalize_requested:
-            self._maybe_process(finalize=True)
+        try:
+            while not self._stop_event.is_set():
+                self._event.wait(timeout=0.5)
+                self._event.clear()
+                self._maybe_process(finalize=False)
+            if self._finalize_requested:
+                self.finalization_succeeded = self._maybe_process(finalize=True)
+        except Exception as exc:
+            # Includes snapshot/chunk/emitter failures that would otherwise
+            # kill only this daemon thread and leave process exit falsely clean.
+            self.finalization_succeeded = False
+            emit_jsonl({"type": "error", "stream": self._stream_name,
+                        "message": f"processing_thread_failed: {exc}"}, self._state.stdout_writer)
 
     def _maybe_process(self, finalize: bool) -> bool:
         try:
@@ -618,8 +626,10 @@ class LiveProcessor:
                 self._last_snapshot_error = message
             return False
         self._last_snapshot_error = None
-        if not snapshot or snapshot.size_bytes <= 0:
+        if not snapshot:
             return False
+        if snapshot.size_bytes == 0:
+            return finalize  # Empty source is distinct from failed inference.
 
         bytes_per_sec = snapshot.sample_rate * snapshot.channels * BYTES_PER_SAMPLE
         if bytes_per_sec <= 0:
@@ -968,9 +978,10 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
             emit_jsonl({"type": "status", "message": "meeting_stopped"}, stdout_writer)
             break
 
+    processing_complete = True
     if not args.no_live:
         for live_processor in live_processors.values():
-            live_processor.stop(finalize=True)
+            processing_complete = live_processor.stop(finalize=True) and processing_complete
 
     with state.lock:
         system_writer = state.system_writer
@@ -994,8 +1005,8 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
         writer = writers.get(stream_name)
         if not writer or writer.bytes_written == 0:
             emit_jsonl({
-                "type": "error",
-                "message": f"no_audio_for_stream_{stream_name}",
+                "type": "status",
+                "message": f"empty_source_{stream_name}",
             }, stdout_writer)
             continue
         had_audio = True
@@ -1018,6 +1029,7 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
             temp_wav = write_wav_from_pcm(snapshot, output_dir)
             if not temp_wav:
                 emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_writer)
+                processing_complete = False
                 continue
 
             try:
@@ -1036,6 +1048,7 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                     )
             except Exception as exc:
                 emit_jsonl({"type": "error", "message": str(exc)}, stdout_writer)
+                processing_complete = False
                 continue
             finally:
                 temp_wav.unlink(missing_ok=True)
@@ -1056,19 +1069,20 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                 live_asr_only=args.live_asr_only,
             )
 
-    if not args.keep_wav and not args.source_recording:
+    if processing_complete and not args.keep_wav and not args.source_recording:
         if system_writer:
             system_writer.path.unlink(missing_ok=True)
         if mic_writer:
             mic_writer.path.unlink(missing_ok=True)
 
-    if not args.keep_pcm and not args.source_recording:
+    if processing_complete and not args.keep_pcm and not args.source_recording:
         if system_writer:
             system_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
         if mic_writer:
             mic_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
 
-    return 0
+    emit_jsonl({"type": "status", "message": "inference_completed" if processing_complete else "inference_incomplete"}, stdout_writer)
+    return 0 if processing_complete else 1
 
 
 if __name__ == "__main__":

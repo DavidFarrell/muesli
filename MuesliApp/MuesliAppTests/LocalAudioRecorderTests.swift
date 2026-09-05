@@ -100,6 +100,8 @@ final class LocalAudioRecorderTests: XCTestCase {
         recorder.record(source: .mic, ptsUs: 200_000, payload: samples(1600))
         recorder.record(source: .mic, ptsUs: 250_000, payload: samples(1600))
         let result = try await finish(recorder)
+        XCTAssertFalse(result.completed)
+        XCTAssertNotNil(result.last_problem)
         XCTAssertEqual(result.streams["mic"]?.gap_frames, 1600)
         XCTAssertEqual(result.streams["mic"]?.overlap_frames, 800)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 11_200)
@@ -185,7 +187,50 @@ final class LocalAudioRecorderTests: XCTestCase {
         release.signal()
         let later = await recorder.finish(timeoutSeconds: 5)
         XCTAssertNotNil(later)
-        XCTAssertFalse(later?.completed ?? true, "The failed close deadline remains part of the outcome")
+        XCTAssertTrue(later?.completed ?? false, "A later verified close may be clean; the deadline described only the earlier wait")
+    }
+
+    func testDeadlineDuringFinalManifestDoesNotPretendOwnerHasClosed() async throws {
+        let url = try folder()
+        let counter = RecorderTestCounter()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let recorder = try LocalAudioRecorder(directory: url, commitInterval: 60, beforeIO: { checkpoint in
+            if case .manifest = checkpoint, counter.next() == 2 {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 3)
+            }
+        })
+        recorder.record(source: .mic, ptsUs: 0, payload: samples(160))
+        let closing = Task.detached { await recorder.finish(timeoutSeconds: 0.1) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let initial = await closing.value
+        XCTAssertNil(initial)
+        XCTAssertFalse(try LocalAudioRecorder.readManifest(directory: url).completed)
+        release.signal()
+        let eventual = try await finish(recorder)
+        XCTAssertTrue(eventual.completed)
+        XCTAssertTrue(try LocalAudioRecorder.readManifest(directory: url).completed)
+        XCTAssertNil(recorder.status().error)
+    }
+
+    func testInitialSourceAlignmentIsDistinctFromMidstreamLoss() async throws {
+        let recorder = try LocalAudioRecorder(directory: folder())
+        recorder.record(source: .mic, ptsUs: 1_000_000, payload: samples(160))
+        recorder.record(source: .mic, ptsUs: 1_010_000, payload: samples(160))
+        let result = try await finish(recorder)
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.losses.first?.reason, "initial_source_alignment")
+    }
+
+    func testTerminalConversionFailureDegradesWithoutAnyLaterBuffer() async throws {
+        let recorder = try LocalAudioRecorder(directory: folder())
+        recorder.record(source: .mic, ptsUs: 0, payload: samples(160))
+        recorder.reportFailure(stream: .mic, message: "final buffer conversion failed")
+        let result = try await finish(recorder)
+        XCTAssertFalse(result.completed)
+        XCTAssertEqual(result.streams["mic"]?.committed_bytes, 320)
+        XCTAssertEqual(result.losses.last?.reason, "source_failure_unknown_range")
     }
 
     func testWAVFailurePreservesPCMAndMarksCompatibilityIncomplete() async throws {
@@ -227,4 +272,10 @@ final class LocalAudioRecorderTests: XCTestCase {
         XCTAssertThrowsError(try LocalAudioRecorder(directory: url))
         XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("mic.pcm")).count, 320)
     }
+}
+
+nonisolated private final class RecorderTestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func next() -> Int { lock.withLock { count += 1; return count } }
 }

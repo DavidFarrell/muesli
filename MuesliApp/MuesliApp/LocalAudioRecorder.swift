@@ -104,6 +104,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var drainScheduled = false
     private var accepting = true
     private var closeRequested = false
+    private var closeWaitExpired = false
     private var rejectedFrames: [Source: Int64] = [:]
     private var latestError: String?
     private var committedBytes: Int64 = 0
@@ -204,6 +205,16 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         noteLoss(source: stream == .mic ? .mic : .system, ptsUs: ptsUs, frames: frames, reason: reason)
     }
 
+    func reportFailure(stream: StreamID, message: String) {
+        let source: Source = stream == .mic ? .mic : .system
+        lock.withLock {
+            latestError = source.rawValue + " capture failed: " + String(message.prefix(256))
+            Self.addLoss(Loss(source: source.rawValue, reason: "source_failure_unknown_range",
+                              start_frame: nil, end_frame: nil, frames: 0),
+                         to: &rejectedLosses, omitted: &omittedLosses)
+        }
+    }
+
     /// Upstream bounded ingress reports rejected converted samples here.
     /// No payload is retained and the same queue commits this loss ledger.
     func noteLoss(source: Source, ptsUs: Int64, frames: Int64, reason: String) {
@@ -228,7 +239,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         return Status(accepting: accepting, queuedBytes: pendingBytes,
                       committedBytes: committedBytes,
                       rejectedFrames: rejectedFrames.values.reduce(0, +),
-                      error: latestError ?? (stalledFor > 5 ? "Source audio has not made commit progress for over five seconds." : nil),
+                      error: latestError ?? (closeWaitExpired && closedManifest == nil ? "Source close is still pending; its committed prefix remains recoverable." : nil) ?? (stalledFor > 5 ? "Source audio has not made commit progress for over five seconds." : nil),
                       secondsSinceCommit: max(0, now - lastCommitUptime),
                       uncommittedPackets: uncommitted, secondsWithoutCommitProgress: stalledFor)
     }
@@ -247,7 +258,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         if schedule { queue.async { [self] in closeOnQueue() } }
         let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
         guard outcome == .completed else {
-            lock.withLock { latestError = "Source recording close did not complete; the committed prefix remains recoverable." }
+            lock.withLock { closeWaitExpired = true }
             return nil
         }
         return lock.withLock { closedManifest }
@@ -309,7 +320,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             // allocate silence proportional to an arbitrary timestamp jump.
             try handle.seek(toOffset: UInt64(start * 2))
             state.gap_frames += start - position
-            loss = Loss(source: packet.source.rawValue, reason: "source_timestamp_gap",
+            loss = Loss(source: packet.source.rawValue, reason: position == 0 ? "initial_source_alignment" : "source_timestamp_gap",
                         start_frame: position, end_frame: start, frames: start - position)
             writeAt = start
         } else if start < position {
@@ -325,7 +336,15 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             positions[packet.source] = writeAt + Int64(data.count / 2)
             state.captured_frames += Int64(data.count / 2)
         }
-        if let loss { appendManifestLoss(loss) }
+        if let loss {
+            appendManifestLoss(loss)
+            if loss.reason != "initial_source_alignment" {
+                let message = "Source audio has a timestamp discontinuity (" + loss.reason + ")."
+                manifest.problem_count += 1
+                manifest.last_problem = message
+                lock.withLock { latestError = message }
+            }
+        }
         manifest.streams[packet.source.rawValue] = state
         dirty = true
     }

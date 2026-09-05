@@ -178,6 +178,12 @@ nonisolated final class BackendOutputReader: @unchecked Sendable {
                     guard fd >= 0 else { throw posixError() }
                     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
                     journal = handle
+                    // A deadline does not release ownership. The advisory
+                    // lock follows this open file description until the real
+                    // cancel handler closes it, including hard-link aliases.
+                    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+                        throw failure("Another reader still owns this event journal.")
+                    }
                     let offset = try handle.seekToEnd()
                     if offset > 0 {
                         try handle.seek(toOffset: offset - 1)

@@ -34,6 +34,7 @@
 				BackendStartupGate.swift,
 				DurationFormatting.swift,
 				LocalAudioRecorder.swift,
+				TranscriptEventJournal.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,
 				MainActorStarvationWatchdog.swift,
