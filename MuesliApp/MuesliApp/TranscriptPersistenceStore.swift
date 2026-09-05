@@ -89,7 +89,7 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
         }
     }
     private static let registry = Registry()
-    private static let allowed = Set(["transcript.txt", "transcript.jsonl", "meeting.json", "transcript_sources.json"])
+    private static let allowed = Set(["transcript.txt", "transcript.jsonl", "meeting.json", "transcript_sources.json", "attachments.json"])
     private let fault: @Sendable (Step) throws -> Void
 
     init(fault: @escaping @Sendable (Step) throws -> Void = { _ in }) {

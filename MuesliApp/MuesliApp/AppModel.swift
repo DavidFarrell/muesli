@@ -181,6 +181,10 @@ final class AppModel: ObservableObject {
 
     let transcriptModel = TranscriptModel()
     @Published var currentAttachments: [Attachment] = []
+    @Published private var attachmentNotices: [String: String] = [:]
+    private var attachmentNoticeOwners: [String: UUID] = [:]
+    private var attachmentEditID: UUID?
+    var attachmentNotice: String? { currentSession.flatMap { attachmentNotices[$0.folderURL.path] } }
 
     private let captureEngine = CaptureEngine()
     // `any MicCapturing` rather than `MicEngine?`: this can hold either the
@@ -344,7 +348,7 @@ final class AppModel: ObservableObject {
     @Published private var catalogNotice: String?
     private var pendingDeletes: [String: UUID] = [:]
     var metadataEditNotice: String? {
-        let notices = metadataEditNotices.keys.sorted().compactMap { metadataEditNotices[$0] } + [catalogNotice].compactMap { $0 }
+        let notices = metadataEditNotices.keys.sorted().compactMap { metadataEditNotices[$0] } + attachmentNotices.keys.sorted().compactMap { attachmentNotices[$0] } + [catalogNotice].compactMap { $0 }
         return notices.isEmpty ? nil : notices.joined(separator: "\n")
     }
     private lazy var metadataEdits = MeetingMetadataEdits { [weak self] event in
@@ -3120,136 +3124,92 @@ final class AppModel: ObservableObject {
 
     // MARK: - Attachments
 
-    private func attachmentsFolderURL(for session: MeetingSession) -> URL {
-        session.folderURL.appendingPathComponent("attachments", isDirectory: true)
-    }
-
-    private func attachmentsManifestURL(for session: MeetingSession) -> URL {
-        session.folderURL.appendingPathComponent("attachments.json")
-    }
-
-    private func meetingElapsedSeconds() -> Double {
-        guard let session = currentSession else { return 0 }
-        return Date().timeIntervalSince(session.startedAt)
-    }
-
-    private func formatTimestampFilename(_ seconds: Double, extension ext: String) -> String {
-        // Format: t+0000005.123.png (7 digits for seconds, 3 for milliseconds)
-        let wholeSec = Int(seconds)
-        let millis = Int((seconds - Double(wholeSec)) * 1000)
-        return String(format: "t+%07d.%03d.%@", wholeSec, millis, ext)
-    }
-
-    func saveImageAttachment(_ image: NSImage) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        do {
-            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
-        } catch {
-            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
-            return
-        }
-
-        let elapsed = meetingElapsedSeconds()
-        let filename = formatTimestampFilename(elapsed, extension: "png")
-        let fileURL = attachmentsDir.appendingPathComponent(filename)
-
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            appendBackendLog("Failed to convert image to PNG", toTail: true)
-            return
-        }
-
-        do {
-            try pngData.write(to: fileURL)
-            let attachment = Attachment(type: .image, timestamp: elapsed, filename: filename)
-            currentAttachments.append(attachment)
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Saved image attachment: \(filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to save image attachment: \(error.localizedDescription)", toTail: true)
-        }
+    func saveImageAttachment(_ encodedImage: Data) {
+        let input = AttachmentPersistence.ImageInput(data: encodedImage)
+        saveAttachment(type: .image) { try input.png() }
     }
 
     func saveTextAttachment(_ text: String) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        do {
-            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
-        } catch {
-            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
+        guard text.utf8.count <= AttachmentPersistence.maximumTextBytes else {
+            if let folder = currentSession?.folderURL {
+                setAttachmentNotice("The text exceeds the 1 MB attachment limit. Nothing was saved.", folder: folder, id: UUID())
+            }
             return
         }
+        saveAttachment(type: .text) { Data(text.utf8) }
+    }
 
-        let elapsed = meetingElapsedSeconds()
-        let filename = formatTimestampFilename(elapsed, extension: "txt")
-        let fileURL = attachmentsDir.appendingPathComponent(filename)
-
-        do {
-            try text.write(to: fileURL, atomically: true, encoding: .utf8)
-            let attachment = Attachment(type: .text, timestamp: elapsed, filename: filename)
-            currentAttachments.append(attachment)
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Saved text attachment: \(filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to save text attachment: \(error.localizedDescription)", toTail: true)
+    private func saveAttachment(type: AttachmentType, data: @escaping @Sendable () throws -> Data) {
+        guard isCapturing, !isFinalizing, let timeline = sourceTimeline,
+              let sourceID = diagnosticSourceID, let session = currentSession else { return }
+        let timestamp = transcriptModel.timestampOffset
+            + Double(max(0, timeline.relativeMicroseconds(CaptureTimeline.hostNowMicroseconds()))) / 1_000_000
+        performAttachmentEdit(folder: session.folderURL, sourceID: sourceID) { context in
+            try AttachmentPersistence.add(context: context, type: type, timestamp: timestamp,
+                                          sourceID: sourceID, data: data())
         }
     }
 
     func deleteAttachment(_ attachment: Attachment) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        let fileURL = attachmentsDir.appendingPathComponent(attachment.filename)
-
-        do {
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
-            }
-            currentAttachments.removeAll { $0.id == attachment.id }
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Deleted attachment: \(attachment.filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to delete attachment: \(error.localizedDescription)", toTail: true)
+        guard isCapturing, !isFinalizing, let session = currentSession,
+              let sourceID = diagnosticSourceID else { return }
+        performAttachmentEdit(folder: session.folderURL, sourceID: sourceID) { context in
+            try AttachmentPersistence.remove(context: context, id: attachment.id)
         }
     }
 
     func attachmentFileURL(for attachment: Attachment) -> URL? {
-        guard let session = currentSession else { return nil }
-        return attachmentsFolderURL(for: session).appendingPathComponent(attachment.filename)
+        guard let session = currentSession, AttachmentPersistence.validFilename(attachment.filename),
+              currentAttachments.contains(where: { $0.id == attachment.id && $0.filename == attachment.filename }) else { return nil }
+        return session.folderURL.appendingPathComponent("attachments").appendingPathComponent(attachment.filename)
     }
 
-    private func saveAttachmentsManifest(for session: MeetingSession) {
-        let manifest = AttachmentsManifest(attachments: currentAttachments)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
+    private func performAttachmentEdit(folder: URL, sourceID: String,
+        operation: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> AttachmentPersistence.Snapshot) {
+        let id = UUID()
+        guard attachmentEditID == nil else {
+            setAttachmentNotice("This attachment change was not accepted while another save was pending. Try again after it finishes.", folder: folder, id: id)
+            return
+        }
         do {
-            let data = try encoder.encode(manifest)
-            try data.write(to: attachmentsManifestURL(for: session), options: [.atomic])
+            let owner = try TranscriptPersistenceStore.shared.start(in: folder, onCompletion: { [weak self] result in
+                Task { @MainActor [weak self] in
+                    guard let self, self.attachmentEditID == id else { return }
+                    self.attachmentEditID = nil
+                    switch result {
+                    case .success(let snapshot):
+                        if self.currentSession?.folderURL == folder, self.diagnosticSourceID == sourceID {
+                            self.currentAttachments = snapshot.attachments
+                        }
+                        if self.attachmentNoticeOwners[folder.path] == id {
+                            self.setAttachmentNotice(snapshot.cleanupNotice, folder: folder, id: id)
+                        }
+                    case .failure(let error):
+                        if self.attachmentNoticeOwners[folder.path] == id {
+                            self.setAttachmentNotice("Attachment change was not saved: \(error.localizedDescription)", folder: folder, id: id)
+                        }
+                    }
+                }
+            }, operation: operation)
+            attachmentEditID = id
+            setAttachmentNotice("Saving attachment…", folder: folder, id: id)
+            Task { @MainActor [weak self] in
+                let result = await owner.wait(timeoutSeconds: 5)
+                guard let self, self.attachmentEditID == id, self.attachmentNoticeOwners[folder.path] == id else { return }
+                switch result {
+                case .timedOut, .cancelled:
+                    self.setAttachmentNotice("The attachment save is still pending. Its original disk operation remains active.", folder: folder, id: id)
+                case .completed, .failed: break // The original callback publishes the actual result.
+                }
+            }
         } catch {
-            appendBackendLog("Failed to save attachments manifest: \(error.localizedDescription)", toTail: true)
+            setAttachmentNotice("Attachment change was not accepted: \(error.localizedDescription)", folder: folder, id: id)
         }
     }
 
-    private func loadAttachments(from folderURL: URL) {
-        currentAttachments = []
-        let manifestURL = folderURL.appendingPathComponent("attachments.json")
-        guard FileManager.default.fileExists(atPath: manifestURL.path) else { return }
-
-        do {
-            let data = try Data(contentsOf: manifestURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let manifest = try decoder.decode(AttachmentsManifest.self, from: data)
-            currentAttachments = manifest.attachments
-        } catch {
-            appendBackendLog("Failed to load attachments manifest: \(error.localizedDescription)", toTail: true)
-        }
+    private func setAttachmentNotice(_ message: String?, folder: URL, id: UUID) {
+        attachmentNotices[folder.path] = message
+        attachmentNoticeOwners[folder.path] = message == nil ? nil : id
     }
 
     private func clearAttachments() {
