@@ -114,6 +114,11 @@ final class AppModel: ObservableObject {
     @Published var showPermissionsSheet = false
     @Published var isCapturing = false
     @Published var isFinalizing = false
+    private var meetingSavePublication = MeetingSavePublicationGate()
+    @Published private var meetingSaveNotices: [String: String] = [:]
+    var meetingSaveNotice: String? {
+        meetingSaveNotices.isEmpty ? nil : meetingSaveNotices.keys.sorted().compactMap { meetingSaveNotices[$0] }.joined(separator: "\n")
+    }
     @Published var captureMode: CaptureMode = .video
     @Published var sourceKind: SourceKind = .display
     @Published var transcribeSystem = true
@@ -277,7 +282,10 @@ final class AppModel: ObservableObject {
     private var backend: BackendProcess?
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
+    private let meetingStartPreparation = MeetingStartPreparationOwner()
     private var sourceTimeline: CaptureTimeline?
+    private var sessionArtifactStore: SessionArtifactStore?
+    private var isPreparingResume = false
     private var inferenceFailure: String?
     // Backend-readiness handshake state (2026-07-16 RCA rec #3 - backend
     // wedged pre-read-loop, meeting presented as recording, 26 minutes lost).
@@ -1805,23 +1813,13 @@ final class AppModel: ObservableObject {
     }
 
     private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
-        segments
-            .filter { !$0.isPartial }
-            .compactMap { seg -> String? in
-                let payload: [String: Any] = [
-                    "speaker_id": seg.speakerID,
-                    "stream": seg.stream,
-                    "t0": seg.t0,
-                    "t1": seg.t1 ?? seg.t0,
-                    "text": seg.text
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: payload),
-                   let line = String(data: data, encoding: .utf8) {
-                    return line
-                }
-                return nil
-            }
-            .joined(separator: "\n")
+        // Legacy export wrapper. Authoritative saves use the throwing encoder
+        // through TranscriptReplacement and TranscriptPersistenceStore.
+        do { return try TranscriptModel.jsonLines(from: segments) }
+        catch {
+            appendBackendLog("Failed to encode transcript JSONL: \(error.localizedDescription)", toTail: true)
+            return ""
+        }
     }
 
     private func writeTranscriptData(
@@ -1841,63 +1839,6 @@ final class AppModel: ObservableObject {
         } catch {
             appendBackendLog(
                 "\(writeFailure): \(error.localizedDescription)",
-                toTail: logToTail,
-                handle: logHandle
-            )
-        }
-    }
-
-    private func saveTranscriptFiles(
-        for session: MeetingSession,
-        segments: [TranscriptSegment],
-        text: String,
-        logToTail: Bool = true,
-        logHandle: FileHandle? = nil
-    ) {
-        let jsonlURL = session.folderURL.appendingPathComponent("transcript.jsonl")
-        let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
-
-        let jsonlString = buildTranscriptJSONL(from: segments)
-        let textString = text
-
-        let jsonlData = jsonlString.data(using: .utf8)
-        let textData = textString.data(using: .utf8)
-
-        writeTranscriptData(
-            jsonlData,
-            to: jsonlURL,
-            encodeFailure: "Failed to encode transcript JSONL.",
-            writeFailure: "Failed to save transcript JSONL",
-            logToTail: logToTail,
-            logHandle: logHandle
-        )
-        writeTranscriptData(
-            textData,
-            to: txtURL,
-            encodeFailure: "Failed to encode transcript text.",
-            writeFailure: "Failed to save transcript text",
-            logToTail: logToTail,
-            logHandle: logHandle
-        )
-
-        let tempBase = FileManager.default.temporaryDirectory
-            .appendingPathComponent(TempTranscriptCleanup.stagingDirectoryName, isDirectory: true)
-        let tempFolder = tempBase.appendingPathComponent("\(session.title)-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
-            if let jsonlData {
-                try jsonlData.write(to: tempFolder.appendingPathComponent("transcript.jsonl"))
-            }
-            if let textData {
-                try textData.write(to: tempFolder.appendingPathComponent("transcript.txt"))
-            }
-            if logToTail {
-                tempTranscriptFolderPath = tempFolder.path
-            }
-            appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: logToTail, handle: logHandle)
-        } catch {
-            appendBackendLog(
-                "Failed to save transcript temp copy: \(error.localizedDescription)",
                 toTail: logToTail,
                 handle: logHandle
             )
@@ -2210,18 +2151,18 @@ final class AppModel: ObservableObject {
 
     func startMeeting() async {
         guard !isStartingMeeting else { return }
-        await startMeeting(resuming: nil, metadata: nil, timestampOffset: 0)
+        await startMeeting(resuming: nil)
         if !isCapturing, case .start = activeScreen {
             await startHomeLevelPreview()
         }
     }
 
-    private func startMeeting(
-        resuming meeting: MeetingHistoryItem?,
-        metadata: MeetingMetadata?,
-        timestampOffset: Double
-    ) async {
+    private func startMeeting(resuming meeting: MeetingHistoryItem?) async {
         guard !isStartingMeeting else { return }
+        guard !meetingStartPreparation.isBusy else {
+            shareableContentError = "The previous start is still preparing or closing its files. Try again after that operation returns."
+            return
+        }
         // The choke point for BOTH the fresh-start (public startMeeting()) and
         // resume (resumeMeeting -> here directly) paths. stopMeeting() clears
         // isCapturing and flips activeScreen back to .start well before its
@@ -2240,7 +2181,6 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
-        refreshMeetingTitleForDateRollover()
         refreshPermissions()
         loadInputDevices()
         backendFolderError = nil
@@ -2303,78 +2243,80 @@ final class AppModel: ObservableObject {
             }
         }
 
-        var title = normaliseMeetingTitle(meetingTitle)
-        let folderURL: URL
-        let audioDir: URL
-        var sessionID = 1
-        if let meeting {
-            do {
-                let prepared = try prepareResumeSession(for: meeting)
-                folderURL = meeting.folderURL
-                audioDir = prepared.audioFolderURL
-                sessionID = prepared.sessionID
-            } catch {
-                shareableContentError = "Failed to prepare resume session: \(error)"
-                return
-            }
-        } else {
-            if let autoTitle = autoNumberedMeetingTitle(from: meetingTitle) {
-                meetingTitle = autoTitle
-                title = normaliseMeetingTitle(autoTitle)
-            }
-            do {
-                folderURL = try createMeetingFolder(title: title)
-                audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
-                try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
-            } catch {
-                shareableContentError = "Failed to create meeting folder: \(error)"
-                return
-            }
+        let request = MeetingStartPreparationOwner.Request(
+            title: normaliseMeetingTitle(meetingTitle),
+            automaticDatePrefix: parseAutoMeetingTitle(meetingTitle) == nil ? nil : Self.meetingDatePrefix(for: Date()),
+            resumeFolder: meeting?.folderURL,
+            video: captureMode == .video)
+        let prepared: MeetingStartPreparationOwner.Prepared
+        switch await meetingStartPreparation.prepare(request, timeoutSeconds: 8) {
+        case .ready(let value): prepared = value
+        case .failed(let message):
+            shareableContentError = "Could not prepare meeting files: \(message)"
+            return
+        case .timedOut:
+            shareableContentError = "Preparing meeting files took too long. The original operation still owns its files; another start will wait for its cleanup."
+            return
+        case .cancelled:
+            shareableContentError = "Meeting start was cancelled. Its file preparation will close before another start is allowed."
+            return
+        case .busy:
+            shareableContentError = "The previous meeting preparation is still closing its files."
+            return
         }
-
-        let session = MeetingSession(title: title, folderURL: folderURL, startedAt: Date())
+        let title = prepared.title
+        let folderURL = prepared.folderURL
+        let audioDir = prepared.audioDirectory
+        let metadata = prepared.priorMetadata
+        let timestampOffset = prepared.timestampOffset
+        let sourceID = prepared.sourceID
+        let recorder = prepared.recorder
+        let captureTimeline = prepared.timeline
+        let session = MeetingSession(title: title, folderURL: folderURL, startedAt: prepared.startedAt)
+        meetingTitle = title
         currentSession = session
+        sourceRecorder = recorder
+        sessionArtifactStore = prepared.artifacts
+        sourceTimeline = captureTimeline
+        inferenceFailure = nil
+        backendLogURL = prepared.logURL
+        backendLogHandle = prepared.logHandle
+        backendLogWriter.reset(handle: prepared.logHandle)
+        transcriptEventsURL = prepared.eventsURL
+        currentTranscriptEventsStartOffset = 0
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        if let metadata {
-            transcriptModel.speakerNames = metadata.speakerNames
+        transcriptModel.speakerNames = metadata?.speakerNames ?? [:]
+        if let data = prepared.transcriptData, let content = String(data: data, encoding: .utf8) {
+            for line in content.split(whereSeparator: \.isNewline) {
+                transcriptModel.ingest(jsonLine: String(line))
+            }
         }
-        if meeting != nil {
-            loadTranscriptFromDisk(in: folderURL)
-            loadAttachments(from: folderURL)
-        } else {
-            clearAttachments()
+        clearAttachments()
+        if let data = prepared.attachmentsData {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            do { currentAttachments = try decoder.decode(AttachmentsManifest.self, from: data).attachments }
+            catch { appendBackendLog("Failed to decode saved attachments: \(error.localizedDescription)", toTail: true) }
         }
-        if timestampOffset > 0 {
-            transcriptModel.timestampOffset = timestampOffset
-        }
+        transcriptModel.timestampOffset = timestampOffset
 
         do {
-            resetBackendLog(in: folderURL)
-            try resetTranscriptEventsLog(in: audioDir)
-            if meeting == nil {
-                try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
-            } else if let metadata {
-                try appendResumeSessionMetadata(metadata, for: session, sessionID: sessionID, audioFolderName: audioDir.lastPathComponent)
-            }
-
-            let sourceID = UUID().uuidString
-            guard timestampOffset.isFinite, timestampOffset >= 0, timestampOffset < 1_000_000_000 else {
-                throw LocalAudioRecorder.RecorderError.invalidManifest
-            }
-            let offsetUs = Int64(timestampOffset * 1_000_000)
-            let recorder = try await Task.detached {
-                try LocalAudioRecorder(directory: audioDir, sessionID: sourceID, timelineOffsetUs: offsetUs)
-            }.value
-            sourceRecorder = recorder
-            inferenceFailure = nil
+            try Task.checkCancellation()
             let recordURL: URL?
-            if captureMode == .video {
-                recordURL = folderURL.appendingPathComponent("recording.mp4")
+            if let artifacts = prepared.artifacts {
+                captureEngine.recoveryRecordingURLProvider = { [artifacts] in artifacts.nextVideoURL() }
+                captureEngine.onRecordingOutputCreated = { [artifacts] in artifacts.retainRecording($0) }
+                guard let url = artifacts.nextVideoURL() else {
+                    throw NSError(domain: "Muesli", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Could not reserve a new video segment"])
+                }
+                recordURL = url
             } else {
+                captureEngine.recoveryRecordingURLProvider = nil
+                captureEngine.onRecordingOutputCreated = nil
                 recordURL = nil
             }
 
-            let captureTimeline = CaptureTimeline()
             sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
             try await captureEngine.startCapture(
@@ -2427,13 +2369,6 @@ final class AppModel: ObservableObject {
             let metaData = try JSONSerialization.data(withJSONObject: meta)
             writer?.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
             appendBackendLog("Sent meeting_start", toTail: true)
-            updateMeetingMetadataStreams(
-                for: session,
-                systemSampleRate: systemSampleRate,
-                systemChannels: systemChannels,
-                micSampleRate: micSampleRate,
-                micChannels: micChannels
-            )
             // Readiness describes inference only. Capture already writes to
             // the app-owned source store and must continue during this wait.
             if let sessionBackend = backend {
@@ -2449,25 +2384,16 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            if captureMode == .video {
-                let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
-                try FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
-
-                screenshotScheduler.start(
-                    every: 5.0,
-                    contentFilter: screenshotFilter,
-                    streamConfig: captureEngine.streamConfigurationForScreenshots(),
-                    meetingStartPTSProvider: { captureTimeline.epochPTS },
-                    outputDir: screenshotsDir
-                ) { [weak self] tSec, relativePath in
-                    guard let self else { return }
-                    let evt: [String: Any] = [
-                        "t": tSec,
-                        "path": relativePath
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: evt) {
-                        let ptsUs = Int64(tSec * 1_000_000.0)
-                        self.writer?.send(type: .screenshotEvent, stream: .system, ptsUs: ptsUs, payload: data)
+            if let artifacts = sessionArtifactStore {
+                let request = ScreenshotScheduler.NativeRequest(filter: screenshotFilter,
+                    configuration: captureEngine.streamConfigurationForScreenshots())
+                // The sink belongs to this attempt. Source assets still persist
+                // when inference is absent or its UI projection is cancelled.
+                let eventWriter = writer
+                screenshotScheduler.start(every: 5, store: artifacts, request: request.capture) { event in
+                    if let data = try? JSONEncoder().encode(event) {
+                        eventWriter?.send(type: .screenshotEvent, stream: .system,
+                            ptsUs: Int64(event.t * 1_000_000), payload: data)
                     }
                 }
             }
@@ -2628,10 +2554,12 @@ final class AppModel: ObservableObject {
         wasResume: Bool,
         priorMetadata: MeetingMetadata?
     ) async {
+        let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         screenshotScheduler.stop()
-        await captureEngine.stopCapture()
+        let systemStopped = await captureEngine.stopCapture()
+        if systemStopped { stoppingArtifacts?.markCaptureStopped(atHostUs: CaptureTimeline.hostNowMicroseconds()) }
 
         enqueueMicLifecycle("start-failure-cleanup") { model in
             if let engine = model.micEngine {
@@ -2650,6 +2578,7 @@ final class AppModel: ObservableObject {
         await micAudioForwarder.endMeeting()
         let hadSourceRecorder = sourceRecorder != nil
         let sourceResult = await sourceRecorder?.finish()
+        let artifactResult = await stoppingArtifacts?.finish(timeoutSeconds: 5)
         sourceRecorder = nil
         sourceTimeline = nil
         micStartTime = nil
@@ -2694,7 +2623,8 @@ final class AppModel: ObservableObject {
         if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
-            finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult, incomplete: true)
+            await finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
+                                    artifactResult: artifactResult, incomplete: true)
         } else {
             rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
         }
@@ -2746,6 +2676,7 @@ final class AppModel: ObservableObject {
         guard isCapturing else { return }
 
         isFinalizing = true
+        let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         micEngineBoundDeviceID = 0
@@ -2763,7 +2694,8 @@ final class AppModel: ObservableObject {
         await micLifecycleTask?.value
 
         screenshotScheduler.stop()
-        await captureEngine.stopCapture()
+        let systemStopped = await captureEngine.stopCapture()
+        if systemStopped { stoppingArtifacts?.markCaptureStopped(atHostUs: CaptureTimeline.hostNowMicroseconds()) }
         if let engine = micEngine {
             _ = await stopNativeMicrophone(engine, ingress: micAudioIngress, preview: false)
         }
@@ -2775,6 +2707,7 @@ final class AppModel: ObservableObject {
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
         let sourceResult = await sourceRecorder?.finish()
+        let artifactResult = await stoppingArtifacts?.finish(timeoutSeconds: 5)
         sourceRecorder = nil
         sourceTimeline = nil
         micStartTime = nil
@@ -2860,6 +2793,7 @@ final class AppModel: ObservableObject {
                 timestampOffsetSnapshot: stoppingTimestampOffset,
                 writer: stoppingWriter,
                 sourceManifest: sourceResult,
+                artifactResult: artifactResult,
                 inferenceFailed: stoppingInferenceFailed
             )
         }
@@ -2878,6 +2812,7 @@ final class AppModel: ObservableObject {
         timestampOffsetSnapshot: Double,
         writer: FramedWriter? = nil,
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        artifactResult: SessionArtifactFinishResult? = nil,
         inferenceFailed: Bool = false
     ) async {
         defer {
@@ -2960,36 +2895,44 @@ final class AppModel: ObservableObject {
         backend?.cleanup()
         backendLogWriter.synchronize(label: "backend log")
 
-        let model = TranscriptModel()
-        model.timestampOffset = timestampOffsetSnapshot
-        model.segments = transcriptSegmentsSnapshot
-        model.speakerNames = speakerNamesSnapshot
-        let replay: TranscriptEventJournal.Replay
-        if let url = transcriptEventsURL, let status = journalDrain?.status {
-            replay = TranscriptEventJournal.replay(url: url, start: status.journalStartOffset,
-                                                   byteCount: status.durableBytes)
-        } else {
-            replay = TranscriptEventJournal.Replay(error: "No authoritative transcript journal was available.")
+        let journalStatus = journalDrain?.status
+        let incomplete = inferenceFailed || exitStatus != 0 || !journalComplete
+        let saveID = meetingSavePublication.begin(folder: session.folderURL)
+        do {
+            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+                onCompletion: { [weak self] result in
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
+                }) { context in
+                try TranscriptReplacement.commitStoppedMeeting(context: context,
+                    timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
+                    speakerNames: speakerNamesSnapshot, journalURL: transcriptEventsURL,
+                    journalStatus: journalStatus, sourceManifest: sourceManifest,
+                    artifactResult: artifactResult, incomplete: incomplete)
+            }
+            switch await operation.wait(timeoutSeconds: 5) {
+            case .completed, .failed: break // Actual completion publishes the observed result.
+            case .timedOut, .cancelled:
+                guard meetingSavePublication.isPending(folder: session.folderURL, id: saveID) else { return }
+                meetingSaveNotices[session.folderURL.path] = "The meeting is still being saved. Its original disk operation retains ownership; the source recording and recovery files are preserved."
+            }
+        } catch {
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL, id: saveID)
         }
-        for line in replay.lines { model.ingest(jsonLine: line) }
-        if let error = replay.error { appendBackendLog(error, toTail: false, handle: backendLogHandle) }
+    }
 
-        let finalizedSegments = model.segments.filter { !$0.isPartial }
-        saveTranscriptFiles(
-            for: session,
-            segments: finalizedSegments,
-            text: model.asPlainText(),
-            logToTail: false,
-            logHandle: backendLogHandle
-        )
-        finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments,
-                                sourceManifest: sourceManifest,
-                                incomplete: inferenceFailed || exitStatus != 0 || !journalComplete || replay.error != nil)
-        if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
-           let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
-            meetingHistory[idx] = updatedItem
-        } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
-            meetingHistory.insert(updatedItem, at: 0)
+    private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL, id: UUID) {
+        guard meetingSavePublication.markTerminal(folder: folder, id: id) else { return }
+        switch result {
+        case .success(let metadata):
+            meetingSaveNotices[folder.path] = nil
+            let item = MeetingHistoryItem(id: folder.lastPathComponent, folderURL: folder, title: metadata.title,
+                createdAt: metadata.createdAt, durationSeconds: metadata.durationSeconds,
+                segmentCount: metadata.segmentCount, status: metadata.status)
+            if let index = meetingHistory.firstIndex(where: { $0.folderURL == folder }) {
+                meetingHistory[index] = item
+            } else { meetingHistory.insert(item, at: 0) }
+        case .failure(let error):
+            meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
     }
 
@@ -3168,6 +3111,7 @@ final class AppModel: ObservableObject {
     }
 
     private func readMeetingMetadata(from folderURL: URL) throws -> MeetingMetadata {
+        try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
         let data = try Data(contentsOf: meetingMetadataURL(for: folderURL))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -3175,6 +3119,7 @@ final class AppModel: ObservableObject {
     }
 
     private func writeMeetingMetadata(_ metadata: MeetingMetadata, to folderURL: URL) throws {
+        try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -3218,6 +3163,7 @@ final class AppModel: ObservableObject {
         audioFolderName: String
     ) throws {
         var updated = metadata
+        updated.preservePreviousSessionOutcome()
         updated.status = .recording
         updated.updatedAt = session.startedAt
         let streams: [String: MeetingStreamInfo] = [
@@ -3235,50 +3181,69 @@ final class AppModel: ObservableObject {
         try writeMeetingMetadata(updated, to: session.folderURL)
     }
 
+    private func updateSessionArtifactsMetadata(for session: MeetingSession, directory: String,
+                                                timelineOffsetSeconds: Double) throws {
+        var metadata = try readMeetingMetadata(from: session.folderURL)
+        guard let index = metadata.sessions.indices.last else { return }
+        metadata.sessions[index].artifactsFolder = directory
+        metadata.sessions[index].timelineOffsetSeconds = timelineOffsetSeconds
+        try writeMeetingMetadata(metadata, to: session.folderURL)
+    }
+
+    /// Finalization must retain this owner and await its typed outcome after
+    /// native stop. Taking it closes screenshot admission immediately; pending
+    /// SDK video callbacks continue to address this original session's ledger.
+    private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        captureEngine.retireCaptureIntent()
+        screenshotScheduler.stop()
+        let store = sessionArtifactStore
+        sessionArtifactStore = nil
+        store?.stopScreenshots()
+        captureEngine.recoveryRecordingURLProvider = nil
+        captureEngine.onRecordingOutputCreated = nil
+        return store
+    }
+
     private func finalizeMeetingMetadata(
         for session: MeetingSession,
         finalizedSegments: [TranscriptSegment],
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        artifactResult: SessionArtifactFinishResult? = nil,
         incomplete: Bool = false
-    ) {
+    ) async {
+        let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
-            var metadata = try readMeetingMetadata(from: session.folderURL)
-            let lastTimestamp = max(
-                metadata.lastTimestamp,
-                finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
-            )
-            let segmentCount = max(metadata.segmentCount, finalizedSegments.count)
-            let savedDuration = sourceManifest.map { manifest in
-                Double(manifest.timeline_offset_us) / 1_000_000
-                + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
-            } ?? metadata.durationSeconds
-            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration)
-
-            metadata.updatedAt = Date()
-            metadata.durationSeconds = durationSeconds
-            metadata.lastTimestamp = lastTimestamp
-            metadata.segmentCount = segmentCount
-            metadata.status = incomplete || sourceManifest?.completed != true ? .degraded : .completed
-            if let lastIndex = metadata.sessions.indices.last {
-                var lastSession = metadata.sessions[lastIndex]
-                if lastSession.endedAt == nil {
-                    lastSession = MeetingSessionMetadata(
-                        sessionID: lastSession.sessionID,
-                        startedAt: lastSession.startedAt,
-                        endedAt: Date(),
-                        audioFolder: lastSession.audioFolder,
-                        streams: lastSession.streams
-                    )
-                    metadata.sessions[lastIndex] = lastSession
-                }
+            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+                onCompletion: { [weak self] result in
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
+                }) { context in
+                let prior = try context.readMetadata()
+                let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
+                let metadata = prior.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,
+                    artifactResult: artifactResult, incomplete: incomplete, sourceProblems: problems)
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try context.commit(files: ["meeting.json": encoder.encode(metadata)])
+                return metadata
             }
-            try writeMeetingMetadata(metadata, to: session.folderURL)
+            switch await operation.wait(timeoutSeconds: 5) {
+            case .completed, .failed: break
+            case .timedOut, .cancelled:
+                guard meetingSavePublication.isPending(folder: session.folderURL, id: saveID) else { return }
+                meetingSaveNotices[session.folderURL.path] = "The interrupted meeting is still being saved. Its source recording and recovery files are preserved."
+            }
         } catch {
-            appendBackendLog("Failed to update meeting.json: \(error.localizedDescription)", toTail: true)
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL, id: saveID)
         }
     }
 
     func renameSpeaker(id: String, to name: String) {
+        let folder: URL?
+        if let session = currentSession { folder = session.folderURL }
+        else if case .viewing(let item) = activeScreen { folder = item.folderURL }
+        else { folder = nil }
+        if let folder, !canEditTranscript(in: folder) { return }
         transcriptModel.renameSpeaker(id: id, to: name)
         if let session = currentSession {
             persistSpeakerNames(to: session.folderURL)
@@ -3425,59 +3390,33 @@ final class AppModel: ObservableObject {
         currentAttachments = []
     }
 
-    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
-        var didUpdate = false
-        let segmentIds = Set(transcriptModel.segments.map { $0.speakerID })
-        let hasSystemSegments = segmentIds.contains { $0.lowercased().hasPrefix("system:") }
-        let hasMicSegments = segmentIds.contains { $0.lowercased().hasPrefix("mic:") }
-        for mapping in mappings {
-            let rawId = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmed = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !rawId.isEmpty, !trimmed.isEmpty else { continue }
-
-            let suffix = ":\(rawId)"
-            var targets = Set<String>()
-            for key in transcriptModel.speakerNames.keys where key.hasSuffix(suffix) || key == rawId {
-                targets.insert(key)
-            }
-            for id in segmentIds where id.hasSuffix(suffix) || id == rawId {
-                targets.insert(id)
-            }
-            if transcriptModel.speakerNames[rawId] != nil {
-                targets.insert(rawId)
-            }
-            if targets.isEmpty {
-                let parts = rawId.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-                if parts.count == 2 {
-                    let prefix = String(parts[0]).lowercased()
-                    let base = String(parts[1])
-                    if prefix == "system", !hasSystemSegments, hasMicSegments {
-                        let alt = "mic:\(base)"
-                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
-                            targets.insert(alt)
-                        }
-                    } else if prefix == "mic", !hasMicSegments, hasSystemSegments {
-                        let alt = "system:\(base)"
-                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
-                            targets.insert(alt)
-                        }
-                    }
-                }
-            }
-            guard !targets.isEmpty else { continue }
-            for target in targets {
-                transcriptModel.renameSpeaker(id: target, to: trimmed)
-                didUpdate = true
-            }
+    private func canEditTranscript(in folder: URL) -> Bool {
+        do {
+            try transcriptModel.assertNoPendingReplacement(in: folder)
+            try TranscriptPersistenceStore.shared.assertReadable(in: folder)
+            return true
+        } catch {
+            transcriptLoadError = "Check the pending save or reopen the meeting before editing its speakers. \(error.localizedDescription)"
+            return false
         }
-        guard didUpdate else { return }
-        persistSpeakerNames(to: meeting.folderURL)
+    }
+
+    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
+        guard canEditTranscript(in: meeting.folderURL) else { return }
+        var didUpdate = false
+        for mapping in mappings {
+            let id = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !name.isEmpty else { continue }
+            if transcriptModel.applySpeakerName(id: id, name: name) { didUpdate = true }
+        }
+        if didUpdate { persistSpeakerNames(to: meeting.folderURL) }
     }
 
     func runBatchRediarization(
         for meeting: MeetingHistoryItem,
         stream: BatchRediarizer.Stream,
-        progressHandler: @escaping (BatchRediarizer.Progress) -> Void
+        progressHandler: @escaping @MainActor @Sendable (BatchRediarizer.Progress) -> Void
     ) async throws -> BatchRediarizer.Result {
         guard let backendProjectRoot = backendFolderURL else {
             throw NSError(
@@ -3514,44 +3453,24 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applyBatchRediarization(_ result: BatchRediarizer.Result, for meeting: MeetingHistoryItem) {
-        let segments = result.turns.map { turn in
-            TranscriptSegment(
-                speakerID: turn.speakerId,
-                stream: turn.stream,
-                t0: turn.t0,
-                t1: turn.t1,
-                text: turn.text,
-                isPartial: false
-            )
+    func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {
+        guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL else {
+            throw TranscriptPersistenceStore.Failure.superseded
         }
-        let sorted = segments.sorted { $0.t0 < $1.t0 }
-
-        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        transcriptModel.segments = sorted
-        transcriptModel.speakerNames = [:]
-        if let last = sorted.last, !last.text.isEmpty {
-            transcriptModel.lastTranscriptText = last.text
-            transcriptModel.lastTranscriptAt = Date()
+        let replacement = try await transcriptModel.applyBatchResult(result, requestID: requestID, in: meeting.folderURL)
+        let metadata = replacement.metadata
+        // Use the committed worker result; do not reread storage on the UI.
+        let updatedItem = MeetingHistoryItem(id: meeting.id, folderURL: meeting.folderURL,
+                                             title: metadata.title, createdAt: metadata.createdAt,
+                                             durationSeconds: metadata.durationSeconds,
+                                             segmentCount: metadata.segmentCount, status: metadata.status)
+        if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
+            meetingHistory[idx] = updatedItem
+        } else {
+            meetingHistory.insert(updatedItem, at: 0)
         }
-
-        writeTranscriptFiles(for: meeting.folderURL, segments: sorted)
-        updateMeetingMetadataAfterRediarization(
-            folderURL: meeting.folderURL,
-            segmentCount: sorted.count,
-            lastTimestamp: sorted.map { $0.t1 ?? $0.t0 }.max() ?? 0,
-            durationSeconds: result.duration
-        )
-
-        if let updatedItem = buildMeetingHistoryItem(for: meeting.folderURL) {
-            if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
-                meetingHistory[idx] = updatedItem
-            } else {
-                meetingHistory.insert(updatedItem, at: 0)
-            }
-            if case .viewing(let current) = activeScreen, current.id == meeting.id {
-                activeScreen = .viewing(updatedItem)
-            }
+        if case .viewing(let current) = activeScreen, current.id == meeting.id {
+            activeScreen = .viewing(updatedItem)
         }
     }
 
@@ -3565,6 +3484,8 @@ final class AppModel: ObservableObject {
     func renameMeeting(folderURL: URL, to newTitle: String) throws -> String {
         let trimmed: String
         do {
+            try transcriptModel.assertNoPendingReplacement(in: folderURL)
+            try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
             trimmed = try MeetingRenamer.rename(folderURL: folderURL, to: newTitle)
         } catch {
             appendBackendLog("Failed to rename meeting at \(folderURL.lastPathComponent): \(error.localizedDescription)", toTail: true)
@@ -3618,50 +3539,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func writeTranscriptFiles(for folderURL: URL, segments: [TranscriptSegment]) {
-        let jsonlURL = folderURL.appendingPathComponent("transcript.jsonl")
-        let txtURL = folderURL.appendingPathComponent("transcript.txt")
-
-        let jsonlString = buildTranscriptJSONL(from: segments)
-        let textString = transcriptModel.asPlainText()
-        let jsonlData = jsonlString.data(using: .utf8)
-        let textData = textString.data(using: .utf8)
-
-        writeTranscriptData(
-            jsonlData,
-            to: jsonlURL,
-            encodeFailure: "Failed to encode transcript JSONL.",
-            writeFailure: "Failed to write transcript JSONL"
-        )
-        writeTranscriptData(
-            textData,
-            to: txtURL,
-            encodeFailure: "Failed to encode transcript text.",
-            writeFailure: "Failed to write transcript text"
-        )
-    }
-
-    private func updateMeetingMetadataAfterRediarization(
-        folderURL: URL,
-        segmentCount: Int,
-        lastTimestamp: Double,
-        durationSeconds: Double
-    ) {
-        do {
-            var metadata = try readMeetingMetadata(from: folderURL)
-            metadata.updatedAt = Date()
-            metadata.segmentCount = segmentCount
-            metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
-            metadata.durationSeconds = max(metadata.durationSeconds, durationSeconds, lastTimestamp)
-            metadata.speakerNames = [:]
-            // Reprocessing cannot certify or repair capture integrity.
-
-            try writeMeetingMetadata(metadata, to: folderURL)
-        } catch {
-            appendBackendLog("Failed to update meeting.json after reprocess: \(error.localizedDescription)", toTail: true)
-        }
-    }
-
     private func updateMeetingMetadataStreams(
         for session: MeetingSession,
         systemSampleRate: Int,
@@ -3676,14 +3553,7 @@ final class AppModel: ObservableObject {
                     "system": MeetingStreamInfo(sampleRate: systemSampleRate, channels: systemChannels),
                     "mic": MeetingStreamInfo(sampleRate: micSampleRate, channels: micChannels)
                 ]
-                let lastSession = metadata.sessions[lastIndex]
-                metadata.sessions[lastIndex] = MeetingSessionMetadata(
-                    sessionID: lastSession.sessionID,
-                    startedAt: lastSession.startedAt,
-                    endedAt: lastSession.endedAt,
-                    audioFolder: lastSession.audioFolder,
-                    streams: streams
-                )
+                metadata.sessions[lastIndex].streams = streams
                 metadata.updatedAt = Date()
                 try writeMeetingMetadata(metadata, to: session.folderURL)
             }
@@ -3730,75 +3600,48 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Finalizes any meeting left at `status: recording` with no live
-    /// session - i.e. the app crashed or was force-quit mid-meeting (see
-    /// engineer-notes/incident-2026-07-06-mainthread-livelock.md, where a
-    /// 54-minute main-thread livelock led to a SIGKILL and the meeting was
-    /// never finalized despite the audio underneath being completely
-    /// healthy). Called from `init()`, before any meeting could possibly be
-    /// live in THIS process, so a `.recording` `meeting.json` found here is
-    /// unconditionally orphaned. Resume stays disabled for the recovered
-    /// meeting - it's `.completed` now, which is the point: the recording is
-    /// over and its audio should be usable in-app (viewer, rediarize,
-    /// export) rather than permanently locked out.
+    /// Snapshot orphan candidates before init returns, then recover source
+    /// prefixes off the UI actor. Applying the result rechecks session identity
+    /// and status so a later user action cannot receive a stale recovery write.
     private func recoverOrphanedMeetingsIfNeeded() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Muesli", isDirectory: true)
             .appendingPathComponent("Meetings", isDirectory: true)
         guard let folders = try? FileManager.default.contentsOfDirectory(
-            at: base,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
+            at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ) else { return }
-
-        for folderURL in folders {
-            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
-            guard resourceValues?.isDirectory == true else { continue }
-            guard let metadata = try? readMeetingMetadata(from: folderURL),
-                  OrphanedMeetingRecovery.needsRecovery(metadata) else { continue }
-
-            let wavDuration = wavDurationSeconds(for: folderURL, metadata: metadata)
-            let fallbackEnd = latestModificationDate(for: folderURL) ?? metadata.updatedAt
-            let fallbackDuration = max(0, fallbackEnd.timeIntervalSince(metadata.createdAt))
-            let recovered = OrphanedMeetingRecovery.finalize(
-                metadata,
-                wavDurationSeconds: wavDuration,
-                fallbackDurationSeconds: fallbackDuration,
-                now: Date()
-            )
-            do {
-                try writeMeetingMetadata(recovered, to: folderURL)
-                appendBackendLog(
-                    "Recovered orphaned meeting '\(recovered.title)' left mid-recording (likely a crash or " +
-                    "force-quit) - marked completed, duration=\(String(format: "%.1f", recovered.durationSeconds))s.",
-                    toTail: true
-                )
-            } catch {
-                appendBackendLog(
-                    "Failed to recover orphaned meeting \(folderURL.lastPathComponent): \(error.localizedDescription)",
-                    toTail: true
-                )
+        let jobs: [(URL, MeetingMetadata)] = folders.compactMap { folder in
+            guard let metadata = try? readMeetingMetadata(from: folder),
+                  OrphanedMeetingRecovery.needsRecovery(metadata) else { return nil }
+            return (folder, metadata)
+        }
+        guard !jobs.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            let results = await Task.detached {
+                jobs.map { folder, metadata in
+                    (folder, metadata.sessions.map { $0.sessionID },
+                     OrphanedMeetingRecovery.inspectAndRecover(folderURL: folder, metadata: metadata))
+                }
+            }.value
+            guard let self else { return }
+            for (folder, sessionIDs, evidence) in results {
+                guard self.currentSession?.folderURL != folder,
+                      let current = try? self.readMeetingMetadata(from: folder),
+                      OrphanedMeetingRecovery.needsRecovery(current),
+                      current.sessions.map({ $0.sessionID }) == sessionIDs else { continue }
+                let recovered = OrphanedMeetingRecovery.finalize(current, evidence: evidence, now: Date())
+                do {
+                    try self.writeMeetingMetadata(recovered, to: folder)
+                    self.appendBackendLog(
+                        "Recovered interrupted meeting '\(recovered.title)' from source media; duration=\(String(format: "%.1f", recovered.durationSeconds))s.",
+                        toTail: true)
+                    for problem in evidence.problems { self.appendBackendLog(problem, toTail: true) }
+                } catch {
+                    self.appendBackendLog("Failed to record recovery for \(folder.lastPathComponent): \(error.localizedDescription)", toTail: true)
+                }
             }
+            self.loadMeetingHistory()
         }
-    }
-
-    /// The longer of the mic/system wav durations, read via `AVAudioFile` -
-    /// `nil` if neither wav exists or is readable, so the caller can fall
-    /// back to an mtime-based estimate.
-    private func wavDurationSeconds(for folderURL: URL, metadata: MeetingMetadata) -> Double? {
-        let audioFolderName = metadata.sessions.last?.audioFolder ?? findAudioFolderName(in: folderURL) ?? "audio"
-        let audioDir = folderURL.appendingPathComponent(audioFolderName, isDirectory: true)
-        var longest: Double?
-        for name in ["mic.wav", "system.wav"] {
-            let url = audioDir.appendingPathComponent(name)
-            guard FileManager.default.fileExists(atPath: url.path),
-                  let file = try? AVAudioFile(forReading: url),
-                  file.fileFormat.sampleRate > 0 else { continue }
-            let seconds = Double(file.length) / file.fileFormat.sampleRate
-            guard seconds.isFinite else { continue }
-            longest = max(longest ?? 0, seconds)
-        }
-        return longest
     }
 
     private func loadMeetingHistory() {
@@ -3826,6 +3669,14 @@ final class AppModel: ObservableObject {
     }
 
     private func buildMeetingHistoryItem(for folderURL: URL) -> MeetingHistoryItem? {
+        do { try TranscriptPersistenceStore.shared.assertReadable(in: folderURL) }
+        catch {
+            // Do not fall through to parsing mixed canonical files while an
+            // owner is active or crash recovery is still needed.
+            return MeetingHistoryItem(id: folderURL.lastPathComponent, folderURL: folderURL,
+                                      title: folderURL.lastPathComponent, createdAt: Date.distantPast,
+                                      durationSeconds: 0, segmentCount: 0, status: .interrupted)
+        }
         if let metadata = try? readMeetingMetadata(from: folderURL) {
             return MeetingHistoryItem(
                 id: folderURL.lastPathComponent,
@@ -3839,13 +3690,14 @@ final class AppModel: ObservableObject {
         }
 
         let createdAt = creationDate(for: folderURL) ?? Date()
-        let updatedAt = latestModificationDate(for: folderURL) ?? createdAt
-        let durationSeconds = max(0, updatedAt.timeIntervalSince(createdAt))
         let title = legacyMeetingTitle(for: folderURL)
         let segmentStats = parseSegmentStats(
             from: folderURL.appendingPathComponent("transcript.jsonl"),
             expectsTypeField: false
         )
+        let audioFolder = folderURL.appendingPathComponent(findAudioFolderName(in: folderURL) ?? "audio")
+        let durationSeconds = max(segmentStats.lastTimestamp,
+                                  OrphanedMeetingRecovery.legacyDuration(audioDirectory: audioFolder) ?? 0)
 
         return MeetingHistoryItem(
             id: folderURL.lastPathComponent,
@@ -3854,7 +3706,7 @@ final class AppModel: ObservableObject {
             createdAt: createdAt,
             durationSeconds: durationSeconds,
             segmentCount: segmentStats.count,
-            status: .completed
+            status: .interrupted
         )
     }
 
@@ -3882,12 +3734,12 @@ final class AppModel: ObservableObject {
     }
 
     func resumeMeeting(_ item: MeetingHistoryItem) {
-        do {
-            let metadata = try readMeetingMetadata(from: item.folderURL)
-            meetingTitle = item.title
-            Task { await startMeeting(resuming: item, metadata: metadata, timestampOffset: metadata.lastTimestamp) }
-        } catch {
-            appendBackendLog("Failed to resume meeting \(item.id): \(error.localizedDescription)", toTail: true)
+        guard !isPreparingResume, !isStartingMeeting, !isCapturing, !isFinalizing else { return }
+        isPreparingResume = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { isPreparingResume = false }
+            await startMeeting(resuming: item)
         }
     }
 
@@ -3934,29 +3786,40 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func loadTranscriptForViewer(from folderURL: URL) {
-        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
-        if FileManager.default.fileExists(atPath: transcriptURL.path) {
-            if let data = try? Data(contentsOf: transcriptURL),
-               let content = String(data: data, encoding: .utf8) {
-                for line in content.split(separator: "\n") {
-                    transcriptModel.ingest(jsonLine: String(line))
-                }
-            }
-        } else {
-            appendBackendLog("Transcript not found for viewer: \(transcriptURL.path)", toTail: true)
-        }
+    @Published var transcriptLoadError: String?
 
-        do {
-            let metadata = try readMeetingMetadata(from: folderURL)
-            transcriptModel.speakerNames = metadata.speakerNames
-        } catch {
-            appendBackendLog("Failed to load speaker names: \(error.localizedDescription)", toTail: true)
+    private var transcriptLoadIntent = UUID()
+
+    private func loadTranscriptForViewer(from folderURL: URL) {
+        let intent = UUID()
+        transcriptLoadIntent = intent
+        transcriptLoadError = nil
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        let contentGeneration = transcriptModel.contentGeneration
+        Task { @MainActor [weak self] in
+            guard let self, self.transcriptLoadIntent == intent,
+                  self.transcriptModel.contentGeneration == contentGeneration else { return }
+            do {
+                let operation = try TranscriptPersistenceStore.shared.start(in: folderURL) { context in
+                    let jsonl = try context.readData(named: "transcript.jsonl")
+                    let metadata = try? context.readMetadata() // Legacy transcripts may have no meeting.json.
+                    return (String(decoding: jsonl, as: UTF8.self), metadata?.speakerNames ?? [:])
+                }
+                let (content, names) = try await operation.value(timeoutSeconds: 5)
+                guard self.transcriptLoadIntent == intent,
+                      case .viewing(let item) = self.activeScreen, item.folderURL == folderURL else { return }
+                self.transcriptModel.applyLoadedTranscript(content: content, names: names, expectedGeneration: contentGeneration)
+            } catch {
+                guard self.transcriptLoadIntent == intent,
+                      self.transcriptModel.contentGeneration == contentGeneration else { return }
+                self.appendBackendLog("Transcript load is unresolved: \(error.localizedDescription)", toTail: true)
+                self.transcriptLoadError = "Transcript could not be loaded: \(error.localizedDescription) Reopen the meeting to retry."
+            }
         }
     }
 
     private func clearViewerTranscript() {
+        transcriptLoadIntent = UUID()
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
     }
 
@@ -3984,7 +3847,8 @@ final class AppModel: ObservableObject {
             speakerNames = stats.speakerNames
         }
 
-        let durationSeconds = max(lastTimestamp, updatedAt.timeIntervalSince(createdAt))
+        let durationSeconds = max(lastTimestamp, OrphanedMeetingRecovery.legacyDuration(
+            audioDirectory: folderURL.appendingPathComponent(audioFolderName)) ?? 0)
         let streams: [String: MeetingStreamInfo] = [
             "system": MeetingStreamInfo(sampleRate: nil, channels: nil),
             "mic": MeetingStreamInfo(sampleRate: nil, channels: nil)
@@ -3993,7 +3857,7 @@ final class AppModel: ObservableObject {
         let session = MeetingSessionMetadata(
             sessionID: 1,
             startedAt: createdAt,
-            endedAt: updatedAt,
+            endedAt: nil,
             audioFolder: audioFolderName,
             streams: streams
         )
@@ -4005,7 +3869,7 @@ final class AppModel: ObservableObject {
             updatedAt: updatedAt,
             durationSeconds: durationSeconds,
             lastTimestamp: lastTimestamp,
-            status: .completed,
+            status: .interrupted,
             sessions: [session],
             segmentCount: segmentCount,
             speakerNames: speakerNames
@@ -4091,7 +3955,10 @@ final class AppModel: ObservableObject {
                     for entry in known {
                         if let speakerID = entry["speaker_id"] as? String {
                             let name = (entry["name"] as? String) ?? speakerID
-                            speakerNames[speakerID] = name
+                            let source = entry["source_session_id"] as? String ?? obj["source_session_id"] as? String
+                            let stream = entry["stream"] as? String ?? obj["stream"] as? String ?? "unknown"
+                            let identity = TranscriptSpeakerIdentity(sourceSessionID: source, stream: stream, speakerID: speakerID)
+                            speakerNames[source == nil && stream == "unknown" ? speakerID : identity.storageKey] = name
                         }
                     }
                 }

@@ -2,6 +2,21 @@ import XCTest
 
 @MainActor
 final class TaskCompletionTests: XCTestCase {
+    func testOneShotOwnerObserverBeforeAfterAndRacingCompletion() async {
+        for iteration in 0..<60 {
+            let completion = TaskCompletion()
+            let observed = TaskCompletion()
+            let counter = CompletionObserverCounter()
+            if iteration.isMultiple(of: 2) { completion.markCompleted() }
+            DispatchQueue.global().async { completion.markCompleted(); completion.markCompleted() }
+            completion.observeCompletion { counter.increment(); observed.markCompleted() }
+            let result = await observed.wait(timeoutSeconds: 1)
+            XCTAssertEqual(result, .completed)
+            completion.markCompleted()
+            XCTAssertEqual(counter.value, 1)
+        }
+    }
+
     func testCompletionBeforeWaitAndRepeatedCompletion() async {
         let completion = TaskCompletion()
         completion.markCompleted()
@@ -111,4 +126,11 @@ nonisolated private final class NoncooperativeOperation: @unchecked Sendable {
         }
         saved?.resume()
     }
+}
+
+nonisolated private final class CompletionObserverCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
 }

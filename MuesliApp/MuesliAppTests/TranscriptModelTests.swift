@@ -155,3 +155,85 @@ final class TranscriptModelTests: XCTestCase {
         XCTAssertEqual(finals.first?.text, "mic final")
     }
 }
+
+extension TranscriptModelTests {
+    func testResumedPermutedLabelsKeepNamesAcrossSaveAndReplay() throws {
+        let model = makeModel()
+        model.echoSuppressionEnabled = false
+        // Session A label 0 is Alex; session B reuses label 0 for Blair.
+        for (source, label, t0, text) in [("A", "system:SPEAKER_00", 0.0, "Alex first"),
+                                         ("B", "system:SPEAKER_00", 5.0, "Blair resumed"),
+                                         ("B", "system:SPEAKER_01", 8.0, "Alex resumed")] {
+            model.ingest(jsonLine: segmentLine(stream: "system", t0: t0, t1: t0 + 1, text: text, speakerID: label), sourceSessionID: source)
+        }
+        model.speakerNames["system:SPEAKER_00"] = "Wrong legacy name"
+        XCTAssertEqual(model.displayName(for: model.segments[0]), "system:SPEAKER_00")
+        XCTAssertFalse(model.applySpeakerName(id: "SPEAKER_00", name: "Wrong inferred name"))
+        let names = ["Alex", "Blair", "Alex"]
+        for (index, name) in names.enumerated() {
+            XCTAssertTrue(model.applySpeakerName(id: model.segments[index].speakerKey, name: name))
+        }
+        let encoded = try TranscriptModel.jsonLines(from: model.segments)
+        XCTAssertFalse(encoded.contains("Blair" + "\""))
+        let lines = encoded.split(separator: "\n")
+        let first = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+        XCTAssertEqual(first["speaker_id"] as? String, "system:SPEAKER_00")
+        XCTAssertEqual(first["source_session_id"] as? String, "A")
+        let replay = makeModel()
+        replay.echoSuppressionEnabled = false
+        for line in lines { replay.ingest(jsonLine: String(line)) }
+        replay.speakerNames = try JSONDecoder().decode([String: String].self, from: JSONEncoder().encode(model.speakerNames))
+        XCTAssertEqual(replay.segments.map(\.speakerKey), model.segments.map(\.speakerKey))
+        XCTAssertEqual(replay.segments.map { replay.displayName(for: $0) }, names)
+        XCTAssertTrue(replay.asPlainText().contains("[source B]"))
+    }
+
+    func testIdentityIncludesStreamAndUnambiguousSource() {
+        let identities = [
+            TranscriptSpeakerIdentity(sourceSessionID: nil, stream: "system", speakerID: "0"),
+            TranscriptSpeakerIdentity(sourceSessionID: "", stream: "system", speakerID: "0"),
+            TranscriptSpeakerIdentity(sourceSessionID: "A", stream: "system", speakerID: "0"),
+            TranscriptSpeakerIdentity(sourceSessionID: "A", stream: "mic", speakerID: "0"),
+            TranscriptSpeakerIdentity(sourceSessionID: "A:system", stream: "mic", speakerID: "0")
+        ]
+        XCTAssertEqual(Set(identities.map(\.storageKey)).count, identities.count)
+        for identity in identities { XCTAssertEqual(TranscriptSpeakerIdentity(storageKey: identity.storageKey), identity) }
+    }
+
+    func testPartialsOverlapAndEchoStayWithinSource() {
+        let model = makeModel()
+        model.ingest(jsonLine: partialLine(stream: "system", t0: 0, text: "first source partial"), sourceSessionID: "A")
+        model.ingest(jsonLine: partialLine(stream: "system", t0: 0, text: "second source partial"), sourceSessionID: "B")
+        XCTAssertEqual(model.segments.count, 2)
+        model.ingest(jsonLine: segmentLine(stream: "system", t0: 0, t1: 1, text: "identical words here"), sourceSessionID: "B")
+        XCTAssertEqual(model.segments.filter(\.isPartial).map(\.sourceSessionID), ["A"])
+        model.ingest(jsonLine: segmentLine(stream: "system", t0: 0, t1: 1, text: "identical words here"), sourceSessionID: "A")
+        XCTAssertEqual(model.segments.count, 2, "same-stream overlap from another source must survive")
+        model.ingest(jsonLine: segmentLine(stream: "mic", t0: 0, t1: 1, text: "identical words here"), sourceSessionID: "C")
+        XCTAssertEqual(model.segments.count, 3, "echo matching cannot cross source boundaries")
+    }
+
+    func testSpeakerEventsUsePerEntrySourceAndStreamAndPreserveReviewedName() {
+        let model = makeModel()
+        model.ingest(jsonLine: #"{"type":"speakers","known":[{"speaker_id":"0","source_session_id":"A","stream":"system","name":"Alex"},{"speaker_id":"0","source_session_id":"B","stream":"mic","name":"Blair"}]}"#)
+        let a = TranscriptSpeakerIdentity(sourceSessionID: "A", stream: "system", speakerID: "0")
+        let b = TranscriptSpeakerIdentity(sourceSessionID: "B", stream: "mic", speakerID: "0")
+        XCTAssertEqual(model.speakerNames[a.storageKey], "Alex")
+        XCTAssertEqual(model.speakerNames[b.storageKey], "Blair")
+        model.renameSpeaker(id: a.storageKey, to: "Reviewed Alex")
+        model.ingest(jsonLine: #"{"type":"speakers","known":[{"speaker_id":"0","stream":"system","name":"Machine label"}]}"#, sourceSessionID: "A")
+        XCTAssertEqual(model.speakerNames[a.storageKey], "Reviewed Alex")
+        model.ingest(jsonLine: #"{"type":"segment","source_session_id":"explicit","stream":"system","speaker_id":"0","t0":2,"t1":3,"text":"one"}"#, sourceSessionID: "fallback")
+        XCTAssertEqual(model.segments.first?.sourceSessionID, "explicit")
+    }
+
+    func testLegacyNameCompatibilityDoesNotNameScopedRecord() {
+        let model = makeModel()
+        model.echoSuppressionEnabled = false
+        model.ingest(jsonLine: segmentLine(stream: "system", t0: 0, t1: 1, text: "legacy", speakerID: "0"))
+        model.ingest(jsonLine: segmentLine(stream: "system", t0: 2, t1: 3, text: "scoped", speakerID: "0"), sourceSessionID: "new")
+        XCTAssertTrue(model.applySpeakerName(id: "0", name: "Legacy Alex"))
+        XCTAssertEqual(model.displayName(for: model.segments[0]), "Legacy Alex")
+        XCTAssertEqual(model.displayName(for: model.segments[1]), "0")
+    }
+}

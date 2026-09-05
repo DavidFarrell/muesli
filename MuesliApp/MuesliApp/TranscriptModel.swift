@@ -3,10 +3,43 @@ import Combine
 
 // MARK: - Transcript Model
 
-struct TranscriptSegment: Identifiable {
+/// Names belong to an original source, stream, and diarizer label. The encoded
+/// dictionary key is deliberately opaque; raw diarizer IDs remain in exports.
+nonisolated struct TranscriptSpeakerIdentity: Hashable, Sendable {
+    let sourceSessionID: String?
+    let stream: String
+    let speakerID: String
+
+    var storageKey: String {
+        let parts: [String?] = [sourceSessionID, stream, speakerID]
+        return "speaker:v1:" + (try! JSONEncoder().encode(parts)).base64EncodedString()
+    }
+
+    init(sourceSessionID: String?, stream: String, speakerID: String) {
+        self.sourceSessionID = sourceSessionID
+        self.stream = stream
+        self.speakerID = speakerID
+    }
+
+    init?(storageKey: String) {
+        guard storageKey.hasPrefix("speaker:v1:"),
+              let data = Data(base64Encoded: String(storageKey.dropFirst("speaker:v1:".count))),
+              let parts = try? JSONDecoder().decode([String?].self, from: data),
+              parts.count == 3, let stream = parts[1], let speakerID = parts[2] else { return nil }
+        self.init(sourceSessionID: parts[0], stream: stream, speakerID: speakerID)
+    }
+
+    var description: String {
+        if let sourceSessionID { return "\(speakerID) · \(stream) · source \(sourceSessionID)" }
+        return "\(speakerID) · \(stream) · legacy source"
+    }
+}
+
+nonisolated struct TranscriptSegment: Identifiable, Sendable {
     let id: UUID
     let speakerID: String
     let stream: String
+    let sourceSessionID: String?
     let t0: Double
     let t1: Double?
     let text: String
@@ -16,6 +49,7 @@ struct TranscriptSegment: Identifiable {
         id: UUID = UUID(),
         speakerID: String,
         stream: String,
+        sourceSessionID: String? = nil,
         t0: Double,
         t1: Double?,
         text: String,
@@ -24,13 +58,18 @@ struct TranscriptSegment: Identifiable {
         self.id = id
         self.speakerID = speakerID
         self.stream = stream
+        self.sourceSessionID = sourceSessionID
         self.t0 = t0
         self.t1 = t1
         self.text = text
         self.isPartial = isPartial
     }
 
-    var logicKey: String { "\(stream)_\(Int(round(t0 * 1000)))" }
+    var speakerIdentity: TranscriptSpeakerIdentity {
+        TranscriptSpeakerIdentity(sourceSessionID: sourceSessionID, stream: stream, speakerID: speakerID)
+    }
+    var speakerKey: String { speakerIdentity.storageKey }
+    var logicKey: String { "\(speakerKey)_\(Int(round(t0 * 1000)))" }
 }
 
 extension String {
@@ -57,6 +96,14 @@ extension String {
 
 @MainActor
 final class TranscriptModel: ObservableObject {
+    struct PendingReplacement {
+        let id: UUID
+        let folder: URL
+        let operation: TranscriptPersistenceStore.Operation<TranscriptReplacement>
+    }
+    var pendingReplacement: PendingReplacement?
+    var replacementWaitIntent = UUID()
+    private(set) var contentGeneration: UInt64 = 0
     var timestampOffset: Double = 0
     @Published var segments: [TranscriptSegment] = []
     @Published var speakerNames: [String: String] = [:]
@@ -64,10 +111,51 @@ final class TranscriptModel: ObservableObject {
     @Published var lastTranscriptText: String = ""
     var echoSuppressionEnabled: Bool = true
 
-    private let echoTimeWindowSeconds: Double = 1.0
+    func displayName(for speakerKey: String) -> String {
+        guard let identity = TranscriptSpeakerIdentity(storageKey: speakerKey) else {
+            return speakerNames[speakerKey] ?? speakerKey
+        }
+        return Self.displayName(for: identity, names: speakerNames)
+    }
 
-    func displayName(for speakerID: String) -> String {
-        speakerNames[speakerID] ?? speakerID
+    func displayName(for segment: TranscriptSegment) -> String {
+        Self.displayName(for: segment.speakerIdentity, names: speakerNames)
+    }
+
+    nonisolated static func displayName(for identity: TranscriptSpeakerIdentity, names: [String: String]) -> String {
+        if let exact = names[identity.storageKey] { return exact }
+        // Older meetings used bare IDs. They cannot identify a resumed source.
+        if identity.sourceSessionID == nil, let legacy = names[identity.speakerID] { return legacy }
+        return identity.speakerID
+    }
+
+    func speakerLabel(for key: String) -> String {
+        guard let identity = TranscriptSpeakerIdentity(storageKey: key) else { return key }
+        guard let source = identity.sourceSessionID else { return identity.description }
+        var sources: [String] = []
+        for segment in segments.sorted(by: { $0.t0 < $1.t0 }) {
+            if let id = segment.sourceSessionID, !sources.contains(id) { sources.append(id) }
+        }
+        let label = sources.firstIndex(of: source).map { "Session \($0 + 1)" } ?? source
+        return "\(identity.speakerID) · \(identity.stream) · \(label)"
+    }
+
+    /// Exact scoped IDs only; compatibility matching is restricted to legacy records.
+    func applySpeakerName(id: String, name: String) -> Bool {
+        let ids = Set(segments.map(\.speakerKey))
+        if TranscriptSpeakerIdentity(storageKey: id) != nil {
+            guard ids.contains(id) else { return false }
+            speakerNames[id] = name
+            return true
+        }
+        let legacy = Set(segments.filter { $0.sourceSessionID == nil }.map(\.speakerID))
+        let matches = legacy.filter { $0 == id || $0.hasSuffix(":" + id) }
+        for target in matches { speakerNames[target] = name }
+        return !matches.isEmpty
+    }
+
+    func assertNoPendingReplacement(in folder: URL) throws {
+        guard pendingReplacement?.folder != folder else { throw TranscriptPersistenceStore.Failure.busy }
     }
 
     func renameSpeaker(id: String, to name: String) {
@@ -75,6 +163,8 @@ final class TranscriptModel: ObservableObject {
     }
 
     func resetForNewMeeting(keepSpeakerNames: Bool) {
+        contentGeneration &+= 1
+        pendingReplacement = nil
         segments.removeAll()
         lastTranscriptAt = nil
         lastTranscriptText = ""
@@ -84,16 +174,67 @@ final class TranscriptModel: ObservableObject {
         }
     }
 
-    func asPlainText(includePartials: Bool = false) -> String {
-        segments
-            .filter { includePartials || !$0.isPartial }
-            .map { seg in
-                let name = displayName(for: seg.speakerID)
-                let stream = seg.stream == "unknown" ? "" : "[\(seg.stream)] "
-                return "\(stream)t=\(String(format: "%.2f", seg.t0))s \(name): \(seg.text)"
-            }
-            .joined(separator: "\n")
+    /// A read can finish on disk before a newer replacement but reach the UI
+    /// afterward. Publishing it must not mix the old snapshot into new content.
+    @discardableResult
+    func applyLoadedTranscript(content: String, names: [String: String], expectedGeneration: UInt64) -> Bool {
+        guard contentGeneration == expectedGeneration else { return false }
+        for line in content.split(separator: "\n") { ingest(jsonLine: String(line)) }
+        speakerNames = names
+        return true
     }
+
+    func asPlainText(includePartials: Bool = false) -> String {
+        Self.plainText(from: segments, names: speakerNames, includePartials: includePartials)
+    }
+
+    nonisolated static func plainText(from segments: [TranscriptSegment], names: [String: String] = [:], includePartials: Bool = false) -> String {
+        segments.filter { includePartials || !$0.isPartial }.map { seg in
+            let name = displayName(for: seg.speakerIdentity, names: names)
+            let source = seg.sourceSessionID.map { "[source \($0)] " } ?? ""
+            let stream = seg.stream == "unknown" ? "" : "[\(seg.stream)] "
+            return "\(source)\(stream)t=\(String(format: "%.2f", seg.t0))s \(name): \(seg.text)"
+        }.joined(separator: "\n")
+    }
+
+    /// Throw rather than silently omit an invalid record from a saved transcript.
+    nonisolated static func jsonLines(from segments: [TranscriptSegment]) throws -> String {
+        try segments.filter { !$0.isPartial }.map { seg in
+            guard seg.t0.isFinite, (seg.t1 ?? seg.t0).isFinite else {
+                throw CocoaError(.propertyListWriteInvalid)
+            }
+            var payload: [String: Any] = [
+                "speaker_id": seg.speakerID, "stream": seg.stream,
+                "t0": seg.t0, "t1": seg.t1 ?? seg.t0, "text": seg.text
+            ]
+            if let source = seg.sourceSessionID { payload["source_session_id"] = source }
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            return String(decoding: data, as: UTF8.self)
+        }.joined(separator: "\n")
+    }
+
+    func ingest(jsonLine: String, sourceSessionID fallbackSourceSessionID: String? = nil) {
+        var value = TranscriptAccumulator(timestampOffset: timestampOffset, segments: segments,
+            speakerNames: speakerNames, lastTranscriptAt: lastTranscriptAt,
+            lastTranscriptText: lastTranscriptText, echoSuppressionEnabled: echoSuppressionEnabled)
+        value.ingest(jsonLine: jsonLine, sourceSessionID: fallbackSourceSessionID)
+        segments = value.segments
+        speakerNames = value.speakerNames
+        lastTranscriptAt = value.lastTranscriptAt
+        lastTranscriptText = value.lastTranscriptText
+    }
+}
+
+/// The same event reduction serves live UI and durable off-UI replay. It owns
+/// value state only and never reads files or publishes UI observations.
+nonisolated struct TranscriptAccumulator: Sendable {
+    var timestampOffset: Double = 0
+    var segments: [TranscriptSegment] = []
+    var speakerNames: [String: String] = [:]
+    var lastTranscriptAt: Date?
+    var lastTranscriptText: String = ""
+    var echoSuppressionEnabled: Bool = true
+    private let echoTimeWindowSeconds: Double = 1.0
 
     private func mergeSegment(_ newSegment: TranscriptSegment, into existingSegments: [TranscriptSegment]) -> [TranscriptSegment] {
         let epsilon: Double = 0.05
@@ -105,7 +246,7 @@ final class TranscriptModel: ObservableObject {
         var updated = existingSegments
 
         updated.removeAll { existing in
-            guard existing.stream == newSegment.stream else { return false }
+            guard existing.stream == newSegment.stream, existing.sourceSessionID == newSegment.sourceSessionID else { return false }
             let existingEnd = existing.t1 ?? existing.t0
             let existingDuration = max(0, existingEnd - existing.t0)
 
@@ -149,30 +290,34 @@ final class TranscriptModel: ObservableObject {
         return segments.contains { existing in
             !existing.isPartial &&
             existing.stream == "system" &&
+            existing.sourceSessionID == segment.sourceSessionID &&
             abs(existing.t0 - segment.t0) < echoTimeWindowSeconds &&
             segment.text.isEchoOf(existing.text)
         }
     }
 
-    private func removeEchoes(causedBy systemSegment: TranscriptSegment) {
+    private mutating func removeEchoes(causedBy systemSegment: TranscriptSegment) {
         guard echoSuppressionEnabled else { return }
         guard systemSegment.stream == "system" else { return }
 
+        let echoWindow = echoTimeWindowSeconds
         segments.removeAll { existing in
             !existing.isPartial &&
             existing.stream == "mic" &&
-            abs(existing.t0 - systemSegment.t0) < echoTimeWindowSeconds &&
+            existing.sourceSessionID == systemSegment.sourceSessionID &&
+            abs(existing.t0 - systemSegment.t0) < echoWindow &&
             existing.text.isEchoOf(systemSegment.text)
         }
     }
 
-    func ingest(jsonLine: String) {
+    mutating func ingest(jsonLine: String, sourceSessionID fallbackSourceSessionID: String? = nil) {
         guard let data = jsonLine.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
 
         let type = obj["type"] as? String ?? "segment"
+        let sourceSessionID = obj["source_session_id"] as? String ?? fallbackSourceSessionID
 
         switch type {
         case "segment":
@@ -185,6 +330,7 @@ final class TranscriptModel: ObservableObject {
             let segment = TranscriptSegment(
                 speakerID: speakerID,
                 stream: stream,
+                sourceSessionID: sourceSessionID,
                 t0: t0,
                 t1: t1,
                 text: text,
@@ -202,7 +348,7 @@ final class TranscriptModel: ObservableObject {
             // and same-stream partials describing later audio - must survive.
             let finalEnd = segment.t1 ?? segment.t0
             if let supersededIdx = segments.firstIndex(where: {
-                $0.isPartial && $0.stream == segment.stream && finalEnd >= $0.t0
+                $0.isPartial && $0.stream == segment.stream && $0.sourceSessionID == segment.sourceSessionID && finalEnd >= $0.t0
             }) {
                 segments.remove(at: supersededIdx)
             }
@@ -237,13 +383,14 @@ final class TranscriptModel: ObservableObject {
             let text = (obj["text"] as? String) ?? ""
             let lastT0 = segments.last?.t0 ?? -Double.infinity
 
-            if let idx = segments.lastIndex(where: { $0.isPartial && $0.stream == stream }) {
+            if let idx = segments.lastIndex(where: { $0.isPartial && $0.stream == stream && $0.sourceSessionID == sourceSessionID }) {
                 // Keep the existing row's identity so SwiftUI treats this as an
                 // update, not a remove+insert (avoids row-identity churn).
                 let segment = TranscriptSegment(
                     id: segments[idx].id,
                     speakerID: speakerID,
                     stream: stream,
+                    sourceSessionID: sourceSessionID,
                     t0: t0,
                     t1: nil,
                     text: text,
@@ -257,6 +404,7 @@ final class TranscriptModel: ObservableObject {
                 let segment = TranscriptSegment(
                     speakerID: speakerID,
                     stream: stream,
+                    sourceSessionID: sourceSessionID,
                     t0: t0,
                     t1: nil,
                     text: text,
@@ -279,7 +427,12 @@ final class TranscriptModel: ObservableObject {
                 for entry in known {
                     if let speakerID = entry["speaker_id"] as? String {
                         let name = (entry["name"] as? String) ?? speakerID
-                        speakerNames[speakerID] = name
+                        let source = entry["source_session_id"] as? String ?? sourceSessionID
+                        let stream = entry["stream"] as? String ?? obj["stream"] as? String ?? "unknown"
+                        let identity = TranscriptSpeakerIdentity(sourceSessionID: source, stream: stream, speakerID: speakerID)
+                        let key = source == nil && stream == "unknown" ? speakerID : identity.storageKey
+                        // Replayed machine labels must not overwrite a reviewed name.
+                        if speakerNames[key] == nil { speakerNames[key] = name }
                     }
                 }
             }

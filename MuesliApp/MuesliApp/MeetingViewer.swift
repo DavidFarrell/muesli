@@ -21,6 +21,8 @@ struct MeetingViewer: View {
     @State private var rediarizeProgress: BatchRediarizer.Progress?
     @State private var rediarizeError: String?
     @State private var pendingRediarizeResult: BatchRediarizer.Result?
+    @State private var pendingRediarizeRequestID = UUID()
+    @State private var isSavingTranscript = false
     @State private var showRediarizeConfirm = false
     @State private var rediarizeTask: Task<Void, Never>?
     @State private var rediarizeStream: BatchRediarizer.Stream = .both
@@ -29,6 +31,9 @@ struct MeetingViewer: View {
     var body: some View {
         VStack(spacing: 12) {
             header
+            if let error = model.transcriptLoadError {
+                Text(error).foregroundStyle(.red).textSelection(.enabled)
+            }
 
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 12) {
@@ -78,6 +83,12 @@ struct MeetingViewer: View {
                                 .buttonStyle(.bordered)
                             }
 
+                            if pendingRediarizeResult != nil && rediarizeError != nil {
+                                Button("Check or retry saving") { showRediarizeConfirm = true }
+                                    .disabled(isSavingTranscript)
+                            }
+
+                            if isSavingTranscript { ProgressView("Saving transcript…") }
                             if let rediarizeError {
                                 Text(rediarizeError)
                                     .font(.caption)
@@ -175,10 +186,21 @@ struct MeetingViewer: View {
         }
         .alert("Replace transcript?", isPresented: $showRediarizeConfirm) {
             Button("Replace", role: .destructive) {
-                if let result = pendingRediarizeResult {
-                    model.applyBatchRediarization(result, for: meeting)
+                if let result = pendingRediarizeResult, !isSavingTranscript {
+                    isSavingTranscript = true
+                    let requestID = pendingRediarizeRequestID
+                    Task { @MainActor in
+                        defer { isSavingTranscript = false }
+                        do {
+                            try await model.applyBatchRediarization(result, requestID: requestID, for: meeting)
+                            guard pendingRediarizeRequestID == requestID else { return }
+                            pendingRediarizeResult = nil
+                            rediarizeError = nil
+                        } catch {
+                            rediarizeError = "Transcript save is unresolved: \(error.localizedDescription)"
+                        }
+                    }
                 }
-                pendingRediarizeResult = nil
                 showRediarizeConfirm = false
             }
             Button("Cancel", role: .cancel) {
@@ -272,8 +294,8 @@ struct MeetingViewer: View {
                     ForEach(transcript.segments.filter { !$0.isPartial }) { segment in
                         TranscriptRow(
                             segment: segment,
-                            displayName: transcript.displayName(for: segment.speakerID),
-                            onRename: { model.renameSpeaker(id: segment.speakerID, to: $0) }
+                            displayName: transcript.displayName(for: segment),
+                            onRename: { model.renameSpeaker(id: segment.speakerKey, to: $0) }
                         )
                         .id(segment.id)
                     }
@@ -325,6 +347,7 @@ struct MeetingViewer: View {
     }
 
     private var canRediarize: Bool {
+        if isSavingTranscript { return false }
         if isRediarizing || isIdentifyingSpeakers {
             return false
         }
@@ -401,6 +424,7 @@ struct MeetingViewer: View {
                 )
                 try Task.checkCancellation()
                 await MainActor.run {
+                    pendingRediarizeRequestID = UUID()
                     pendingRediarizeResult = result
                     isRediarizing = false
                     rediarizeProgress = nil
@@ -502,7 +526,7 @@ struct MeetingViewer: View {
     private func speakerIdsForIdentification() -> [String] {
         var ids = Set<String>()
         for segment in transcript.segments where !segment.isPartial {
-            ids.insert(segment.speakerID)
+            ids.insert(segment.speakerKey)
         }
         return ids.sorted()
     }
@@ -512,7 +536,7 @@ struct MeetingViewer: View {
             .filter { !$0.isPartial }
             .map { segment in
                 let stream = segment.stream == "unknown" ? "" : "[\(segment.stream)] "
-                return "\(stream)t=\(String(format: "%.2f", segment.t0))s \(segment.speakerID): \(segment.text)"
+                return "[source \(segment.sourceSessionID ?? "legacy/unknown")] \(stream)t=\(String(format: "%.2f", segment.t0))s \(segment.speakerKey) (raw label \(segment.speakerID)): \(segment.text)"
             }
             .joined(separator: "\n")
     }
@@ -550,10 +574,10 @@ struct SpeakerMappingSheet: View {
             List {
                 ForEach(workingMappings.indices, id: \.self) { index in
                     HStack(spacing: 12) {
-                        Text(workingMappings[index].speakerId)
+                        Text(TranscriptSpeakerIdentity(storageKey: workingMappings[index].speakerId)?.description ?? workingMappings[index].speakerId)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .frame(width: 90, alignment: .leading)
+                            .frame(width: 200, alignment: .leading)
 
                         TextField("Name", text: Binding(
                             get: { workingMappings[index].name },

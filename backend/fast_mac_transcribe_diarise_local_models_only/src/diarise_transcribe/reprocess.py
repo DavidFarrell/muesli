@@ -6,27 +6,35 @@ Re-runs transcription + diarization on existing audio files.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import json
+import math
+import tempfile
+import wave
 import sys
 import traceback
 from pathlib import Path
 from typing import List, Optional
 
-from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
-from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
-from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import DiarSegment
-from .merge import merge_transcript_with_diarisation
-from .recovery import (
-    RecoveryWindow,
-    cluster_recovery_windows,
-    drop_words_in_windows,
-    filter_words_in_window,
-    find_wordless_segments,
-    offset_words,
-    splice_words,
-)
-from .senko_diarisation import SenkoDiarizer
+# Model imports can emit diagnostics; reserve stdout for protocol events.
+with redirect_stdout(sys.stderr):
+    from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
+    from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
+    from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
+    from .diarisation import DiarSegment
+    from .merge import merge_transcript_with_diarisation
+    from .recovery import (
+        RecoveryWindow,
+        cluster_recovery_windows,
+        drop_words_in_windows,
+        filter_words_in_window,
+        find_wordless_segments,
+        offset_words,
+        splice_words,
+    )
+    from .senko_diarisation import SenkoDiarizer
+    from .source_recording import MANIFEST_NAME, CommittedSource, committed_sources
+
 
 
 STREAM_FILES = {
@@ -35,8 +43,11 @@ STREAM_FILES = {
 }
 
 
+_protocol_stdout = None
+
+
 def emit(obj: dict) -> None:
-    print(json.dumps(obj), flush=True)
+    print(json.dumps(obj), file=_protocol_stdout or sys.stdout, flush=True)
 
 
 def emit_status(stage: str, stream: Optional[str] = None, **extra) -> None:
@@ -95,8 +106,7 @@ def _discover_session_audio_dirs(meeting_dir: Path, verbose: bool) -> list[Path]
                         continue
                     seen.add(resolved)
                     if not path.exists() or not path.is_dir():
-                        log(f"Warning: session audio folder missing: {path}")
-                        continue
+                        raise ValueError(f"Session audio folder missing; its media extent is unknown: {path}")
                     session_dirs.append(path)
 
     if session_dirs:
@@ -125,6 +135,49 @@ def _discover_session_audio_dirs(meeting_dir: Path, verbose: bool) -> list[Path]
         fallback_dirs.append(entry)
 
     return fallback_dirs
+
+
+
+def _legacy_session_duration(audio_dir: Path) -> float:
+    """Measure both physical source files, regardless of selected ASR streams.
+
+    Word/turn ends cannot establish source duration: quiet tails and an omitted
+    system stream still occupy meeting time. No file mtime or wall-clock gap is
+    a media duration.
+    """
+    durations = []
+    for filename in STREAM_FILES.values():
+        path = audio_dir / filename
+        if not path.exists():
+            continue
+        duration = float(get_audio_duration(str(path)))
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError(f"Invalid audio duration: {path}")
+        durations.append(duration)
+    if not durations:
+        raise ValueError(f"No readable source audio in {audio_dir}")
+    return max(durations)
+
+
+def _committed_wav(source: CommittedSource, destination: Path) -> Path:
+    """Export a frozen committed prefix to an owned temporary file only.
+
+    Compatibility WAVs can be absent, stale, or include an uncommitted tail.
+    Neither those files nor the authoritative PCM/manifest are modified.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remaining = source.size_bytes
+    with source.path.with_suffix(".pcm").open("rb") as pcm, wave.open(str(destination), "wb") as wav:
+        wav.setnchannels(source.channels)
+        wav.setsampwidth(2)
+        wav.setframerate(source.sample_rate)
+        while remaining:
+            chunk = pcm.read(min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValueError(f"Truncated committed source: {source.path.with_suffix('.pcm')}")
+            wav.writeframesraw(chunk)
+            remaining -= len(chunk)
+    return destination
 
 
 def _run_recovery_pass(
@@ -226,7 +279,7 @@ def reprocess_stream(
             print(msg, file=sys.stderr)
 
     temp_wav = None
-    delete_temp = False
+    owned_normalization = None
 
     if is_wav_16k_mono(str(audio_path)):
         temp_wav = str(audio_path)
@@ -234,8 +287,13 @@ def reprocess_stream(
         if not check_ffmpeg():
             raise RuntimeError("ffmpeg not found")
         log("Normalizing audio...")
-        temp_wav = normalise_audio(str(audio_path))
-        delete_temp = True
+        owned_normalization = tempfile.TemporaryDirectory(prefix="muesli-normalized-")
+        temp_wav = str(Path(owned_normalization.name) / "normalized.wav")
+        try:
+            normalise_audio(str(audio_path), output_path=temp_wav)
+        except Exception:
+            owned_normalization.cleanup()
+            raise
 
     try:
         emit_status("transcribing", stream_name)
@@ -315,11 +373,8 @@ def reprocess_stream(
             "duration": duration,
         }
     finally:
-        if delete_temp and temp_wav:
-            try:
-                Path(temp_wav).unlink(missing_ok=True)
-            except Exception:
-                pass
+        if owned_normalization is not None:
+            owned_normalization.cleanup()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -377,7 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def _main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
@@ -395,51 +450,80 @@ def main() -> int:
 
         all_turns = []
         all_speakers = set()
+        source_inventory = []
         running_offset = 0.0
 
-        for session_audio_dir in session_audio_dirs:
-            session_duration = 0.0
-            for stream in streams:
-                filename = STREAM_FILES[stream]
-                path = session_audio_dir / filename
-                if not path.exists():
-                    emit({"type": "error", "message": f"missing audio for {stream}"})
-                    print(f"Missing audio file: {path}", file=sys.stderr)
-                    return 1
+        # This invocation owns only its temporary exports. Default reprocess
+        # never overwrites or deletes source PCM, manifests, or existing WAVs.
+        with tempfile.TemporaryDirectory(prefix="muesli-reprocess-") as temporary:
+            for session_index, session_audio_dir in enumerate(session_audio_dirs):
+                sources = None
+                if (session_audio_dir / MANIFEST_NAME).exists():
+                    sources = committed_sources(session_audio_dir)
+                    reference = sources["mic"]
+                    session_offset = reference.timeline_offset_us / 1_000_000
+                    session_duration = max(source.size_bytes / 32_000 for source in sources.values())
+                else:
+                    session_offset = running_offset
+                    session_duration = _legacy_session_duration(session_audio_dir)
 
-                try:
-                    result = reprocess_stream(
-                        path,
-                        stream,
-                        diar_backend=args.diar_backend,
-                        asr_model=args.asr_model,
-                        language=args.language,
-                        gap_threshold=args.gap_threshold,
-                        speaker_tolerance=args.speaker_tolerance,
-                        verbose=args.verbose,
-                        recovery=not args.no_recovery,
-                    )
-                except Exception as error:
-                    message = f"{stream} reprocess failed ({format_exception_message(error)})"
-                    emit({"type": "error", "message": message})
-                    print(message, file=sys.stderr)
-                    traceback.print_exc(file=sys.stderr)
-                    return 1
+                source_identity = sources["mic"].session_id if sources is not None else str(session_audio_dir.relative_to(meeting_dir))
+                source_inventory.append({
+                    "source_session_id": source_identity,
+                    "audio_folder": str(session_audio_dir.relative_to(meeting_dir)),
+                    "timeline_offset_seconds": session_offset,
+                    "duration_seconds": session_duration,
+                    "storage_kind": "committed_pcm" if sources is not None else "legacy_wav",
+                })
 
-                local_max_t1 = 0.0
-                for turn in result["turns"]:
-                    local_max_t1 = max(local_max_t1, turn["t1"])
-                    turn["t0"] += running_offset
-                    turn["t1"] += running_offset
+                for stream in streams:
+                    if sources is not None:
+                        source = sources[stream]
+                        # Empty committed streams are legitimate (e.g. system
+                        # silence). Do not ask ASR to decode a zero-frame WAV.
+                        if source.size_bytes == 0:
+                            continue
+                        path = _committed_wav(
+                            source, Path(temporary) / str(session_index) / STREAM_FILES[stream])
+                    else:
+                        path = session_audio_dir / STREAM_FILES[stream]
+                        if not path.exists():
+                            emit({"type": "error", "message": f"missing audio for {stream}"})
+                            print(f"Missing audio file: {path}", file=sys.stderr)
+                            return 1
 
-                all_turns.extend(result["turns"])
-                all_speakers.update(result["speakers"])
-                session_duration = max(session_duration, result["duration"], local_max_t1)
+                    try:
+                        result = reprocess_stream(
+                            path,
+                            stream,
+                            diar_backend=args.diar_backend,
+                            asr_model=args.asr_model,
+                            language=args.language,
+                            gap_threshold=args.gap_threshold,
+                            speaker_tolerance=args.speaker_tolerance,
+                            verbose=args.verbose,
+                            recovery=not args.no_recovery,
+                        )
+                    except Exception as error:
+                        message = f"{stream} reprocess failed ({format_exception_message(error)})"
+                        emit({"type": "error", "message": message})
+                        print(message, file=sys.stderr)
+                        traceback.print_exc(file=sys.stderr)
+                        return 1
 
-            running_offset += session_duration
+                    for turn in result["turns"]:
+                        turn["source_session_id"] = source_identity
+                        turn["t0"] += session_offset
+                        turn["t1"] += session_offset
+                    all_turns.extend(result["turns"])
+                    all_speakers.update(result["speakers"])
+
+                # A manifest's explicit offset is authoritative even when
+                # sessions contain pauses/gaps or only one stream is selected.
+                running_offset = max(running_offset, session_offset + session_duration)
 
         all_turns.sort(key=lambda item: (item["t0"], item["stream"], item["speaker_id"]))
-        duration = max(running_offset, max((t["t1"] for t in all_turns), default=0.0))
+        duration = running_offset
 
         emit_status("complete")
         emit({
@@ -447,6 +531,7 @@ def main() -> int:
             "turns": all_turns,
             "speakers": sorted(all_speakers),
             "duration": duration,
+            "sources": source_inventory,
         })
         return 0
     except Exception as error:
@@ -455,6 +540,19 @@ def main() -> int:
         print(message, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    global _protocol_stdout
+    previous = _protocol_stdout
+    _protocol_stdout = sys.stdout
+    try:
+        # Third-party inference prints belong to stderr, including nested
+        # calls. emit() retains the original stdout for JSONL result delivery.
+        with redirect_stdout(sys.stderr):
+            return _main()
+    finally:
+        _protocol_stdout = previous
 
 
 if __name__ == "__main__":

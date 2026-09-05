@@ -265,8 +265,8 @@ struct SessionView: View {
                         ForEach(transcript.segments) { seg in
                             TranscriptRow(
                                 segment: seg,
-                                displayName: transcript.displayName(for: seg.speakerID),
-                                onRename: { model.renameSpeaker(id: seg.speakerID, to: $0) }
+                                displayName: transcript.displayName(for: seg),
+                                onRename: { model.renameSpeaker(id: seg.speakerKey, to: $0) }
                             )
                             .id(seg.id)
                         }

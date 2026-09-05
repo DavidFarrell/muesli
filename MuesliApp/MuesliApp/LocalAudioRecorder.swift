@@ -116,6 +116,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
 
     // Queue-owned fields.
     private var handles: [Source: FileHandle] = [:]
+    private var sourceLease: FileHandle?
     private var positions: [Source: Int64] = [:]
     private var manifest: Manifest
     private var dirty = false
@@ -137,6 +138,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         manifest = Manifest(session_id: sessionID, timeline_offset_us: timelineOffsetUs, streams: Dictionary(
             uniqueKeysWithValues: Source.allCases.map { ($0.rawValue, StreamState()) }))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        sourceLease = try Self.acquireSourceLease(directory: directory, create: true)
         guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent(Self.manifestName).path),
               Source.allCases.allSatisfy({ !FileManager.default.fileExists(atPath: directory.appendingPathComponent($0.rawValue + ".pcm").path) }) else {
             throw RecorderError.existingSource
@@ -162,6 +164,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         // A missing explicit finish leaves completed=false on disk. Do not
         // manufacture clean completion from deinit or trust uncommitted tails.
         for handle in handles.values { try? handle.close() }
+        try? sourceLease?.close()
     }
 
     /// Returns admission, not a durability acknowledgment. Invalid/rejected
@@ -249,6 +252,17 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     /// Expiry leaves the file owner and queued close intact; it never grants
     /// permission to close its handles from another queue or claim completion.
     func finish(timeoutSeconds: Double = 10) async -> Manifest? {
+        requestFinish()
+        let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
+        guard outcome == .completed else {
+            lock.withLock { closeWaitExpired = true }
+            return nil
+        }
+        return lock.withLock { closedManifest }
+    }
+
+    /// Nonblocking close admission, shared with abandoned-start cleanup.
+    func requestFinish() {
         let schedule = lock.withLock {
             accepting = false
             let schedule = !closeRequested
@@ -256,12 +270,12 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             return schedule
         }
         if schedule { queue.async { [self] in closeOnQueue() } }
-        let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
-        guard outcome == .completed else {
-            lock.withLock { closeWaitExpired = true }
-            return nil
-        }
-        return lock.withLock { closedManifest }
+    }
+
+    /// One immutable owner can retain an abandoned preparation until the
+    /// actual close and source-lease release, independently of wait deadlines.
+    func observeClosed(_ observer: @escaping @Sendable () -> Void) {
+        closeCompletion.observeCompletion(observer)
     }
 
     private func drain() {
@@ -444,7 +458,37 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         if dirty { manifest.completed = false }
         closedManifest = manifest
         lock.unlock()
+        try? sourceLease?.close()
+        sourceLease = nil
         closeCompletion.markCompleted()
+    }
+
+    /// An expired caller deadline does not make the committed prefix final.
+    /// Hold the same OS lease while reading a resume boundary; a crashed
+    /// process releases it automatically, while a live closing queue retains it.
+    static func withInactiveSource<T>(directory: URL, _ body: () throws -> T) throws -> T {
+        let lease = try acquireSourceLease(directory: directory, create: false)
+        defer { try? lease?.close() }
+        return try body()
+    }
+
+    private static func acquireSourceLease(directory: URL, create: Bool) throws -> FileHandle? {
+        let path = directory.appendingPathComponent(".capture-owner.lock").path
+        let flags = create ? O_RDWR | O_CREAT | O_CLOEXEC : O_RDONLY | O_CLOEXEC
+        let descriptor = open(path, flags, S_IRUSR | S_IWUSR)
+        if descriptor < 0 {
+            if !create && errno == ENOENT { return nil } // Older sources predate leases.
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let failure = errno
+            Darwin.close(descriptor)
+            if failure == EWOULDBLOCK || failure == EAGAIN {
+                throw RecorderError.sourceFailed("Source audio is still being saved. Resume is available after its original writer closes.")
+            }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
     static func readManifest(directory: URL) throws -> Manifest {
