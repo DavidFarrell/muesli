@@ -47,6 +47,7 @@ def normalise_audio(
     output_path: Optional[str] = None,
     sample_rate: int = 16000,
     mono: bool = True,
+    max_output_bytes: int | None = None,
 ) -> str:
     """
     Convert any audio file to normalised WAV format using ffmpeg.
@@ -56,6 +57,8 @@ def normalise_audio(
         output_path: Path for output WAV file. If None, uses temp file.
         sample_rate: Target sample rate (default 16000 for ASR/diarisation)
         mono: Convert to mono (default True)
+        max_output_bytes: Optional exact owned-output cap (mono only). The
+            decoder uses a PCM pipe; failure closes and reaps the child.
 
     Returns:
         Path to the normalised WAV file
@@ -91,6 +94,39 @@ def normalise_audio(
 
     if mono:
         cmd.extend(["-ac", "1"])  # Mono
+
+    if max_output_bytes is not None:
+        if type(max_output_bytes) is not int or max_output_bytes <= 44 or not mono:
+            raise ValueError("Invalid bounded normalized output configuration")
+        # The owner, not ffmpeg's advisory -fs option, enforces the exact bytes
+        # written. A raw PCM pipe also lets wave write a finalized seekable header.
+        cmd.extend(["-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            with wave.open(str(output_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                written = 44
+                while chunk := process.stdout.read(65536):
+                    if written + len(chunk) > max_output_bytes:
+                        raise ValueError("Normalized output exceeds the size limit")
+                    if len(chunk) % 2:
+                        raise ValueError("Unaligned normalized PCM output")
+                    output.writeframesraw(chunk)
+                    written += len(chunk)
+            if process.wait() != 0:
+                raise RuntimeError("ffmpeg conversion failed")
+            return str(output_path)
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
     cmd.extend([
         "-f", "wav",  # Output format
@@ -137,18 +173,25 @@ def slice_wav_to_temp(input_path: str, start: float, end: float) -> str:
         start_frame = max(0, min(n_frames, int(round(start * framerate))))
         end_frame = max(start_frame, min(n_frames, int(round(end * framerate))))
 
-        src.setpos(start_frame)
-        frame_data = src.readframes(end_frame - start_frame)
-
-    fd, output_path = tempfile.mkstemp(suffix=".wav", prefix="recovery_slice_")
-    os.close(fd)
-
-    with wave.open(output_path, "wb") as dst:
-        dst.setnchannels(n_channels)
-        dst.setsampwidth(sample_width)
-        dst.setframerate(framerate)
-        dst.writeframes(frame_data)
-
+        fd, output_path = tempfile.mkstemp(suffix=".wav", prefix="recovery_slice_")
+        os.close(fd)
+        try:
+            with wave.open(output_path, "wb") as dst:
+                dst.setnchannels(n_channels)
+                dst.setsampwidth(sample_width)
+                dst.setframerate(framerate)
+                src.setpos(start_frame)
+                remaining = end_frame - start_frame
+                while remaining:
+                    frame_data = src.readframes(min(remaining, 32768))
+                    frame_bytes = sample_width * n_channels
+                    if not frame_data or len(frame_data) % frame_bytes:
+                        raise ValueError("Truncated recovery source WAV")
+                    dst.writeframesraw(frame_data)
+                    remaining -= len(frame_data) // frame_bytes
+        except BaseException:
+            Path(output_path).unlink(missing_ok=True)
+            raise
     return output_path
 
 

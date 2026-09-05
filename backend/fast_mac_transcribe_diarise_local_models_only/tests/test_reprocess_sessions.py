@@ -7,8 +7,12 @@ from pathlib import Path
 from diarise_transcribe import reprocess
 
 
-def _write_wav_stub(path: Path) -> None:
-    path.write_bytes(b"RIFF")
+def _write_wav_stub(path: Path, seconds=1) -> None:
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * int(seconds * 16000))
 
 
 def test_discover_session_audio_dirs_prefers_metadata_order(tmp_path: Path) -> None:
@@ -36,8 +40,8 @@ def test_main_applies_session_offsets(tmp_path: Path, monkeypatch) -> None:
     (meeting_dir / "audio-session-2").mkdir(parents=True)
 
     for folder in ("audio", "audio-session-2"):
-        _write_wav_stub(meeting_dir / folder / "mic.wav")
-        _write_wav_stub(meeting_dir / folder / "system.wav")
+        _write_wav_stub(meeting_dir / folder / "mic.wav", 2 if folder == "audio" else 5.5)
+        _write_wav_stub(meeting_dir / folder / "system.wav", 3 if folder == "audio" else 6)
 
     metadata = {
         "sessions": [

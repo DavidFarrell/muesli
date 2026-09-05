@@ -2,9 +2,12 @@
 Tests for the ASR recovery pass wired into reprocess_stream.
 
 These mock the ASR model, diarizer, and audio helpers - no models are
-loaded and no real audio files are touched, matching the project's
+loaded and only synthetic audio files are touched, matching the project's
 existing reprocess tests.
 """
+
+from pathlib import Path
+import wave
 
 from diarise_transcribe import reprocess
 from diarise_transcribe.asr import TranscriptResult, Word
@@ -28,8 +31,9 @@ class FakeASRModel:
         self.calls: list[str] = []
 
     def transcribe(self, path: str, language=None) -> TranscriptResult:
-        self.calls.append(path)
-        value = self._transcripts_by_path[path]
+        label = next(key for key in self._transcripts_by_path if Path(key).name == Path(path).name)
+        self.calls.append(label)
+        value = self._transcripts_by_path[label]
         if isinstance(value, Exception):
             raise value
         return value
@@ -48,9 +52,22 @@ def _default_slice_fn(wav_path, start, end):
 
 
 def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.0, slice_fn=None):
+    def write_wav(path):
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\0\0" * int(file_duration * 16000))
+    for key in transcripts_by_path:
+        if Path(key).name == "MAIN.wav":
+            write_wav(Path(key))
+    def owned_slice(wav_path, start, end):
+        label = (slice_fn or _default_slice_fn)(wav_path, start, end)
+        path = Path(wav_path).parent / Path(label).name
+        write_wav(path)
+        return str(path)
     fake_asr = FakeASRModel(reprocess.DEFAULT_MODEL, transcripts_by_path)
 
-    monkeypatch.setattr(reprocess, "is_wav_16k_mono", lambda path: True)
     monkeypatch.setattr(reprocess, "get_audio_duration", lambda path: file_duration)
     monkeypatch.setattr(reprocess, "ASRModel", lambda model_id: fake_asr)
     monkeypatch.setattr(
@@ -61,7 +78,7 @@ def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.
     monkeypatch.setattr(
         reprocess,
         "slice_wav_to_temp",
-        slice_fn or _default_slice_fn,
+        owned_slice,
     )
     return fake_asr
 
@@ -106,8 +123,12 @@ def test_recovery_noop_when_all_segments_well_covered(monkeypatch, tmp_path) -> 
     _patch_common(monkeypatch, segments, {str(audio_path): main_transcript})
     result_without_recovery = _run(audio_path, recovery=False)
 
-    # Recovery enabled-but-inert output is identical to recovery disabled.
-    assert result_with_recovery == result_without_recovery
+    # Transcript output is identical; the evidence deliberately distinguishes
+    # an executed no-op recovery analysis from recovery not requested.
+    assert {k: v for k, v in result_with_recovery.items() if k != "processing"} == {
+        k: v for k, v in result_without_recovery.items() if k != "processing"}
+    assert result_with_recovery["processing"].recovery.outcome == "not_needed"
+    assert result_without_recovery["processing"].recovery.outcome == "not_requested"
 
 
 def test_recovery_recovers_wordless_segment_and_splices_speaker_back_in(
@@ -259,6 +280,8 @@ def test_recovery_isolates_a_failing_window_and_still_recovers_the_others(
     assert fake_asr.calls == [str(audio_path), slice_path_a, slice_path_b]
 
     speaker_ids = {turn["speaker_id"] for turn in result["turns"]}
+    assert result["processing"].recovery.outcome == "partial_failure"
+    assert result["processing"].recovery.failed_window_count == 1
     # A's speaker never got words (recovery failed) - correctly still absent.
     assert "system:SPEAKER_03" not in speaker_ids
     # B's speaker was recovered despite A's failure.
