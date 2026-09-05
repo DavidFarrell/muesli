@@ -187,7 +187,7 @@ nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
     /// actually executed on `writeQueue` - the observable fact the
     /// `closeStdinAndWait` teardown barrier waits for.
     private var stdinCloseHasRun = false
-    private var stdinCloseEnqueued = false
+    private var stdinCloseEnqueueCount = 0
     private let stdinCloseCompletion = TaskCompletion()
     /// Diagnostics beyond the tracker's backlog accounting: queued writes
     /// that threw (EPIPE after the child died, or writes landing after the
@@ -283,17 +283,27 @@ nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
         enqueueStdinClose()
     }
 
-    /// The single place the stdin handle is ever closed - always on
-    /// `writeQueue`, preserving single-queue handle ownership (round-2 gate
-    /// blocker: BackendProcess.cleanup used to close the same handle
-    /// cross-thread while this queue could be mid-write). Idempotent: a
-    /// second queued close lands on an already-closed handle and `try?`
-    /// swallows it.
+    /// One queue-owned close shared by all deadline waits. Keep admission
+    /// closed and avoid accumulating closure jobs behind a blocked pipe write.
     private func enqueueStdinClose() {
+        let enqueue = stateLock.withLock {
+            isForceClosed = true
+            guard stdinCloseEnqueueCount == 0 else { return false }
+            stdinCloseEnqueueCount = 1
+            return true
+        }
+        guard enqueue else { return }
         writeQueue.async {
             try? self.handle.close()
             self.stateLock.withLock { self.stdinCloseHasRun = true }
+            self.stdinCloseCompletion.markCompleted()
         }
+    }
+
+    /// Actual queued operation count and completion, including while the queue
+    /// is blocked. This also lets teardown diagnostics distinguish a pending close.
+    var stdinCloseSnapshot: (enqueued: Int, closed: Bool) {
+        stateLock.withLock { (stdinCloseEnqueueCount, stdinCloseHasRun) }
     }
 
     /// Teardown barrier: reject further sends, enqueue the close, and wait

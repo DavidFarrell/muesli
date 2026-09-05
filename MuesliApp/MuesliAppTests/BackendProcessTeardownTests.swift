@@ -27,10 +27,12 @@ final class BackendProcessTeardownTests: XCTestCase {
         let closed = await writer.closeStdinAndWait(timeoutSeconds: 2)
         XCTAssertTrue(closed, "the queued close must have RUN before teardown proceeds")
 
-        backend.cleanup() // must not touch stdin (and must not crash)
-
+        // Closing stdin does not imply that cat has finished echoing stdout.
+        // Preserve the production exit-before-output-cleanup ordering; an
+        // explicit early stdout abort is allowed to produce SIGPIPE in cat.
         let status = await backend.waitForExit(timeoutSeconds: 5)
         XCTAssertEqual(status, 0, "cat exits 0 only on stdin EOF - proving the writer's close delivered it")
+        backend.cleanup() // must not touch stdin (and must not crash)
     }
 
     /// Wedged child: /bin/sleep never reads stdin, so the pipe fills and a

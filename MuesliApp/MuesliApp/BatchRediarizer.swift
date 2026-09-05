@@ -141,7 +141,7 @@ actor BatchRediarizer {
         progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
     ) async throws -> Result {
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
-        return try await execute(progressHandler: progressHandler) { accumulator in
+        return try await execute(protecting: meetingDirectory, progressHandler: progressHandler) { accumulator in
             let build: (String) throws -> BackendProcess = { python in
                 let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue]
                 let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
@@ -159,7 +159,7 @@ actor BatchRediarizer {
                     beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
                     launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil,
                     progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil) async throws -> Result {
-        try await execute(progressHandler: progressHandler) { accumulator in
+        try await execute(protecting: backendRoot, progressHandler: progressHandler) { accumulator in
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot,
                 environment: Self.backendEnvironment(root: backendRoot), eventJournalURL: eventJournalURL,
                 beforeEventJournalIO: beforeEventJournalIO, launchCheckpoint: launchCheckpoint)
@@ -168,11 +168,11 @@ actor BatchRediarizer {
         }
     }
 
-    private func execute(progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+    private func execute(protecting folder: URL, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
                          factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
         let accumulator = Accumulator()
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
-        let attempt = try admission.start(timeoutSeconds: min(8, timeoutSeconds)) { try factory(accumulator) }
+        let attempt = try admission.start(protecting: folder, timeoutSeconds: min(8, timeoutSeconds)) { try factory(accumulator) }
         return try await withTaskCancellationHandler(operation: {
             do {
                 switch await attempt.waitUntilReady() {

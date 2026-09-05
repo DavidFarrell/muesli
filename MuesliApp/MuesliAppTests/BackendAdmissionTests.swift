@@ -207,6 +207,92 @@ final class BackendAdmissionTests: XCTestCase {
         XCTAssertEqual(status.droppedUILines, 300)
     }
 
+    func testStoppedUnclaimedNativeLaunchProtectsMeetingFromTrashThroughActualClose() async throws {
+        let folder = try folder(), owner = BackendAdmissionOwner(), probe = AdmissionProbe()
+        let recorder = try LocalAudioRecorder(directory: folder.appendingPathComponent("audio"))
+        let metadata = MeetingMetadata(version: 1, title: "Stopped", createdAt: Date(), updatedAt: Date(),
+            durationSeconds: 0, lastTimestamp: 0, status: .degraded,
+            sessions: [.init(sessionID: 1, startedAt: Date(), audioFolder: "audio", streams: [:])],
+            segmentCount: 0, speakerNames: [:])
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: folder.appendingPathComponent("meeting.json"))
+        let attempt = try owner.start(protecting: folder, timeoutSeconds: 0.1) {
+            let backend = try BackendProcess(command: ["/bin/sleep", "30"],
+                eventJournalURL: folder.appendingPathComponent("events"), launchCheckpoint: { hit in
+                    if case .afterRun = hit { probe.block() }
+                })
+            probe.install(backend)
+            return BackendAdmissionOwner.Resources(backend: backend)
+        }
+        defer { probe.release.signal(); attempt.cancel() }
+        XCTAssertEqual(probe.entered.wait(timeout: .now() + 2), .success)
+        owner.retireAdmission() // Production Stop admission fence.
+        _ = await recorder.finish(timeoutSeconds: 2) // Native/source/finalizer may now finish.
+        _ = await attempt.waitUntilReady()
+        let alias = folder.deletingLastPathComponent().appendingPathComponent("backend-alias-" + UUID().uuidString)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: folder)
+        defer { try? FileManager.default.removeItem(at: alias) }
+        let deletion = try MeetingCatalogOwner.trash(in: alias, onCompletion: { _ in }, move: { _ in
+            XCTFail("The retained native launch must prevent moving its original source path")
+        })
+        if case .failed(let error) = await deletion.wait(timeoutSeconds: 2) {
+            XCTAssertTrue(error.localizedDescription.contains("still owns"))
+        } else { XCTFail("Stop completion cannot release backend deletion protection") }
+        probe.release.signal()
+        let closed = await attempt.waitUntilClosed(timeoutSeconds: 3)
+        XCTAssertEqual(closed, .completed)
+        let deletionAfterClose = try MeetingCatalogOwner.trash(in: folder, onCompletion: { _ in }, move: { original in
+            XCTAssertThrowsError(try BackendMeetingLease.acquire(in: original, exclusive: false),
+                "Actual Trash must retain its exclusive backend lease through the move")
+        })
+        if case .completed = await deletionAfterClose.wait(timeoutSeconds: 2) {} else { XCTFail("Actual owner close must permit deletion") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path), "No real Trash operation is used")
+    }
+
+    func testExclusiveMoveLeaseRejectsLaunchBeforeItsFactoryCanRecreateOldPath() async throws {
+        let folder = try folder(), owner = BackendAdmissionOwner()
+        let lease = try BackendMeetingLease.acquire(in: folder, exclusive: true)
+        defer { try? lease.close() }
+        let attempt = try owner.start(protecting: folder) {
+            XCTFail("A pending move must reject admission before any backend factory IO")
+            return BackendAdmissionOwner.Resources(backend: try BackendProcess(command: ["/usr/bin/true"]))
+        }
+        if case .failed = await attempt.waitUntilReady() {} else { XCTFail("Expected folder lease conflict") }
+        let closed = await attempt.waitUntilClosed(timeoutSeconds: 1)
+        XCTAssertEqual(closed, .completed)
+    }
+
+    func testStdinCloseCompletesPromptlyAndRepeatedBlockedWaitsQueueOnlyOnce() async throws {
+        signal(SIGPIPE, SIG_IGN)
+        let pipe = Pipe()
+        let writer = FramedWriter(stdinHandle: pipe.fileHandleForWriting, stallThresholdSeconds: 0.01)
+        defer { try? pipe.fileHandleForReading.close(); writer.forceCloseStdin() }
+        writer.send(type: .audio, stream: .mic, ptsUs: 0, payload: Data(repeating: 7, count: 65_536))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !writer.isBacklogStalled() && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(writer.isBacklogStalled(), "the real pipe must be blocked before testing close waits")
+        for _ in 0..<40 {
+            let closed = await writer.closeStdinAndWait(timeoutSeconds: 0.005)
+            XCTAssertFalse(closed)
+        }
+        XCTAssertEqual(writer.stdinCloseSnapshot.enqueued, 1)
+        XCTAssertFalse(writer.stdinCloseSnapshot.closed)
+        writer.send(type: .meetingStop, stream: .system, ptsUs: 0, payload: Data())
+        XCTAssertEqual(writer.backlogSnapshot().rejectedAfterCloseFrames, 1)
+        try pipe.fileHandleForReading.close()
+        let start = ContinuousClock.now
+        let closed = await writer.closeStdinAndWait(timeoutSeconds: 5)
+        XCTAssertTrue(closed)
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+        let immediate = ContinuousClock.now
+        let alreadyClosed = await writer.closeStdinAndWait(timeoutSeconds: 5)
+        XCTAssertTrue(alreadyClosed)
+        XCTAssertLessThan(immediate.duration(to: .now), .milliseconds(100))
+        XCTAssertEqual(writer.stdinCloseSnapshot.enqueued, 1)
+    }
+
     func testBatchProductionAdmissionCancellationDuringPrepareIsBoundedAndBusy() async throws {
         let folder = try folder(), probe = AdmissionProbe(), runner = BatchRediarizer(timeoutSeconds: 10)
         let task = Task {

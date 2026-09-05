@@ -2377,7 +2377,7 @@ final class AppModel: ObservableObject {
                     toTail: self.isCurrentSource(recorder, eventsURL: eventsURL), handle: sessionLogHandle)
             }
         }
-        let attempt = try backendAdmission.start(timeoutSeconds: 8) {
+        let attempt = try backendAdmission.start(protecting: folderURL, timeoutSeconds: 8) {
             try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
                 var command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
                     "--transcribe-stream", transcribeStream, "--output-dir", audioDir.path,

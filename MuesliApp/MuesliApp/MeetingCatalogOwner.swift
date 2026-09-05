@@ -157,6 +157,8 @@ nonisolated final class MeetingCatalogOwner: @unchecked Sendable {
                           try FileManager.default.trashItem(at: folder, resultingItemURL: &destination)
                       }) throws -> TranscriptPersistenceStore.Operation<Void> {
         try store.start(in: folder, onCompletion: onCompletion) { context in
+            let inferenceLease = try BackendMeetingLease.acquire(in: folder, exclusive: true)
+            defer { try? inferenceLease.close() }
             let metadata = try context.readMetadata()
             let root = folder.standardizedFileURL.resolvingSymlinksInPath()
             var artifactLeases: [FileHandle] = []

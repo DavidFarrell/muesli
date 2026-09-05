@@ -124,7 +124,7 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
     private var active: Attempt?
     var isBusy: Bool { lock.withLock { active != nil } }
 
-    func start(timeoutSeconds: Double = 8, factory: @escaping @Sendable () throws -> Resources) throws -> Attempt {
+    func start(protecting meetingFolder: URL? = nil, timeoutSeconds: Double = 8, factory: @escaping @Sendable () throws -> Resources) throws -> Attempt {
         precondition(timeoutSeconds.isFinite && timeoutSeconds >= 0)
         let attempt = Attempt(timeoutSeconds: timeoutSeconds)
         try lock.withLock {
@@ -134,7 +134,10 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         attempt.arm()
         queue.async { [self] in
             var resources: Resources?
+            var meetingLease: FileHandle?
             do {
+                try attempt.checkAdmission()
+                if let meetingFolder { meetingLease = try BackendMeetingLease.acquire(in: meetingFolder, exclusive: false) }
                 try attempt.checkAdmission()
                 let value = try factory()
                 resources = value
@@ -147,8 +150,10 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
             // This detached owner is not a child of the cancelled caller. It
             // retains this admission until every original resource really closes.
             let ownedResources = resources
+            let ownedMeetingLease = meetingLease
             Task.detached { [self] in
                 if let ownedResources { await Self.maintain(ownedResources, attempt: attempt) }
+                try? ownedMeetingLease?.close()
                 lock.withLock { if active === attempt { active = nil } }
                 attempt.finished.markCompleted()
             }
@@ -212,6 +217,37 @@ nonisolated enum BackendLaunchConfiguration {
             return BackendAdmissionOwner.Resources(backend: backend, onClosed: { root.stopAccessingSecurityScopedResource() })
         } catch {
             root.stopAccessingSecurityScopedResource()
+            throw error
+        }
+    }
+}
+
+/// Shared by live/batch inference and the actual catalog Trash operation.
+/// A caller deadline never releases this lease. It is separate from the
+/// transcript transaction so finalization may still save a degraded result.
+nonisolated enum BackendMeetingLease {
+    static func acquire(in folder: URL, exclusive: Bool) throws -> FileHandle {
+        let path = folder.appendingPathComponent(".backend-owner.lock").path
+        // Never create a folder here: a late attempt whose meeting was moved
+        // must fail before any Python entry point can recreate its old path.
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        do {
+            guard flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0 else {
+                throw BackendAdmissionOwner.Failure(message: "Transcription or a pending move still owns this meeting folder.")
+            }
+            // The move may have completed between open and flock. An open
+            // handle in Trash must not authorize a launch at the original path.
+            var owned = stat(), current = stat()
+            guard fstat(fd, &owned) == 0, lstat(path, &current) == 0,
+                  owned.st_mode & S_IFMT == S_IFREG,
+                  owned.st_dev == current.st_dev, owned.st_ino == current.st_ino else {
+                throw BackendAdmissionOwner.Failure(message: "The meeting folder changed during transcription admission.")
+            }
+            return handle
+        } catch {
+            try? handle.close()
             throw error
         }
     }
