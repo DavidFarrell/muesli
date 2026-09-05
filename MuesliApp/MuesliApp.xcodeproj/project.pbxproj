@@ -63,6 +63,7 @@
 				MeetingMetadataEdits.swift,
 				MainActorStarvationWatchdog.swift,
 				MeterPublishGate.swift,
+				NativeCallbackOwner.swift,
 				MicAudioFormat.swift,
 				MicAudioForwarder.swift,
 				MicAudioIngress.swift,

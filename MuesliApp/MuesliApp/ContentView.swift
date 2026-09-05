@@ -673,22 +673,6 @@ struct Permissions {
 
 // MARK: - ScreenCaptureKit Helpers
 
-enum ScreenCaptureKitHelpers {
-    static func fetchShareableContent(excludingDesktopWindows: Bool, onScreenWindowsOnly: Bool) async throws -> SCShareableContent {
-        try await withCheckedThrowingContinuation { cont in
-            SCShareableContent.getExcludingDesktopWindows(excludingDesktopWindows, onScreenWindowsOnly: onScreenWindowsOnly) { content, error in
-                if let error {
-                    cont.resume(throwing: error)
-                } else if let content {
-                    cont.resume(returning: content)
-                } else {
-                    cont.resume(throwing: NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "No shareable content returned"]))
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Audio Devices
 
 struct AudioDevice: Identifiable, Hashable {

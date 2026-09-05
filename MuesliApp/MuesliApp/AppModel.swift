@@ -111,6 +111,9 @@ final class AppModel: ObservableObject {
     @Published var windowThumbnails: [CGWindowID: CGImage] = [:]
     @Published var isLoadingShareableContent = false
     @Published var shareableContentError: String?
+    private let thumbnailOwner = NativeCallbackOwner<SourceThumbnailRequest.Image>()
+    private var thumbnailTask: Task<Void, Never>?
+    private var thumbnailGeneration = UUID()
 
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
@@ -1837,6 +1840,12 @@ final class AppModel: ObservableObject {
     }
 
     func loadShareableContent() async {
+        guard !isLoadingShareableContent else { return }
+        thumbnailGeneration = UUID()
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        displayThumbnails.removeAll()
+        windowThumbnails.removeAll()
         isLoadingShareableContent = true
         shareableContentError = nil
         defer { isLoadingShareableContent = false }
@@ -1857,17 +1866,20 @@ final class AppModel: ObservableObject {
                 selectedWindowID = windows.first?.windowID
             }
 
-            // Capture thumbnails in background - don't block the UI
-            Task { @MainActor in
-                await captureThumbnails()
+            let generation = thumbnailGeneration
+            let capturedDisplays = displays
+            let capturedWindows = windows
+            thumbnailTask = Task { @MainActor [weak self] in
+                await self?.captureThumbnails(displays: capturedDisplays, windows: capturedWindows, generation: generation)
             }
 
             if isStartScreenActive && !isCapturing {
                 await refreshHomeLevelPreview()
             }
         } catch {
-            shareableContentError = String(describing: error)
-            screenPermissionGranted = false
+            shareableContentError = error.localizedDescription
+            // An unavailable native request is not evidence of TCC denial.
+            screenPermissionGranted = Permissions.screenCapturePreflight()
         }
     }
 
@@ -1968,7 +1980,7 @@ final class AppModel: ObservableObject {
             )
             screenPermissionGranted = true
         } catch {
-            screenPermissionGranted = false
+            screenPermissionGranted = Permissions.screenCapturePreflight()
         }
     }
 
@@ -1978,94 +1990,44 @@ final class AppModel: ObservableObject {
     }
 
     @MainActor
-    private func captureThumbnails() async {
-        displayThumbnails.removeAll()
-        windowThumbnails.removeAll()
-
-        let thumbnailSize = CGSize(width: 160, height: 90)
-
+    private func captureThumbnails(displays: [SCDisplay], windows: [SCWindow], generation: UUID) async {
+        defer {
+            if thumbnailGeneration == generation { thumbnailTask = nil }
+        }
+        // Snapshot IDs/filters belong only to this picker generation. A new
+        // refresh retires publication immediately, even if macOS returns late.
         for display in displays {
-            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-            if let image = await captureThumbnail(for: filter),
-               let thumbnail = resizeImage(image, to: thumbnailSize) {
-                displayThumbnails[display.displayID] = thumbnail
+            guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+            let request = SourceThumbnailRequest(filter: SCContentFilter(display: display, excludingApplications: [], exceptingWindows: []))
+            do {
+                let image = try await thumbnailOwner.perform(timeoutSeconds: 2, request: request.capture)
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                displayThumbnails[display.displayID] = image.value
+            } catch {
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                if thumbnailOwner.isBusy {
+                    shareableContentError = "Screen previews are unavailable while a previous macOS request is still pending."
+                    return
+                }
+                // A disappeared individual window/display may fail normally;
+                // only unresolved native ownership stops the entire batch.
             }
         }
-
         for window in windows {
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            if let image = await captureThumbnail(for: filter),
-               let thumbnail = resizeImage(image, to: thumbnailSize) {
-                windowThumbnails[window.windowID] = thumbnail
-            }
-        }
-    }
-
-    @MainActor
-    private func captureThumbnail(for filter: SCContentFilter) async -> CGImage? {
-        let config = SCStreamConfiguration()
-        config.showsCursor = false
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-
-        // Use a timeout to prevent hanging if a window capture never returns
-        return await withTaskGroup(of: CGImage?.self) { group in
-            group.addTask {
-                await withCheckedContinuation { continuation in
-                    SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
-                        guard error == nil,
-                              let sampleBuffer,
-                              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-                            continuation.resume(returning: nil)
-                            return
-                        }
-                        let ciImage = CIImage(cvImageBuffer: imageBuffer)
-                        let context = CIContext()
-                        let cgImage = context.createCGImage(ciImage, from: ciImage.extent)
-                        continuation.resume(returning: cgImage)
-                    }
+            guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+            let request = SourceThumbnailRequest(filter: SCContentFilter(desktopIndependentWindow: window))
+            do {
+                let image = try await thumbnailOwner.perform(timeoutSeconds: 2, request: request.capture)
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                windowThumbnails[window.windowID] = image.value
+            } catch {
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                if thumbnailOwner.isBusy {
+                    shareableContentError = "Screen previews are unavailable while a previous macOS request is still pending."
+                    return
                 }
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(2))
-                return nil
-            }
-            // Return first result (either the capture or timeout)
-            let result = await group.next() ?? nil
-            group.cancelAll()
-            return result
         }
-    }
-
-    private func resizeImage(_ image: CGImage, to maxSize: CGSize) -> CGImage? {
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
-        if width == 0 || height == 0 {
-            return nil
-        }
-
-        let widthRatio = maxSize.width / width
-        let heightRatio = maxSize.height / height
-        let ratio = min(widthRatio, heightRatio)
-
-        let newWidth = Int(width * ratio)
-        let newHeight = Int(height * ratio)
-
-        guard let context = CGContext(
-            data: nil,
-            width: newWidth,
-            height: newHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
-
-        return context.makeImage()
     }
 
     func startMeeting() async {
