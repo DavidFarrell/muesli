@@ -24,6 +24,19 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript_sources.json").path), file: file, line: line)
     }
 
+    func testFinalSavePublicationRejectsLateTimeoutAndOlderFolderCompletion() {
+        let folder = URL(fileURLWithPath: "/synthetic-meeting")
+        var gate = MeetingSavePublicationGate()
+        let first = gate.begin(folder: folder)
+        XCTAssertTrue(gate.isPending(folder: folder, id: first))
+        XCTAssertTrue(gate.markTerminal(folder: folder, id: first))
+        XCTAssertFalse(gate.isPending(folder: folder, id: first), "late timeout cannot restore pending notice")
+        let second = gate.begin(folder: folder)
+        XCTAssertFalse(gate.markTerminal(folder: folder, id: first), "old completion cannot replace newer metadata")
+        XCTAssertTrue(gate.isPending(folder: folder, id: second))
+        XCTAssertTrue(gate.markTerminal(folder: folder, id: second))
+    }
+
     func testStoppedFinalizerReplaysOnlyDurableJournalAndCommitsAllFilesTogether() async throws {
         for fail in [false, true] {
             let (folder, old, _) = try fixture()

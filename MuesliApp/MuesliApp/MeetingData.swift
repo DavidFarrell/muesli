@@ -189,3 +189,23 @@ struct MeetingHistoryItem: Identifiable {
     let segmentCount: Int
     let status: MeetingStatus
 }
+
+/// UI publication has its own generation: waiter deadlines never overrule an
+/// observed terminal result, and old callbacks cannot replace newer saves.
+nonisolated struct MeetingSavePublicationGate {
+    private struct State { let id: UUID; var terminal = false }
+    private var states: [URL: State] = [:]
+    mutating func begin(folder: URL) -> UUID {
+        let id = UUID()
+        states[folder] = State(id: id)
+        return id
+    }
+    func isPending(folder: URL, id: UUID) -> Bool {
+        states[folder].map { $0.id == id && !$0.terminal } == true
+    }
+    mutating func markTerminal(folder: URL, id: UUID) -> Bool {
+        guard states[folder]?.id == id else { return false }
+        states[folder]?.terminal = true
+        return true
+    }
+}

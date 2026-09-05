@@ -114,6 +114,7 @@ final class AppModel: ObservableObject {
     @Published var showPermissionsSheet = false
     @Published var isCapturing = false
     @Published var isFinalizing = false
+    private var meetingSavePublication = MeetingSavePublicationGate()
     @Published private var meetingSaveNotices: [String: String] = [:]
     var meetingSaveNotice: String? {
         meetingSaveNotices.isEmpty ? nil : meetingSaveNotices.keys.sorted().compactMap { meetingSaveNotices[$0] }.joined(separator: "\n")
@@ -2896,10 +2897,11 @@ final class AppModel: ObservableObject {
 
         let journalStatus = journalDrain?.status
         let incomplete = inferenceFailed || exitStatus != 0 || !journalComplete
+        let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
             let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
                 onCompletion: { [weak self] result in
-                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL) }
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
                 try TranscriptReplacement.commitStoppedMeeting(context: context,
                     timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
@@ -2910,14 +2912,16 @@ final class AppModel: ObservableObject {
             switch await operation.wait(timeoutSeconds: 5) {
             case .completed, .failed: break // Actual completion publishes the observed result.
             case .timedOut, .cancelled:
+                guard meetingSavePublication.isPending(folder: session.folderURL, id: saveID) else { return }
                 meetingSaveNotices[session.folderURL.path] = "The meeting is still being saved. Its original disk operation retains ownership; the source recording and recovery files are preserved."
             }
         } catch {
-            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL)
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL, id: saveID)
         }
     }
 
-    private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL) {
+    private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL, id: UUID) {
+        guard meetingSavePublication.markTerminal(folder: folder, id: id) else { return }
         switch result {
         case .success(let metadata):
             meetingSaveNotices[folder.path] = nil
@@ -3207,10 +3211,11 @@ final class AppModel: ObservableObject {
         artifactResult: SessionArtifactFinishResult? = nil,
         incomplete: Bool = false
     ) async {
+        let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
             let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
                 onCompletion: { [weak self] result in
-                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL) }
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
                 let prior = try context.readMetadata()
                 let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
@@ -3225,10 +3230,11 @@ final class AppModel: ObservableObject {
             switch await operation.wait(timeoutSeconds: 5) {
             case .completed, .failed: break
             case .timedOut, .cancelled:
+                guard meetingSavePublication.isPending(folder: session.folderURL, id: saveID) else { return }
                 meetingSaveNotices[session.folderURL.path] = "The interrupted meeting is still being saved. Its source recording and recovery files are preserved."
             }
         } catch {
-            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL)
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL, id: saveID)
         }
     }
 
