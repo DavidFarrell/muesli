@@ -50,6 +50,7 @@
 				LocalAudioRecorder.swift,
 				TranscriptEventJournal.swift,
 				MeetingData.swift,
+				MeetingFileAccess.swift,
 				MeetingStartPreparation.swift,
 				MeetingRenamer.swift,
 				MeetingCatalogOwner.swift,
