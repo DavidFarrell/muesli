@@ -3177,7 +3177,7 @@ final class AppModel: ObservableObject {
     }
 
     private func readMeetingMetadata(from folderURL: URL) throws -> MeetingMetadata {
-        try TranscriptPersistenceStore.shared.recover(in: folderURL)
+        try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
         let data = try Data(contentsOf: meetingMetadataURL(for: folderURL))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -3185,6 +3185,7 @@ final class AppModel: ObservableObject {
     }
 
     private func writeMeetingMetadata(_ metadata: MeetingMetadata, to folderURL: URL) throws {
+        try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -3287,6 +3288,11 @@ final class AppModel: ObservableObject {
     }
 
     func renameSpeaker(id: String, to name: String) {
+        let folder: URL?
+        if let session = currentSession { folder = session.folderURL }
+        else if case .viewing(let item) = activeScreen { folder = item.folderURL }
+        else { folder = nil }
+        if let folder, !canEditTranscript(in: folder) { return }
         transcriptModel.renameSpeaker(id: id, to: name)
         if let session = currentSession {
             persistSpeakerNames(to: session.folderURL)
@@ -3433,7 +3439,21 @@ final class AppModel: ObservableObject {
         currentAttachments = []
     }
 
+    private func canEditTranscript(in folder: URL) -> Bool {
+        do {
+            guard transcriptModel.pendingReplacement?.folder != folder else {
+                throw TranscriptPersistenceStore.Failure.busy
+            }
+            try TranscriptPersistenceStore.shared.assertReadable(in: folder)
+            return true
+        } catch {
+            transcriptLoadError = "Check the pending save or reopen the meeting before editing its speakers. \(error.localizedDescription)"
+            return false
+        }
+    }
+
     func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
+        guard canEditTranscript(in: meeting.folderURL) else { return }
         var didUpdate = false
         for mapping in mappings {
             let id = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3484,20 +3504,24 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applyBatchRediarization(_ result: BatchRediarizer.Result, for meeting: MeetingHistoryItem) throws {
-        let metadata = try readMeetingMetadata(from: meeting.folderURL)
-        let replacement = try TranscriptReplacement(result: result, metadata: metadata)
-        try transcriptModel.applyReplacement(replacement, in: meeting.folderURL)
-
-        if let updatedItem = buildMeetingHistoryItem(for: meeting.folderURL) {
-            if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
-                meetingHistory[idx] = updatedItem
-            } else {
-                meetingHistory.insert(updatedItem, at: 0)
-            }
-            if case .viewing(let current) = activeScreen, current.id == meeting.id {
-                activeScreen = .viewing(updatedItem)
-            }
+    func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {
+        guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL else {
+            throw TranscriptPersistenceStore.Failure.superseded
+        }
+        let replacement = try await transcriptModel.applyBatchResult(result, requestID: requestID, in: meeting.folderURL)
+        let metadata = replacement.metadata
+        // Use the committed worker result; do not reread storage on the UI.
+        let updatedItem = MeetingHistoryItem(id: meeting.id, folderURL: meeting.folderURL,
+                                             title: metadata.title, createdAt: metadata.createdAt,
+                                             durationSeconds: metadata.durationSeconds,
+                                             segmentCount: metadata.segmentCount, status: metadata.status)
+        if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
+            meetingHistory[idx] = updatedItem
+        } else {
+            meetingHistory.insert(updatedItem, at: 0)
+        }
+        if case .viewing(let current) = activeScreen, current.id == meeting.id {
+            activeScreen = .viewing(updatedItem)
         }
     }
 
@@ -3511,6 +3535,7 @@ final class AppModel: ObservableObject {
     func renameMeeting(folderURL: URL, to newTitle: String) throws -> String {
         let trimmed: String
         do {
+            try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
             trimmed = try MeetingRenamer.rename(folderURL: folderURL, to: newTitle)
         } catch {
             appendBackendLog("Failed to rename meeting at \(folderURL.lastPathComponent): \(error.localizedDescription)", toTail: true)
@@ -3694,6 +3719,14 @@ final class AppModel: ObservableObject {
     }
 
     private func buildMeetingHistoryItem(for folderURL: URL) -> MeetingHistoryItem? {
+        do { try TranscriptPersistenceStore.shared.assertReadable(in: folderURL) }
+        catch {
+            // Do not fall through to parsing mixed canonical files while an
+            // owner is active or crash recovery is still needed.
+            return MeetingHistoryItem(id: folderURL.lastPathComponent, folderURL: folderURL,
+                                      title: folderURL.lastPathComponent, createdAt: Date.distantPast,
+                                      durationSeconds: 0, segmentCount: 0, status: .interrupted)
+        }
         if let metadata = try? readMeetingMetadata(from: folderURL) {
             return MeetingHistoryItem(
                 id: folderURL.lastPathComponent,
@@ -3822,37 +3855,36 @@ final class AppModel: ObservableObject {
 
     @Published var transcriptLoadError: String?
 
-    private func loadTranscriptForViewer(from folderURL: URL) {
-        transcriptLoadError = nil
-        do { try TranscriptPersistenceStore.shared.recover(in: folderURL) }
-        catch {
-            transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-            appendBackendLog("Transcript recovery required: \(error.localizedDescription)", toTail: true)
-            transcriptLoadError = "Transcript needs recovery: \(error.localizedDescription)"
-            return
-        }
-        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
-        if FileManager.default.fileExists(atPath: transcriptURL.path) {
-            if let data = try? Data(contentsOf: transcriptURL),
-               let content = String(data: data, encoding: .utf8) {
-                for line in content.split(separator: "\n") {
-                    transcriptModel.ingest(jsonLine: String(line))
-                }
-            }
-        } else {
-            appendBackendLog("Transcript not found for viewer: \(transcriptURL.path)", toTail: true)
-        }
+    private var transcriptLoadIntent = UUID()
 
-        do {
-            let metadata = try readMeetingMetadata(from: folderURL)
-            transcriptModel.speakerNames = metadata.speakerNames
-        } catch {
-            appendBackendLog("Failed to load speaker names: \(error.localizedDescription)", toTail: true)
+    private func loadTranscriptForViewer(from folderURL: URL) {
+        let intent = UUID()
+        transcriptLoadIntent = intent
+        transcriptLoadError = nil
+        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+        Task { @MainActor [weak self] in
+            guard let self, self.transcriptLoadIntent == intent else { return }
+            do {
+                let operation = try TranscriptPersistenceStore.shared.start(in: folderURL) { context in
+                    let jsonl = try context.readData(named: "transcript.jsonl")
+                    let metadata = try? context.readMetadata() // Legacy transcripts may have no meeting.json.
+                    return (String(decoding: jsonl, as: UTF8.self), metadata?.speakerNames ?? [:])
+                }
+                let (content, names) = try await operation.value(timeoutSeconds: 5)
+                guard self.transcriptLoadIntent == intent,
+                      case .viewing(let item) = self.activeScreen, item.folderURL == folderURL else { return }
+                for line in content.split(separator: "\n") { self.transcriptModel.ingest(jsonLine: String(line)) }
+                self.transcriptModel.speakerNames = names
+            } catch {
+                guard self.transcriptLoadIntent == intent else { return }
+                self.appendBackendLog("Transcript load is unresolved: \(error.localizedDescription)", toTail: true)
+                self.transcriptLoadError = "Transcript could not be loaded: \(error.localizedDescription) Reopen the meeting to retry."
+            }
         }
     }
 
     private func clearViewerTranscript() {
+        transcriptLoadIntent = UUID()
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 
 nonisolated struct TranscriptReplacement: Sendable {
+    let id = UUID()
     let segments: [TranscriptSegment]
     let metadata: MeetingMetadata
     let files: [String: Data]
@@ -43,11 +44,54 @@ nonisolated struct TranscriptReplacement: Sendable {
 }
 
 extension TranscriptModel {
+    func applyBatchResult(_ result: BatchRediarizer.Result, requestID: UUID, in folder: URL,
+                          store: TranscriptPersistenceStore = .shared,
+                          timeoutSeconds: Double = 5) async throws -> TranscriptReplacement {
+        try await applyOwnedReplacement(id: requestID, in: folder, store: store, timeoutSeconds: timeoutSeconds) { context in
+            try TranscriptReplacement(result: result, metadata: context.readMetadata())
+        }
+    }
+
     /// Persistence is the admission point for changing what the viewer shows.
-    /// A thrown failure leaves every published property unchanged.
+    /// Timeout keeps the original operation for retry; it does not establish
+    /// failure of the save, release ownership, or publish an optimistic model.
+    @discardableResult
     func applyReplacement(_ replacement: TranscriptReplacement, in folder: URL,
-                          store: TranscriptPersistenceStore = .shared) throws {
-        try store.commit(files: replacement.files, in: folder)
+                          store: TranscriptPersistenceStore = .shared,
+                          timeoutSeconds: Double = 5) async throws -> TranscriptReplacement {
+        try await applyOwnedReplacement(id: replacement.id, in: folder, store: store, timeoutSeconds: timeoutSeconds) { _ in replacement }
+    }
+
+    private func applyOwnedReplacement(id: UUID, in folder: URL, store: TranscriptPersistenceStore,
+                                       timeoutSeconds: Double,
+                                       prepare: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> TranscriptReplacement) async throws -> TranscriptReplacement {
+        let intent = UUID()
+        replacementWaitIntent = intent
+        let generation = contentGeneration
+        let operation: TranscriptPersistenceStore.Operation<TranscriptReplacement>
+        if let pending = pendingReplacement, pending.id == id, pending.folder == folder {
+            operation = pending.operation
+        } else {
+            operation = try store.start(in: folder) { context in
+                let replacement = try prepare(context)
+                try context.commit(files: replacement.files)
+                return replacement
+            }
+            pendingReplacement = PendingReplacement(id: id, folder: folder, operation: operation)
+        }
+        let replacement: TranscriptReplacement
+        switch await operation.wait(timeoutSeconds: timeoutSeconds) {
+        case .completed(let value): replacement = value
+        case .failed(let error):
+            if pendingReplacement?.id == id { pendingReplacement = nil }
+            throw error
+        case .timedOut: throw TranscriptPersistenceStore.Failure.timedOut
+        case .cancelled: throw TranscriptPersistenceStore.Failure.cancelled
+        }
+        guard contentGeneration == generation, replacementWaitIntent == intent else {
+            throw TranscriptPersistenceStore.Failure.superseded
+        }
+        pendingReplacement = nil
         resetForNewMeeting(keepSpeakerNames: false)
         segments = replacement.segments
         speakerNames = replacement.metadata.speakerNames
@@ -55,5 +99,6 @@ extension TranscriptModel {
             lastTranscriptText = last.text
             lastTranscriptAt = Date()
         }
+        return replacement
     }
 }

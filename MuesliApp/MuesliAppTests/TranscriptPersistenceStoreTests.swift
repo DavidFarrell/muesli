@@ -24,10 +24,10 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript_sources.json").path), file: file, line: line)
     }
 
-    func testSuccessfulReplacementPersistsRawProvenanceInventoryAndMetadataBeforePublishing() throws {
+    func testSuccessfulReplacementPersistsRawProvenanceInventoryAndMetadataBeforePublishing() async throws {
         let (folder, _, replacement) = try fixture()
         let model = makeModel()
-        try model.applyReplacement(replacement, in: folder)
+        try await model.applyReplacement(replacement, in: folder)
         XCTAssertEqual(model.segments.map(\.sourceSessionID), ["A", "B"])
         XCTAssertEqual(model.segments.map(\.speakerID), ["system:0", "system:0"])
         XCTAssertEqual(Set(model.segments.map(\.speakerKey)).count, 2)
@@ -41,7 +41,7 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         XCTAssertEqual(sources.map(\.sourceSessionID), ["A", "B", "silent"])
     }
 
-    func testDiskStagingMetadataRenameAndLateCommitFailureLeaveOldFilesAndUI() throws {
+    func testDiskStagingMetadataRenameAndLateCommitFailureLeaveOldFilesAndUI() async throws {
         for step in [TranscriptPersistenceStore.Step.stage("meeting.json"), .replace("meeting.json"), .replace("transcript.txt"), .commitJournal] {
             let (folder, old, replacement) = try fixture()
             let model = makeModel()
@@ -49,7 +49,10 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
             model.speakerNames = ["old": "Reviewed"]
             let priorID = model.segments[0].id
             let store = TranscriptPersistenceStore { candidate in if candidate == step { throw POSIXError(.ENOSPC) } }
-            XCTAssertThrowsError(try model.applyReplacement(replacement, in: folder, store: store))
+            do {
+                try await model.applyReplacement(replacement, in: folder, store: store)
+                XCTFail("Expected disk failure")
+            } catch { }
             XCTAssertEqual(model.segments[0].id, priorID)
             XCTAssertEqual(model.lastTranscriptText, "Previous")
             XCTAssertEqual(model.speakerNames, ["old": "Reviewed"])
@@ -58,19 +61,22 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         }
     }
 
-    func testRollbackFailureRetainsJournalAndNextLoadRecoversEntireOldSnapshot() throws {
+    func testRollbackFailureRetainsJournalAndNextLoadRecoversEntireOldSnapshot() async throws {
         let (folder, old, replacement) = try fixture()
         let store = TranscriptPersistenceStore { step in
             if step == .replace("transcript.txt") || step == .restore("meeting.json") { throw POSIXError(.EIO) }
         }
-        XCTAssertThrowsError(try store.commit(files: replacement.files, in: folder)) { error in
+        do {
+            try await store.start(in: folder) { try $0.commit(files: replacement.files) }.value()
+            XCTFail("Expected recovery failure")
+        } catch {
             guard case TranscriptPersistenceStore.Failure.recoveryRequired = error else { return XCTFail("Expected explicit recoverable failure") }
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent(TranscriptPersistenceStore.journalDirectoryName).path))
-        try TranscriptPersistenceStore.shared.recover(in: folder)
+        try await TranscriptPersistenceStore.shared.start(in: folder) { _ in () }.value()
         try assertOld(old, in: folder)
-        try TranscriptPersistenceStore.shared.recover(in: folder)
-        try TranscriptPersistenceStore.shared.commit(files: replacement.files, in: folder)
+        try await TranscriptPersistenceStore.shared.start(in: folder) { _ in () }.value()
+        try await TranscriptPersistenceStore.shared.start(in: folder) { try $0.commit(files: replacement.files) }.value()
         XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("transcript.txt")), replacement.files["transcript.txt"])
     }
 
@@ -79,5 +85,165 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         let segment = TranscriptSegment(speakerID: "0", stream: "mic", t0: .nan, t1: 2, text: "Bad clock", isPartial: false)
         XCTAssertThrowsError(try TranscriptModel.jsonLines(from: [segment]))
         try assertOld(old, in: folder)
+    }
+}
+
+nonisolated private final class TranscriptDiskStall: @unchecked Sendable {
+    let entered = TaskCompletion()
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var calls = 0
+    var count: Int { lock.withLock { calls } }
+    func block() {
+        lock.withLock { calls += 1 }
+        entered.markCompleted()
+        release.wait()
+    }
+}
+
+extension TranscriptPersistenceStoreTests {
+    func testStalledSaveLeavesUIResponsiveAndRetainsOwnerUntilRealCompletion() async throws {
+        let (folder, _, replacement) = try fixture()
+        let (otherFolder, _, _) = try fixture()
+        let model = makeModel()
+        model.ingest(jsonLine: #"{"speaker_id":"old","stream":"mic","t0":0,"t1":1,"text":"Previous"}"#)
+        let stall = TranscriptDiskStall()
+        let store = TranscriptPersistenceStore { step in
+            if step == .stage("meeting.json") { stall.block() }
+        }
+        // Safety release makes the test fail, rather than hang, if a regression
+        // accidentally puts the disk wait back on MainActor.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { stall.release.signal() }
+        let began = Date()
+        let save = Task { @MainActor in
+            do {
+                try await model.applyReplacement(replacement, in: folder, store: store, timeoutSeconds: 0.03)
+                XCTFail("Expected a pending outcome")
+            } catch {
+                guard case TranscriptPersistenceStore.Failure.timedOut = error else { return XCTFail("Expected timeout, got \(error)") }
+            }
+        }
+        let entered = await stall.entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(entered, .completed)
+        let heartbeat = TaskCompletion()
+        Task { @MainActor in heartbeat.markCompleted() }
+        let heartbeatResult = await heartbeat.wait(timeoutSeconds: 0.1)
+        XCTAssertEqual(heartbeatResult, .completed)
+        await save.value
+        XCTAssertLessThan(Date().timeIntervalSince(began), 0.5, "UI progress and timeout must not wait for the blocked disk")
+        XCTAssertEqual(model.lastTranscriptText, "Previous")
+        XCTAssertThrowsError(try store.start(in: folder) { _ in () })
+        XCTAssertThrowsError(try store.assertReadable(in: folder))
+        // No global I/O lock: an unrelated folder can recover and read now.
+        let metadata = try await store.start(in: otherFolder) { try $0.readMetadata() }.value(timeoutSeconds: 0.2)
+        XCTAssertEqual(metadata.title, "Meeting")
+        let original = try XCTUnwrap(model.pendingReplacement?.operation)
+        stall.release.signal()
+        _ = try await original.value(timeoutSeconds: 1)
+        XCTAssertEqual(model.lastTranscriptText, "Previous", "late disk completion is not optimistic UI completion")
+        try await model.applyReplacement(replacement, in: folder, store: store, timeoutSeconds: 1)
+        XCTAssertEqual(model.segments.map(\.sourceSessionID), ["A", "B"])
+        XCTAssertEqual(stall.count, 1, "retry must observe the original completed owner rather than write again")
+    }
+
+    func testViewerChangeFencesLateSavePublication() async throws {
+        let (folder, _, replacement) = try fixture()
+        let model = makeModel()
+        let stall = TranscriptDiskStall()
+        let store = TranscriptPersistenceStore { step in
+            if step == .stage("meeting.json") { stall.block() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { stall.release.signal() }
+        let save = Task { @MainActor in
+            do {
+                try await model.applyReplacement(replacement, in: folder, store: store, timeoutSeconds: 2)
+                XCTFail("A retired viewer must not receive the result")
+            } catch {
+                guard case TranscriptPersistenceStore.Failure.superseded = error else { return XCTFail("Expected superseded, got \(error)") }
+            }
+        }
+        let entered = await stall.entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(entered, .completed)
+        model.resetForNewMeeting(keepSpeakerNames: false)
+        model.ingest(jsonLine: #"{"speaker_id":"new","stream":"mic","t0":0,"t1":1,"text":"Different meeting"}"#)
+        stall.release.signal()
+        await save.value
+        XCTAssertEqual(model.lastTranscriptText, "Different meeting")
+    }
+
+    func testInterruptedCleanupAfterRollbackOrStagingPreservesReadableCanonicalSnapshot() async throws {
+        for trigger in [TranscriptPersistenceStore.Step.replace("transcript.txt"), .stagingPublished] {
+            let (folder, old, replacement) = try fixture()
+            let store = TranscriptPersistenceStore { step in
+                if step == trigger || step == .cleanupResolved { throw POSIXError(.EIO) }
+            }
+            do {
+                try await store.start(in: folder) { try $0.commit(files: replacement.files) }.value()
+                XCTFail("Expected interrupted cleanup")
+            } catch { }
+            let root = folder.appendingPathComponent(TranscriptPersistenceStore.journalDirectoryName)
+            let journal = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("journal.json"))) as? [String: Any])
+            XCTAssertEqual(journal["committed"] as? Bool, true, "restored/untouched canonical files need a durable keep marker before cleanup")
+            // Reproduce recursive cleanup deleting a backup, then process death
+            // before it deletes the journal. The next owner needs no backup.
+            try FileManager.default.removeItem(at: root.appendingPathComponent("old-meeting.json"))
+            try await TranscriptPersistenceStore.shared.start(in: folder) { _ in () }.value()
+            try assertOld(old, in: folder)
+        }
+    }
+
+    func testInterruptedRecoveryCleanupAlsoPublishesResolvedMarker() async throws {
+        let (folder, old, replacement) = try fixture()
+        let failing = TranscriptPersistenceStore { step in
+            if step == .replace("transcript.txt") || step == .restore("meeting.json") { throw POSIXError(.EIO) }
+        }
+        do { try await failing.start(in: folder) { try $0.commit(files: replacement.files) }.value(); XCTFail() }
+        catch { }
+        let cleanupFailure = TranscriptPersistenceStore { if $0 == .cleanupResolved { throw POSIXError(.EIO) } }
+        do { try await cleanupFailure.start(in: folder) { _ in () }.value(); XCTFail() }
+        catch { }
+        let root = folder.appendingPathComponent(TranscriptPersistenceStore.journalDirectoryName)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("old-transcript.txt"))
+        try await TranscriptPersistenceStore.shared.start(in: folder) { _ in () }.value()
+        try assertOld(old, in: folder)
+    }
+}
+
+extension TranscriptPersistenceStoreTests {
+    func testOwnedCommitAndTerminalCallbackFinishWhileMainActorIsBlocked() async throws {
+        let (folder, _, replacement) = try fixture()
+        let completion = DispatchSemaphore(value: 0)
+        let operation = try TranscriptPersistenceStore.shared.start(in: folder, onCompletion: { _ in completion.signal() }) { context in
+            let metadata = try context.readMetadata()
+            try context.commit(files: replacement.files)
+            return metadata.title
+        }
+        // Deliberately block the actual UI executor. Both disk work and its
+        // terminal callback must complete without hopping back to MainActor.
+        XCTAssertEqual(completion.wait(timeout: .now() + 1), .success)
+        let title = try await operation.value(timeoutSeconds: 0)
+        XCTAssertEqual(title, "Meeting")
+    }
+
+    func testRecoveryFailureInvokesTerminalCallbackAndReleasesAdmission() async throws {
+        let (folder, _, _) = try fixture()
+        let root = folder.appendingPathComponent(TranscriptPersistenceStore.journalDirectoryName)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        try Data("invalid journal".utf8).write(to: root.appendingPathComponent("journal.json"))
+        let completion = DispatchSemaphore(value: 0)
+        let operation = try TranscriptPersistenceStore.shared.start(in: folder, onCompletion: { _ in completion.signal() }) { _ in
+            XCTFail("Recovery failure must prevent the operation body")
+        }
+        XCTAssertEqual(completion.wait(timeout: .now() + 1), .success)
+        switch await operation.wait(timeoutSeconds: 0) {
+        case .failed: break
+        default: XCTFail("Expected recovery failure")
+        }
+        // A malformed journal requires repair, but must not leak its owner.
+        let retry = try TranscriptPersistenceStore.shared.start(in: folder) { _ in () }
+        switch await retry.wait(timeoutSeconds: 1) {
+        case .failed: break
+        default: XCTFail("Expected the same recoverable journal error")
+        }
     }
 }

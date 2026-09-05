@@ -96,6 +96,14 @@ extension String {
 
 @MainActor
 final class TranscriptModel: ObservableObject {
+    struct PendingReplacement {
+        let id: UUID
+        let folder: URL
+        let operation: TranscriptPersistenceStore.Operation<TranscriptReplacement>
+    }
+    var pendingReplacement: PendingReplacement?
+    var replacementWaitIntent = UUID()
+    private(set) var contentGeneration: UInt64 = 0
     var timestampOffset: Double = 0
     @Published var segments: [TranscriptSegment] = []
     @Published var speakerNames: [String: String] = [:]
@@ -153,6 +161,8 @@ final class TranscriptModel: ObservableObject {
     }
 
     func resetForNewMeeting(keepSpeakerNames: Bool) {
+        contentGeneration &+= 1
+        pendingReplacement = nil
         segments.removeAll()
         lastTranscriptAt = nil
         lastTranscriptText = ""

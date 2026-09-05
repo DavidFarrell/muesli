@@ -21,6 +21,8 @@ struct MeetingViewer: View {
     @State private var rediarizeProgress: BatchRediarizer.Progress?
     @State private var rediarizeError: String?
     @State private var pendingRediarizeResult: BatchRediarizer.Result?
+    @State private var pendingRediarizeRequestID = UUID()
+    @State private var isSavingTranscript = false
     @State private var showRediarizeConfirm = false
     @State private var rediarizeTask: Task<Void, Never>?
     @State private var rediarizeStream: BatchRediarizer.Stream = .both
@@ -82,9 +84,11 @@ struct MeetingViewer: View {
                             }
 
                             if pendingRediarizeResult != nil && rediarizeError != nil {
-                                Button("Retry saving transcript") { showRediarizeConfirm = true }
+                                Button("Check or retry saving") { showRediarizeConfirm = true }
+                                    .disabled(isSavingTranscript)
                             }
 
+                            if isSavingTranscript { ProgressView("Saving transcript…") }
                             if let rediarizeError {
                                 Text(rediarizeError)
                                     .font(.caption)
@@ -182,13 +186,19 @@ struct MeetingViewer: View {
         }
         .alert("Replace transcript?", isPresented: $showRediarizeConfirm) {
             Button("Replace", role: .destructive) {
-                if let result = pendingRediarizeResult {
-                    do {
-                        try model.applyBatchRediarization(result, for: meeting)
-                        pendingRediarizeResult = nil
-                        rediarizeError = nil
-                    } catch {
-                        rediarizeError = "Transcript was not replaced: \(error.localizedDescription)"
+                if let result = pendingRediarizeResult, !isSavingTranscript {
+                    isSavingTranscript = true
+                    let requestID = pendingRediarizeRequestID
+                    Task { @MainActor in
+                        defer { isSavingTranscript = false }
+                        do {
+                            try await model.applyBatchRediarization(result, requestID: requestID, for: meeting)
+                            guard pendingRediarizeRequestID == requestID else { return }
+                            pendingRediarizeResult = nil
+                            rediarizeError = nil
+                        } catch {
+                            rediarizeError = "Transcript save is unresolved: \(error.localizedDescription)"
+                        }
                     }
                 }
                 showRediarizeConfirm = false
@@ -337,6 +347,7 @@ struct MeetingViewer: View {
     }
 
     private var canRediarize: Bool {
+        if isSavingTranscript { return false }
         if isRediarizing || isIdentifyingSpeakers {
             return false
         }
@@ -413,6 +424,7 @@ struct MeetingViewer: View {
                 )
                 try Task.checkCancellation()
                 await MainActor.run {
+                    pendingRediarizeRequestID = UUID()
                     pendingRediarizeResult = result
                     isRediarizing = false
                     rediarizeProgress = nil
