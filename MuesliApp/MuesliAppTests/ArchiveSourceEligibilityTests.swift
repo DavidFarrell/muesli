@@ -190,6 +190,18 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
             rejected(root, contains: "Unindexed")
         }
     }
+    func testUnknownRootMaterialIsNeverClassifiedByAMediaSuffixDenylist() throws {
+        for path in ["extra.m4a", "extra.aac", "extra.aiff", "extra.caf", "extra.mov", "extra.flac", "extra.webm", "unknown", "unknown.bin", "future-evidence.json"] {
+            let root = try folder(); try fixture(root); try write(root, path, Data("unindexed material".utf8))
+            rejected(root, contains: "Unindexed")
+        }
+        let root = try folder(); try fixture(root)
+        for path in ["transcript.txt", "transcript.jsonl", "transcript_sources.json", "backend.log"] {
+            try write(root, path, Data("ordinary projection, not closure evidence".utf8))
+        }
+        let result = try inspect(root)
+        XCTAssertTrue(result.inventory.files.contains { $0.path == "transcript_sources.json" })
+    }
     func testLedgerFailurePendingDuplicateForeignUnknownAndMissingClosureRefuse() throws {
         for kind in ["failed", "pending", "duplicate", "foreign", "unknown", "no_stop", "wrong_stop", "size", "missing", "duration", "count", "header_offset"] {
             let root = try folder(), id = try fixture(root, artifacts: true)[0]

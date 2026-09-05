@@ -183,11 +183,13 @@ nonisolated enum ArchiveSourceEligibility {
             try attachments(result)
             try require(Set(inventory.directories) == usedDirectories, "Unindexed source/artifact directories require review, including empty directories.")
             for record in inventory.files where !usedFiles.contains(record.path) {
-                // Ordinary root transcript/log/evidence files remain in the
-                // complete hash inventory. They cannot prove source closure.
-                let reserved = ["pcm", "wav", "mp4", "png", "jpg", "jpeg"]
-                try require(!record.path.contains("/") && !reserved.contains((record.path as NSString).pathExtension.lowercased())
-                            && !["assets.jsonl", "source-recording.json", "transcript_events.jsonl", ".capture-owner.lock", ".artifact-owner.lock"].contains(record.path.lowercased()),
+                // Only actual app-owned root projections/logs/locks have a
+                // known role here. A media suffix denylist cannot classify
+                // arbitrary M4A/MOV/extensionless material as ordinary evidence.
+                // Future evidence names need their own typed integration.
+                let ordinaryRootFiles: Set<String> = ["transcript.txt", "transcript.jsonl", "transcript_sources.json",
+                    "backend.log", ".meeting-access.lock", ".meeting-transaction.lock", ".backend-owner.lock"]
+                try require(ordinaryRootFiles.contains(record.path),
                             "Unindexed source or artifact material requires review: \(record.path)")
             }
             return result
