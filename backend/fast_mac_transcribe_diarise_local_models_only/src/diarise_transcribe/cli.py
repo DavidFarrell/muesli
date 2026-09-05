@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
 
 from .audio import normalise_audio, check_ffmpeg, get_audio_duration
 from .asr import ASRModel, DEFAULT_MODEL
@@ -130,6 +131,7 @@ Examples:
         help="Verbose output",
     )
 
+    add_parser_argument(parser)
     return parser
 
 
@@ -179,7 +181,10 @@ def run_pipeline(
         sys.exit(1)
 
     # Validate input file
-    input_path = Path(input_file).resolve()
+    input_path = validate_source_path(Path(input_file))
+    for output in (output_text, output_json, output_srt, output_rttm):
+        if output is not None:
+            validate_source_path(Path(output))
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
@@ -285,6 +290,7 @@ def main():
     """Main entry point."""
     parser = create_parser()
     args = parser.parse_args()
+    require_app_admission(args)
 
     try:
         run_pipeline(

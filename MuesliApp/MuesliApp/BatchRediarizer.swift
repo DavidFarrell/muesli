@@ -143,7 +143,7 @@ actor BatchRediarizer {
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
         return try await execute(protecting: meetingDirectory, progressHandler: progressHandler) { accumulator in
             let build: (String) throws -> BackendProcess = { python in
-                let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue]
+                let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue, "--meeting-lease-required"]
                 let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
                 Self.attach(backend, accumulator: accumulator, progressHandler: progressHandler)
                 return backend

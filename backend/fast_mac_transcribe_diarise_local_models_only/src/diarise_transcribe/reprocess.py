@@ -15,6 +15,7 @@ import sys
 import traceback
 from pathlib import Path
 from typing import List, Optional
+from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
 
 # Model imports can emit diagnostics; reserve stdout for protocol events.
 with redirect_stdout(sys.stderr):
@@ -429,15 +430,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the ASR recovery pass for voiced-but-wordless diar segments",
     )
+    add_parser_argument(parser)
     return parser
 
 
 def _main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    require_app_admission(args)
 
     try:
-        meeting_dir = Path(args.meeting_dir).expanduser().resolve()
+        meeting_dir = validate_source_path(Path(args.meeting_dir), meeting_root=True)
         session_audio_dirs = _discover_session_audio_dirs(meeting_dir, verbose=args.verbose)
         if not session_audio_dirs:
             emit({"type": "error", "message": "audio folder not found"})

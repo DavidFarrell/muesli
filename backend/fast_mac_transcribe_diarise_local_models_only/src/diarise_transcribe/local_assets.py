@@ -125,11 +125,14 @@ def preflight(model_id: str = DEFAULT_ASR_MODEL, *, diarisation: bool = False, h
 
 
 def main() -> int:
+    from .meeting_lease import add_parser_argument, require_app_admission
     parser = argparse.ArgumentParser(description="Verify local inference assets without downloads or model loading")
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument("--diarisation", action="store_true")
     parser.add_argument("--hashes", action="store_true", help="Include SHA-256 provenance for release manifests")
+    add_parser_argument(parser)
     args = parser.parse_args()
+    require_app_admission(args)
     try:
         result = preflight(args.asr_model, diarisation=args.diarisation, hashes=args.hashes)
     except MissingLocalAssets as exc:

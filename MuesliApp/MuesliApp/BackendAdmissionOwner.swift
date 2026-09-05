@@ -253,7 +253,7 @@ nonisolated enum BackendMeetingLease {
         let path = folder.appendingPathComponent(".backend-owner.lock").path
         // Never create a folder here: a late attempt whose meeting was moved
         // must fail before any Python entry point can recreate its old path.
-        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        let fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, S_IRUSR | S_IWUSR)
         guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         do {
@@ -264,7 +264,7 @@ nonisolated enum BackendMeetingLease {
             // handle in Trash must not authorize a launch at the original path.
             var owned = stat(), current = stat()
             guard fstat(fd, &owned) == 0, lstat(path, &current) == 0,
-                  owned.st_mode & S_IFMT == S_IFREG,
+                  owned.st_mode & S_IFMT == S_IFREG, owned.st_nlink == 1, owned.st_uid == geteuid(),
                   owned.st_dev == current.st_dev, owned.st_ino == current.st_ino else {
                 throw BackendAdmissionOwner.Failure(message: "The meeting folder changed during transcription admission.")
             }

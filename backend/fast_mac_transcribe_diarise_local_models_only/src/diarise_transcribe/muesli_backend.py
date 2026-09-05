@@ -27,6 +27,7 @@ from .merge import merge_transcript_with_diarisation
 from .source_recording import CommittedSource, committed_sources
 from .local_assets import MissingLocalAssets, preflight
 from .runtime_identity import observe_runtime
+from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
 
 MSG_AUDIO = 1
 MSG_SCREENSHOT_EVENT = 2
@@ -848,13 +849,15 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Verbose logs to stderr",
     )
+    add_parser_argument(parser)
     return parser
 
 
 def main() -> int:
     args = create_parser().parse_args()
+    require_app_admission(args)
 
-    output_dir = Path(args.output_dir).resolve()
+    output_dir = validate_source_path(Path(args.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     protocol_stdout = sys.stdout

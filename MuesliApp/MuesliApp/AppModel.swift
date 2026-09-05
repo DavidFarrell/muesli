@@ -2386,7 +2386,7 @@ final class AppModel: ObservableObject {
             try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
                 var command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
                     "--transcribe-stream", transcribeStream, "--output-dir", audioDir.path,
-                    "--keep-wav", "--source-recording", "--live-asr-only"]
+                    "--keep-wav", "--source-recording", "--live-asr-only", "--meeting-lease-required"]
                 #if DEBUG
                 command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
                 #endif
