@@ -61,6 +61,29 @@ nonisolated enum OrphanedMeetingRecovery {
         return end
     }
 
+    /// Off-UI validation for final publication. Earlier source failures cannot
+    /// be erased by a healthy last session, or by missing files after Resume.
+    static func finalizationSourceProblems(folderURL: URL, metadata: MeetingMetadata) -> [String] {
+        let root = folderURL.standardizedFileURL.resolvingSymlinksInPath()
+        var problems: [String] = []
+        for session in metadata.sessions {
+            do {
+                let audio = root.appendingPathComponent(session.audioFolder).standardizedFileURL.resolvingSymlinksInPath()
+                guard audio.path.hasPrefix(root.path + "/") else { throw resumeError("Source folder is outside the meeting") }
+                try LocalAudioRecorder.withInactiveSource(directory: audio) {
+                    let manifest = try validatedManifest(directory: audio)
+                    guard manifest.completed, manifest.problem_count == 0,
+                          manifest.streams.values.allSatisfy({ $0.dropped_frames == 0 }) else {
+                        throw resumeError("Source did not finish without loss")
+                    }
+                }
+            } catch {
+                problems.append("Session \(session.sessionID): \(error.localizedDescription)")
+            }
+        }
+        return problems
+    }
+
     private static func resumeError(_ message: String) -> NSError {
         NSError(domain: "MeetingResume", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
@@ -115,6 +138,10 @@ nonisolated enum OrphanedMeetingRecovery {
 
     static func finalize(_ metadata: MeetingMetadata, evidence: Evidence, now: Date) -> MeetingMetadata {
         var updated = metadata
+        updated.preservePreviousSessionOutcome()
+        if let last = updated.sessions.indices.last, updated.sessions[last].finalizationStatus == "unknown" {
+            updated.sessions[last].finalizationStatus = "interrupted"
+        }
         updated.status = .interrupted
         updated.updatedAt = now
         updated.durationSeconds = recoveredDuration(mediaDurationSeconds: evidence.durationSeconds,

@@ -29,6 +29,7 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
     var durationSeconds: Double? = nil
     var artifactsFolder: String? = nil
     var artifactFinalization: MeetingArtifactFinalization? = nil
+    var finalizationStatus: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -40,6 +41,7 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
         case durationSeconds = "duration_seconds"
         case artifactsFolder = "artifacts_folder"
         case artifactFinalization = "artifact_finalization"
+        case finalizationStatus = "finalization_status"
     }
 }
 
@@ -100,11 +102,18 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
     var segmentCount: Int
     var speakerNames: [String: String]
 
+    /// Preserve the observed previous outcome before Resume changes the meeting
+    /// status to recording. Missing historical session evidence stays unknown.
+    mutating func preservePreviousSessionOutcome() {
+        guard let last = sessions.indices.last, sessions[last].finalizationStatus == nil else { return }
+        sessions[last].finalizationStatus = status == .recording ? "unknown" : status.rawValue
+    }
+
     /// Pure metadata preparation for a folder-owned off-UI persistence operation.
     func finalized(segments finalizedSegments: [TranscriptSegment],
                    sourceManifest: LocalAudioRecorder.Manifest?,
                    artifactResult: SessionArtifactFinishResult?,
-                   incomplete: Bool, now: Date = Date()) -> MeetingMetadata {
+                   incomplete: Bool, sourceProblems: [String] = [], now: Date = Date()) -> MeetingMetadata {
         var metadata = self
         let artifacts = artifactResult.map(MeetingArtifactFinalization.init)
         let artifactsRequired = metadata.sessions.last?.artifactsFolder != nil
@@ -127,10 +136,13 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
         metadata.durationSeconds = durationSeconds
         metadata.lastTimestamp = lastTimestamp
         metadata.segmentCount = segmentCount
-        metadata.status = incomplete || artifactsIncomplete || sourceManifest?.completed != true ? .degraded : .completed
+        let currentComplete = !incomplete && !artifactsIncomplete
+            && sourceManifest?.completed == true && sourceManifest?.problem_count == 0
+            && sourceManifest?.streams.values.allSatisfy { $0.dropped_frames == 0 } == true
         if let lastIndex = metadata.sessions.indices.last {
             var lastSession = metadata.sessions[lastIndex]
             lastSession.artifactFinalization = artifacts
+            lastSession.finalizationStatus = currentComplete ? "completed" : "degraded"
             if lastSession.endedAt == nil {
                 lastSession.endedAt = now
             }
@@ -146,6 +158,11 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
             }
             metadata.sessions[lastIndex] = lastSession
         }
+        let allSessionsComplete = !metadata.sessions.isEmpty && metadata.sessions.allSatisfy {
+            $0.finalizationStatus == "completed"
+                && ($0.artifactsFolder == nil || $0.artifactFinalization?.isComplete == true)
+        }
+        metadata.status = allSessionsComplete && sourceProblems.isEmpty ? .completed : .degraded
         return metadata
     }
 

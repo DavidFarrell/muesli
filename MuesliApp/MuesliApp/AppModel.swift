@@ -3228,6 +3228,7 @@ final class AppModel: ObservableObject {
         audioFolderName: String
     ) throws {
         var updated = metadata
+        updated.preservePreviousSessionOutcome()
         updated.status = .recording
         updated.updatedAt = session.startedAt
         let streams: [String: MeetingStreamInfo] = [

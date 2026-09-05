@@ -17,6 +17,51 @@ final class OrphanedMeetingRecoveryTests: XCTestCase {
         XCTAssertEqual(saved.sessions.last?.timelineOffsetSeconds, 60)
     }
 
+    func testCleanResumeCannotErasePriorInferenceFailureOrUnknownHistory() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio-session-2"))
+        let source = await recorder.finish(timeoutSeconds: 3)
+        for priorStatus in [MeetingStatus.degraded, .interrupted, .recording] {
+            var previous = metadata(status: priorStatus)
+            previous.preservePreviousSessionOutcome()
+            previous.status = .recording
+            previous.sessions.append(MeetingSessionMetadata(sessionID: 2, startedAt: Date(),
+                audioFolder: "audio-session-2", streams: [:]))
+            let saved = previous.finalized(segments: [], sourceManifest: source,
+                artifactResult: nil, incomplete: false)
+            XCTAssertEqual(saved.status, .degraded)
+            XCTAssertEqual(saved.sessions.last?.finalizationStatus, "completed")
+            XCTAssertNotEqual(saved.sessions.first?.finalizationStatus, "completed")
+        }
+    }
+
+    func testPriorSourceLossAndMissingIndexedSourcePreventCompletedPublication() async throws {
+        let root = try folder(), first = root.appendingPathComponent("audio")
+        let oldRecorder = try LocalAudioRecorder(directory: first)
+        _ = await oldRecorder.finish(timeoutSeconds: 3)
+        let next = try LocalAudioRecorder(directory: root.appendingPathComponent("audio-session-2"))
+        let source = await next.finish(timeoutSeconds: 3)
+        var previous = metadata(status: .completed)
+        previous.preservePreviousSessionOutcome()
+        previous.status = .recording
+        previous.sessions.append(MeetingSessionMetadata(sessionID: 2, startedAt: Date(),
+            audioFolder: "audio-session-2", streams: [:]))
+        XCTAssertTrue(OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: root, metadata: previous).isEmpty)
+        var manifest = try LocalAudioRecorder.readManifest(directory: first)
+        manifest.problem_count = 1
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(manifest).write(to: first.appendingPathComponent(LocalAudioRecorder.manifestName))
+        var problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: root, metadata: previous)
+        XCTAssertEqual(problems.count, 1)
+        XCTAssertEqual(previous.finalized(segments: [], sourceManifest: source, artifactResult: nil,
+            incomplete: false, sourceProblems: problems).status, .degraded)
+        try FileManager.default.removeItem(at: first)
+        problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: root, metadata: previous)
+        XCTAssertEqual(problems.count, 1)
+        XCTAssertEqual(previous.finalized(segments: [], sourceManifest: source, artifactResult: nil,
+            incomplete: false, sourceProblems: problems).status, .degraded)
+    }
+
     func testResumeWaitsForOriginalWriterAfterCloseDeadlineThenUsesItsFullExtent() async throws {
         let root = try folder(), audio = root.appendingPathComponent("audio")
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
