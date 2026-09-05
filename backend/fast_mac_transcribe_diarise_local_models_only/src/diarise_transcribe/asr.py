@@ -5,10 +5,12 @@ Provides word-level timestamps for alignment with diarisation.
 """
 
 import threading
+import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from parakeet_mlx import from_pretrained
+from .local_assets import local_asr_directory
 
 
 # Cache of loaded parakeet-mlx models keyed by model_id, so repeated
@@ -67,10 +69,10 @@ class ASRModel:
         with _model_cache_lock:
             cached = _model_cache.get(self.model_id)
             if cached is None:
-                print(f"Loading ASR model: {self.model_id}")
-                cached = from_pretrained(self.model_id)
+                print(f"Loading local ASR model: {self.model_id}", file=sys.stderr)
+                cached = from_pretrained(str(local_asr_directory(self.model_id)))
                 _model_cache[self.model_id] = cached
-                print("ASR model loaded.")
+                print("ASR model loaded.", file=sys.stderr)
 
             self._model = cached
 

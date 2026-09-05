@@ -7,8 +7,8 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 - **ASR**: NVIDIA Parakeet via [parakeet-mlx](https://github.com/senstella/parakeet-mlx) (MLX-accelerated)
 - **Diarisation**: [Senko](https://github.com/narcotic-sh/senko) using pyannote + CAM++ (CoreML, runs on Neural Engine)
 - **Output**: Speaker-labelled transcripts in TXT, JSON, SRT, and RTTM formats
-- **Fully offline** after initial model downloads
-- **100% local** - no data leaves your machine
+- **Local inference** with model assets prepared before recording
+- **Offline runtime policy**: no automatic model downloads; Python networking and Hub requests are disabled during inference
 
 ## Requirements
 
@@ -161,8 +161,8 @@ On Apple Silicon (tested on M-series Macs):
 brew install ffmpeg
 ```
 
-### Model download issues
-Models are downloaded from HuggingFace on first use. Ensure you have internet access for the initial download. After that, everything runs offline.
+### Missing model assets
+Recording never downloads missing models. Use the explicit preparation command below before recording; it saves the exact model selection used by both the app and reprocessing. An incomplete installation reports inference unavailable while the app preserves source audio.
 
 ### CoreML errors
 Ensure you're on macOS with Apple Silicon. Intel Macs are not supported.
@@ -170,3 +170,20 @@ Ensure you're on macOS with Apple Silicon. Intel Macs are not supported.
 ## License
 
 MIT
+
+
+## Local asset readiness
+
+Recording and reprocessing now resolve model files locally and fail explicitly if required assets are absent. They do not download during a recording. Verify the selected Python environment with:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m diarise_transcribe.local_assets --diarisation --hashes
+```
+
+Preparing missing ASR assets is a separate online operation requiring an exact upstream model commit:
+
+```bash
+.venv/bin/python scripts/prepare-local-models.py --allow-download --revision EXACT_40_CHARACTER_MODEL_COMMIT
+```
+
+Keep the returned model directory and generated file hashes with a release. The environment must also contain Senko's native libraries and CoreML assets. The default runtime blocks Python DNS/IP sockets and Hub requests; local Unix IPC remains available. These controls do not sandbox arbitrary native extensions. Whole-process network isolation and signed-build qualification remain explicit release gates in `engineer-notes/production-audit-2026-09-05/offline-runtime.md` at the repository root. The external Claude Merge workflow has a separate network and permission boundary.

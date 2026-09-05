@@ -217,6 +217,9 @@ actor BatchRediarizer {
             mergedPath = defaultPath
         }
         return [
+            "MUESLI_ALLOW_MODEL_DOWNLOADS": "0",
+            "HF_HUB_OFFLINE": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
             "PYTHONPATH": root.appendingPathComponent("src").path,
             "PATH": mergedPath,
             "NUMBA_CACHE_DIR": numbaCacheDir.path,

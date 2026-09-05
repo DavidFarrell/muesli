@@ -25,6 +25,7 @@ from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_
 from .diarisation import DiarSegment
 from .merge import merge_transcript_with_diarisation
 from .source_recording import CommittedSource, committed_sources
+from .local_assets import MissingLocalAssets, preflight
 
 MSG_AUDIO = 1
 MSG_SCREENSHOT_EVENT = 2
@@ -854,7 +855,12 @@ def main() -> int:
     # diagnostics must not corrupt the authoritative protocol journal.
     sys.stdout = sys.stderr
     try:
-        result = _run_backend(args, output_dir, stdout_writer)
+        try:
+            preflight(args.asr_model, diarisation=not args.live_asr_only)
+            result = _run_backend(args, output_dir, stdout_writer)
+        except MissingLocalAssets as exc:
+            emit_jsonl({"type": "error", "code": "missing_local_assets", "message": str(exc)}, stdout_writer)
+            result = 1
     finally:
         sys.stdout = protocol_stdout
         delivered = stdout_writer.close()

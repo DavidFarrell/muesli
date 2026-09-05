@@ -84,6 +84,7 @@ def normalise_audio(
     cmd = [
         "ffmpeg",
         "-y",  # Overwrite output
+        "-protocol_whitelist", "file,pipe",  # Local input must not fetch referenced network media.
         "-i", str(input_path),
         "-ar", str(sample_rate),  # Sample rate
     ]
