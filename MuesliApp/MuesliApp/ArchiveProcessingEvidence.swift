@@ -145,7 +145,7 @@ nonisolated enum ArchiveProcessingEvidence {
             }
             try require(entry.status == "processed" && entry.availability == "present" && turns > 0
                         && entry.turnCount == turns, "A nonempty source with no processed turns requires review before archiving.")
-            _ = try count(entry.asrWordCount); _ = try count(entry.diarizationSegmentCount)
+            let mainWords = try count(entry.asrWordCount); _ = try count(entry.diarizationSegmentCount)
             guard let model = entry.modelInput else { throw Failure(message: "The actual model input is unidentified.") }
             try model.validate(maximumFrames: stream.pcmBytes / 2)
             try require(model.frameCount == stream.pcmBytes / 2 && model.byteCount == stream.pcmBytes + 44
@@ -153,6 +153,8 @@ nonisolated enum ArchiveProcessingEvidence {
             try recovery(entry.recovery, sourceID: source.id, stream: entry.stream,
                          duration: Double(stream.pcmBytes) / 32_000, sourceBytes: stream.pcmBytes,
                          totalWindows: &totalWindows, sourceBytesRead: &recoverySourceBytes, inputHash: recoveryInputHash)
+            try require(turns <= mainWords + entry.recovery.recoveredWordCount,
+                        "Processing claims more turns than its actual returned words can supply.")
         }
         try require(!result.turns.isEmpty, "Sources without any processed turns require review before archiving.")
         return Verified(sessionCount: expected.count, streamCount: entries.count, turnCount: result.turns.count)
@@ -171,6 +173,7 @@ nonisolated enum ArchiveProcessingEvidence {
                     && !value.windows.isEmpty && value.windows.count <= 1024 - totalWindows
                     && value.plannedWindowCount == value.windows.count && value.attemptedWindowCount == value.windows.count,
                     "Recovery failed, was incomplete or exceeded its supported evidence bound.")
+        _ = try count(value.recoveredWordCount)
         totalWindows += value.windows.count
         var empty = 0, recovered = 0, words = 0
         for window in value.windows {
@@ -190,8 +193,9 @@ nonisolated enum ArchiveProcessingEvidence {
             let verifiedHash = try inputHash(sourceID, stream, lower..<upper)
             try require(hash(verifiedHash) && model.sha256 == verifiedHash,
                         "Recovery used bytes that differ from the verified source range.")
-            _ = try count(window.asrWordCount)
+            let recognizedWords = try count(window.asrWordCount)
             let recoveredWords = try count(window.recoveredWordCount)
+            try require(recoveredWords <= recognizedWords, "Recovery claims more retained words than ASR returned.")
             if window.status == "recovered" { try require(recoveredWords > 0, "Recovery claims words without evidence."); recovered += 1 }
             else { try require(window.status == "processed_without_words" && recoveredWords == 0, "A recovery window is incomplete."); empty += 1 }
             words += recoveredWords

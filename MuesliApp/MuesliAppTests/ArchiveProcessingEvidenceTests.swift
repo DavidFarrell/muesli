@@ -103,6 +103,12 @@ final class ArchiveProcessingEvidenceTests: XCTestCase {
         }
         var value = fixture(); changeEntry(&value, 1) { $0["model_input"] = model() }; try assertRejected(value)
     }
+    func testProcessedTurnsRequireEnoughActuallyReturnedWords() throws {
+        var value = fixture(); changeEntry(&value) { $0["asr_word_count"] = 0 }; try assertRejected(value)
+        // No diarization segments is legitimate: words may use UNKNOWN speaker.
+        value = fixture(); changeEntry(&value) { $0["diarization_segment_count"] = 0 }
+        XCTAssertNoThrow(try ArchiveProcessingEvidence.validate(log: encoded(value), observedExitCode: 0, expected: expected))
+    }
     func testTurnCountTimeAndSpeakerInventoryMustMatch() throws {
         var value = fixture(); changeEntry(&value) { $0["turn_count"] = 2 }; try assertRejected(value)
         value = fixture(); value["speakers"] = ["mic:UNKNOWN"]; try assertRejected(value)
@@ -126,6 +132,15 @@ final class ArchiveProcessingEvidenceTests: XCTestCase {
                 return expectedHash
             }))
         try assertRejected(value) // No independent source-range verification.
+        var inconsistentWindow = (recovery["windows"] as! [[String: Any]])[0]
+        inconsistentWindow["asr_word_count"] = 0
+        recovery["windows"] = [inconsistentWindow]; changeEntry(&value) { $0["recovery"] = recovery }
+        try assertRejected(value, recoveryInputHash: { _, _, _ in expectedHash })
+        inconsistentWindow["asr_word_count"] = 1; recovery["windows"] = [inconsistentWindow]
+        // A positive recovery can legitimately supply turns with no main words.
+        changeEntry(&value) { $0["asr_word_count"] = 0; $0["recovery"] = recovery }
+        XCTAssertNoThrow(try ArchiveProcessingEvidence.validate(log: encoded(value), observedExitCode: 0, expected: expected,
+            recoveryInputHash: { _, _, _ in expectedHash }))
         recovery["recovered_word_count"] = 2; changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value, recoveryInputHash: { _, _, _ in expectedHash })
         recovery["recovered_word_count"] = 1; recovery["failed_window_count"] = 1
         changeEntry(&value) { $0["recovery"] = recovery }; try assertRejected(value, recoveryInputHash: { _, _, _ in expectedHash })
