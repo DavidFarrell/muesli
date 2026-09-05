@@ -46,3 +46,35 @@ MainActor isolation passes for TaskCompletion, CaptureTimeline, RecordingArtifac
 SessionArtifactStore and ScreenshotScheduler. Release builds with ad-hoc signing.
 Logs: /private/tmp/muesli-artifacts-tests.log,
 /private/tmp/muesli-artifacts-strict.log, /private/tmp/muesli-artifacts-release.log.
+
+## Independent review corrections
+
+Reservation time is now requested_t only. SCRecordingOutput has no first-frame
+host timestamp, so a successful SDK duration does not manufacture a globally
+aligned MP4 interval or mediaEndSeconds. Root's source-stop orchestration instead
+calls markCaptureStopped(atHostUs:) only when native stop positively completed.
+The durable capture_stopped event and status.captureEndSeconds describe the
+capture scope in the original host timeline. They do not claim MP4 first-frame
+alignment. Unknown stop remains explicit, including after an expired native wait.
+
+A transient screenshot capture/PNG failure leaves a sticky degraded outcome but
+does not disable later screenshots or video reservations. Only a failed ledger
+blocks new storage admission. Capture failures are coalesced into one queued
+drain and durable bounded artifact_error events; PNG/output persistence errors
+and unregistered video reservations also persist their outcome when the ledger
+is writable. The partial-ledger failure latch still prevents further appends.
+
+A screenshot request has a separate monotonic deadline. Expiry records a durable
+unavailable outcome without releasing the actual SDK slot. Every later session
+inherits the unavailable outcome until the original callback returns. The test
+uses a never-replying provider, advances the injected monotonic clock, stops and
+starts another session, and verifies one outstanding request plus both durable
+unavailable outcomes. Healthy later capture after a transient request failure is
+covered independently.
+
+The corrective focused Swift set passes 26 tests (9 artifacts, 11 recovery,
+6 subprocess/provenance), using no real capture. The Release build and strict
+Swift 6/default-MainActor artifact check pass. Logs:
+/private/tmp/muesli-f9-corrections-tests.log,
+/private/tmp/muesli-f9-corrections-release.log,
+/private/tmp/muesli-artifacts-strict.log.

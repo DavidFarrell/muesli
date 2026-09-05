@@ -11,6 +11,7 @@ nonisolated struct SessionArtifactStatus: Sendable {
     let committedScreenshots: Int
     let error: String?
     let mediaEndSeconds: Double?
+    var captureEndSeconds: Double? = nil
     let closed: Bool
     var isComplete: Bool { closed && pendingVideos == 0 && error == nil }
 }
@@ -54,12 +55,17 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     private var closed = false
     private var screenshotsAllowed = true
     private var screenshotPending = false
+    private var storageUnavailable = false
+    private var pendingCaptureFailures = 0
+    private var pendingUnavailableFailures = 0
+    private var failureDrainPending = false
     private var firstError: String?
     private var finishedVideos = 0
     private var committedScreenshots = 0
     private var mediaEndSeconds: Double?
+    private var captureEndSeconds: Double?
     private struct Video {
-        let t: Double
+        let requestedAt: Double
         var delegate: RecordingDelegate?
     }
     private var videos: [URL: Video] = [:]
@@ -98,9 +104,9 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     func nextVideoURL() -> URL? {
         let url = directory.appendingPathComponent("video/\(UUID().uuidString).mp4")
         let admitted = lock.withLock {
-            guard !closing, firstError == nil, videos.count < 16 else { return false }
+            guard !closing, !storageUnavailable, videos.count < 16 else { return false }
             let localUs = max(0, timeline.relativeMicroseconds(CaptureTimeline.hostNowMicroseconds()))
-            videos[url] = Video(t: Double(timelineOffsetUs) / 1_000_000 + Double(localUs) / 1_000_000)
+            videos[url] = Video(requestedAt: Double(timelineOffsetUs) / 1_000_000 + Double(localUs) / 1_000_000)
             return true
         }
         guard admitted else { return nil }
@@ -119,9 +125,9 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         }
         guard accepted else { return }
         queue.async { [self] in
-            let time = lock.withLock { videos[delegate.url]?.t }
+            let time = lock.withLock { videos[delegate.url]?.requestedAt }
             do { try append(["type": "video", "status": "requested", "path": relativePath(delegate.url),
-                             "t": time ?? 0, "source_session_id": sourceSessionID]) }
+                             "requested_t": time ?? 0, "source_session_id": sourceSessionID]) }
             catch { recordError(error) }
         }
         // Retain this original owner until the real callback. Expiring a wait
@@ -137,7 +143,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     func submitScreenshot(_ image: CGImage, captureTimeUs: Int64,
                           onCommitted: @escaping @Sendable (ScreenshotArtifact) -> Void) -> Bool {
         let accepted = lock.withLock {
-            guard screenshotsAllowed, !closing, !screenshotPending, firstError == nil else { return false }
+            guard screenshotsAllowed, !closing, !screenshotPending, !storageUnavailable else { return false }
             screenshotPending = true
             return true
         }
@@ -146,7 +152,10 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
             defer { lock.withLock { screenshotPending = false }; finishIfReady() }
             guard lock.withLock({ screenshotsAllowed && !closing }) else { return }
             let localUs = timeline.relativeMicroseconds(captureTimeUs)
-            guard localUs >= 0 else { recordError(Self.error("Screenshot predates the capture timeline")); return }
+            guard localUs >= 0 else {
+                persistFailure("Screenshot predates the capture timeline", kind: "screenshot_timestamp")
+                return
+            }
             let name = UUID().uuidString + ".png"
             let url = directory.appendingPathComponent("screenshots/" + name)
             do {
@@ -165,31 +174,57 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
                     return screenshotsAllowed && !closing
                 }
                 if deliver { onCommitted(event) }
-            } catch { recordError(error) }
+            } catch { persistFailure(error.localizedDescription, kind: "screenshot_write") }
         }
         return true
     }
 
     func stopScreenshots() { lock.withLock { screenshotsAllowed = false } }
 
-    func recordScreenshotFailure() {
-        recordError(Self.error("Screenshot capture failed"))
+    /// Caller must have positively observed native source stop. This is the
+    /// capture scope boundary, not a claim about the MP4's first-frame time.
+    func markCaptureStopped(atHostUs: Int64) {
+        let accepted = lock.withLock { !closing }
+        guard accepted else { return }
+        queue.async { [self] in
+            let localUs = timeline.relativeMicroseconds(atHostUs)
+            guard localUs >= 0 else { persistFailure("Capture stop predates its epoch", kind: "capture_stop"); return }
+            let end = Double(timelineOffsetUs) / 1_000_000 + Double(localUs) / 1_000_000
+            do {
+                try append(["type": "capture_stopped", "source_session_id": sourceSessionID, "t": end])
+                lock.withLock { captureEndSeconds = max(captureEndSeconds ?? 0, end) }
+            } catch { recordError(error) }
+        }
+    }
+
+    func recordScreenshotFailure(ownershipUnavailable: Bool = false) {
+        let schedule = lock.withLock {
+            guard screenshotsAllowed, !closing else { return false }
+            if firstError == nil { firstError = ownershipUnavailable ? "Screenshot request did not complete" : "Screenshot capture failed" }
+            if ownershipUnavailable { pendingUnavailableFailures = min(Int.max - 1, pendingUnavailableFailures) + 1 }
+            else { pendingCaptureFailures = min(Int.max - 1, pendingCaptureFailures) + 1 }
+            guard !failureDrainPending else { return false }
+            failureDrainPending = true
+            return true
+        }
+        if schedule { queue.async { [self] in drainCaptureFailures() } }
     }
 
     func status() -> SessionArtifactStatus {
         lock.withLock { SessionArtifactStatus(sourceSessionID: sourceSessionID, pendingVideos: videos.count,
             finishedVideos: finishedVideos, committedScreenshots: committedScreenshots, error: firstError,
-            mediaEndSeconds: mediaEndSeconds, closed: closed) }
+            mediaEndSeconds: mediaEndSeconds, captureEndSeconds: captureEndSeconds, closed: closed) }
     }
 
     @concurrent func finish(timeoutSeconds: Double) async -> SessionArtifactFinishResult {
         lock.withLock { closing = true; screenshotsAllowed = false }
         queue.async { [self] in
-            lock.withLock {
+            let unregistered = lock.withLock {
                 let unregistered = videos.filter { $0.value.delegate == nil }.map(\.key)
-                if !unregistered.isEmpty && firstError == nil { firstError = "A reserved video output was never created" }
                 for url in unregistered { videos.removeValue(forKey: url) }
+                return unregistered.count
             }
+            if unregistered > 0 { persistFailure("A reserved video output was never created", kind: "video_not_created", count: unregistered) }
             finishIfReady()
         }
         switch await completion.wait(timeoutSeconds: timeoutSeconds) {
@@ -203,7 +238,9 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         let video = lock.withLock { videos[state.url] }
         guard let video else { return }
         var event: [String: Any] = ["type": "video", "status": state.status.rawValue,
-            "path": relativePath(state.url), "source_session_id": sourceSessionID, "t": video.t]
+            "path": relativePath(state.url), "source_session_id": sourceSessionID, "requested_t": video.requestedAt]
+        // SCRecordingOutput exposes duration but not a first-frame host PTS.
+        // Reservation time is diagnostic, not evidence of media alignment.
         if let duration = state.durationSeconds { event["duration_seconds"] = duration }
         if let size = state.fileSize { event["file_size"] = size }
         if let error = state.error { event["error"] = error }
@@ -217,21 +254,18 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
                 try Self.syncDirectory(state.url.deletingLastPathComponent())
             }
             try append(event)
-        } catch { recordError(error) }
+        } catch { persistFailure(error.localizedDescription, kind: "video_persistence") }
         lock.withLock {
             videos.removeValue(forKey: state.url)
             if state.status == .finished {
                 finishedVideos += 1
-                if let duration = state.durationSeconds {
-                    mediaEndSeconds = max(mediaEndSeconds ?? 0, video.t + duration)
-                }
             } else if firstError == nil { firstError = state.error ?? "Recording output failed" }
         }
         finishIfReady()
     }
 
     private func finishIfReady() {
-        let ready = lock.withLock { closing && videos.isEmpty && !screenshotPending }
+        let ready = lock.withLock { closing && videos.isEmpty && !screenshotPending && !failureDrainPending }
         guard ready else { return }
         do {
             try ledger?.synchronize()
@@ -246,6 +280,32 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         relativeDirectory + "/" + url.path.dropFirst(directory.path.count + 1)
     }
     private func recordError(_ error: Error) { lock.withLock { if firstError == nil { firstError = error.localizedDescription } } }
+    private func persistFailure(_ message: String, kind: String, count: Int = 1) {
+        // Native messages cannot make a single ledger event arbitrarily large.
+        let bounded = String(message.prefix(2_048))
+        recordError(Self.error(bounded))
+        do {
+            try append(["type": "artifact_error", "source_session_id": sourceSessionID,
+                        "kind": kind, "error": bounded, "count": count])
+        } catch { recordError(error) }
+    }
+    private func drainCaptureFailures() {
+        let (count, unavailable) = lock.withLock {
+            let counts = (pendingCaptureFailures, pendingUnavailableFailures)
+            pendingCaptureFailures = 0; pendingUnavailableFailures = 0
+            return counts
+        }
+        if count > 0 { persistFailure("Screenshot capture failed", kind: "screenshot_capture", count: count) }
+        if unavailable > 0 { persistFailure("Screenshot request did not complete; its native owner remains outstanding",
+                                            kind: "screenshot_unavailable", count: unavailable) }
+        let repeatDrain = lock.withLock {
+            if pendingCaptureFailures > 0 || pendingUnavailableFailures > 0 { return true }
+            failureDrainPending = false
+            return false
+        }
+        if repeatDrain { queue.async { [self] in drainCaptureFailures() } }
+        else { finishIfReady() }
+    }
     private func append(_ object: [String: Any]) throws { try append(JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) }
     private func append(_ data: Data) throws {
         guard let ledger, !ledgerFailed else { throw Self.error("Artifact ledger is closed or failed") }
@@ -256,6 +316,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
             // A failed write can leave a partial tail. Never append another
             // record behind it or claim that a later fsync committed this one.
             ledgerFailed = true
+            lock.withLock { storageUnavailable = true }
             throw error
         }
     }

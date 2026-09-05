@@ -119,4 +119,62 @@ final class OrphanedMeetingRecoveryTests: XCTestCase {
         XCTAssertNil(evidence.durationSeconds)
         XCTAssertFalse(evidence.problems.isEmpty)
     }
+
+    func testResumeUsesSixtySecondsOfSourceInsteadOfLastWordAtTen() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio"))
+        recorder.record(source: .mic, ptsUs: 0, payload: Data(repeating: 0, count: 60 * 32_000))
+        _ = await recorder.finish()
+        var original = metadata(oldDuration: 900_000)
+        original.lastTimestamp = 10
+        let snapshot = original
+        let offset = try await Task.detached {
+            try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: snapshot)
+        }.value
+        XCTAssertEqual(offset, 60)
+    }
+
+    func testResumeRejectsUnknownEarlierSessionDespiteKnownTranscriptTime() throws {
+        let root = try folder()
+        var original = metadata(oldDuration: 60)
+        original.lastTimestamp = 10
+        XCTAssertThrowsError(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: original))
+    }
+
+    func testCompatibilityExportFailureDoesNotEraseValidCommittedExtent() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio"), timelineOffsetUs: 10_000_000)
+        recorder.record(source: .mic, ptsUs: 0, payload: Data(repeating: 0, count: 32_000))
+        _ = await recorder.finish()
+        let original = metadata()
+        let evidence = await Task.detached {
+            OrphanedMeetingRecovery.inspectAndRecover(folderURL: root, metadata: original,
+                exportWAVs: { _ in throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC)) })
+        }.value
+        XCTAssertEqual(evidence.durationSeconds, 11)
+        XCTAssertEqual(evidence.sessions.first?.durationSeconds, 1)
+        XCTAssertTrue(evidence.problems.contains { $0.contains("WAV export failed") })
+    }
+
+    func testZeroAudioVideoSessionUsesStoppedCaptureExtentAndRejectsUnknownExtent() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio"))
+        _ = await recorder.finish()
+        let store = try SessionArtifactStore(meetingDirectory: root, sourceSessionID: UUID().uuidString,
+            timeline: CaptureTimeline(epochMicroseconds: 1_000_000), timelineOffsetUs: 0)
+        var original = metadata()
+        original.sessions[0].artifactsFolder = store.relativeDirectory
+        // Valid zero-byte PCM cannot certify an empty video session.
+        XCTAssertThrowsError(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: original))
+        store.markCaptureStopped(atHostUs: 301_000_000)
+        let result = await store.finish(timeoutSeconds: 2)
+        XCTAssertEqual(result.status.captureEndSeconds, 300)
+        XCTAssertEqual(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: original), 300)
+        let snapshot = original
+        let evidence = await Task.detached {
+            OrphanedMeetingRecovery.inspectAndRecover(folderURL: root, metadata: snapshot)
+        }.value
+        XCTAssertEqual(evidence.durationSeconds, 300)
+        XCTAssertEqual(evidence.sessions.first?.durationSeconds, 300)
+    }
 }

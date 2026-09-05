@@ -76,7 +76,7 @@ final class SessionArtifactStoreTests: XCTestCase {
         let result = await store.finish(timeoutSeconds: 2)
         XCTAssertFalse(result.status.isComplete)
         XCTAssertEqual(result.status.committedScreenshots, 0)
-        XCTAssertEqual(try ledger(store).count, 1)
+        XCTAssertEqual(try ledger(store).last?["kind"] as? String, "screenshot_write")
     }
 
     func testVideoReservationsStayUniqueAcrossTwoResumes() async throws {
@@ -136,6 +136,10 @@ final class SessionArtifactStoreTests: XCTestCase {
         let configuration = SCRecordingOutputConfiguration(); configuration.outputURL = url
         let output = SCRecordingOutput(configuration: configuration, delegate: delegate)
         store.retainRecording(delegate)
+        // Native startup can be delayed arbitrarily after URL reservation.
+        // Neither reservation nor SDK start callback supplies first-frame PTS.
+        try await Task.sleep(for: .milliseconds(20))
+        delegate.recordingOutputDidStartRecording(output)
         guard case .timedOut(let pending) = await store.finish(timeoutSeconds: 0.02) else { return XCTFail("missing SDK finish") }
         XCTAssertEqual(pending.pendingVideos, 1)
         XCTAssertNil(store.nextVideoURL())
@@ -144,6 +148,9 @@ final class SessionArtifactStoreTests: XCTestCase {
         XCTAssertTrue(status.isComplete)
         XCTAssertEqual(status.finishedVideos, 1)
         XCTAssertEqual(try ledger(store).last?["status"] as? String, "finished")
+        XCTAssertNotNil(try ledger(store).last?["requested_t"])
+        XCTAssertNil(try ledger(store).last?["t"])
+        XCTAssertNil(status.mediaEndSeconds)
     }
 
     func testNativeFailureAndUnregisteredReservationRemainIncomplete() async throws {
@@ -159,5 +166,53 @@ final class SessionArtifactStoreTests: XCTestCase {
         XCTAssertNil(other.nextVideoURL())
         let unregistered = await other.finish(timeoutSeconds: 2)
         XCTAssertFalse(unregistered.status.isComplete)
+        XCTAssertEqual(try ledger(other).last?["kind"] as? String, "video_not_created")
+    }
+
+    func testCaptureFailureIsDurableWithoutDisablingLaterScreenshotOrVideo() async throws {
+        let store = try store(folder())
+        store.recordScreenshotFailure()
+        XCTAssertNotNil(store.nextVideoURL(), "screenshot failure cannot park system recovery")
+        let event = expectation(description: "healthy screenshot after failure")
+        XCTAssertTrue(store.submitScreenshot(pixel(), captureTimeUs: 2_000_000) { _ in event.fulfill() })
+        await fulfillment(of: [event], timeout: 2)
+        let result = await store.finish(timeoutSeconds: 2)
+        XCTAssertFalse(result.status.isComplete, "prior failed artifact remains a truthful degraded outcome")
+        let rows = try ledger(store)
+        XCTAssertTrue(rows.contains { $0["kind"] as? String == "screenshot_capture" })
+        XCTAssertTrue(rows.contains { $0["type"] as? String == "screenshot" })
+    }
+
+    func testNeverReturningRequestIsReportedToEveryLaterSessionWithoutExtraRequest() async throws {
+        nonisolated final class Time: @unchecked Sendable {
+            let lock = NSLock(); var value = 0.0
+            nonisolated func read() -> Double { lock.withLock { value } }
+            nonisolated func advance() { lock.withLock { value = 20 } }
+        }
+        let time = Time(), requests = Requests(), root = try folder()
+        let scheduler = ScreenshotScheduler(requestTimeoutSeconds: 10, now: time.read)
+        let first = try store(root)
+        scheduler.start(every: 60, store: first, request: requests.request) { _ in XCTFail("no reply") }
+        scheduler.requestNow()
+        XCTAssertEqual(requests.received.wait(timeout: .now() + 2), .success)
+        time.advance()
+        scheduler.requestNow()
+        // Request queue processing reports expiration before this barrier can
+        // produce another request; the unresolved SDK owner is still retained.
+        XCTAssertEqual(requests.received.wait(timeout: .now() + 0.1), .timedOut)
+        scheduler.stop()
+        let firstResult = await first.finish(timeoutSeconds: 2)
+        XCTAssertFalse(firstResult.status.isComplete)
+        let second = try store(root)
+        scheduler.start(every: 60, store: second, request: requests.request) { _ in XCTFail("no reply") }
+        scheduler.requestNow()
+        XCTAssertEqual(requests.received.wait(timeout: .now() + 0.1), .timedOut)
+        scheduler.stop()
+        let secondResult = await second.finish(timeoutSeconds: 2)
+        XCTAssertFalse(secondResult.status.isComplete)
+        XCTAssertEqual(requests.count, 1)
+        for store in [first, second] {
+            XCTAssertTrue(try ledger(store).contains { $0["kind"] as? String == "screenshot_unavailable" })
+        }
     }
 }

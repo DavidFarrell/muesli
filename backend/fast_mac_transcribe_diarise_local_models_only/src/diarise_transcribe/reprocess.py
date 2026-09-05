@@ -106,8 +106,7 @@ def _discover_session_audio_dirs(meeting_dir: Path, verbose: bool) -> list[Path]
                         continue
                     seen.add(resolved)
                     if not path.exists() or not path.is_dir():
-                        log(f"Warning: session audio folder missing: {path}")
-                        continue
+                        raise ValueError(f"Session audio folder missing; its media extent is unknown: {path}")
                     session_dirs.append(path)
 
     if session_dirs:
@@ -451,6 +450,7 @@ def _main() -> int:
 
         all_turns = []
         all_speakers = set()
+        source_inventory = []
         running_offset = 0.0
 
         # This invocation owns only its temporary exports. Default reprocess
@@ -466,6 +466,15 @@ def _main() -> int:
                 else:
                     session_offset = running_offset
                     session_duration = _legacy_session_duration(session_audio_dir)
+
+                source_identity = sources["mic"].session_id if sources is not None else str(session_audio_dir.relative_to(meeting_dir))
+                source_inventory.append({
+                    "source_session_id": source_identity,
+                    "audio_folder": str(session_audio_dir.relative_to(meeting_dir)),
+                    "timeline_offset_seconds": session_offset,
+                    "duration_seconds": session_duration,
+                    "storage_kind": "committed_pcm" if sources is not None else "legacy_wav",
+                })
 
                 for stream in streams:
                     if sources is not None:
@@ -503,6 +512,7 @@ def _main() -> int:
                         return 1
 
                     for turn in result["turns"]:
+                        turn["source_session_id"] = source_identity
                         turn["t0"] += session_offset
                         turn["t1"] += session_offset
                     all_turns.extend(result["turns"])
@@ -513,7 +523,7 @@ def _main() -> int:
                 running_offset = max(running_offset, session_offset + session_duration)
 
         all_turns.sort(key=lambda item: (item["t0"], item["stream"], item["speaker_id"]))
-        duration = max(running_offset, max((t["t1"] for t in all_turns), default=0.0))
+        duration = running_offset
 
         emit_status("complete")
         emit({
@@ -521,6 +531,7 @@ def _main() -> int:
             "turns": all_turns,
             "speakers": sorted(all_speakers),
             "duration": duration,
+            "sources": source_inventory,
         })
         return 0
     except Exception as error:

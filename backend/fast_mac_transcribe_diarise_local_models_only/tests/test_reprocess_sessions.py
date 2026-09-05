@@ -100,10 +100,10 @@ def test_main_applies_session_offsets(tmp_path: Path, monkeypatch) -> None:
 
     assert result["duration"] == 9.0
     assert result["turns"] == [
-        {"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 0.5, "t1": 3.0, "text": "b"},
-        {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 1.0, "t1": 2.0, "text": "a"},
-        {"speaker_id": "system:SPEAKER_02", "stream": "system", "t0": 5.0, "t1": 9.0, "text": "d"},
-        {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 7.0, "t1": 8.0, "text": "c"},
+        {"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 0.5, "t1": 3.0, "text": "b", "source_session_id": "audio"},
+        {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 1.0, "t1": 2.0, "text": "a", "source_session_id": "audio"},
+        {"speaker_id": "system:SPEAKER_02", "stream": "system", "t0": 5.0, "t1": 9.0, "text": "d", "source_session_id": "audio-session-2"},
+        {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 7.0, "t1": 8.0, "text": "c", "source_session_id": "audio-session-2"},
     ]
 
 
@@ -154,6 +154,9 @@ def test_committed_prefix_resume_twice_has_identical_mic_offsets_for_mic_only_an
         assert reprocess.main() == 0
         results.append(next(e for e in events if e["type"] == "result"))
     assert [r["duration"] for r in results] == [29.0, 29.0]
+    assert results[0]["sources"] == results[1]["sources"], "inventory is independent of chosen streams"
+    assert [source["source_session_id"] for source in results[0]["sources"]] == ["audio", "audio-session-2", "audio-session-3"]
+    assert {turn["source_session_id"] for turn in results[1]["turns"]} == {"audio", "audio-session-2", "audio-session-3"}
     assert [[t["t0"] for t in r["turns"] if t["stream"] == "mic"] for r in results] == [
         [0.1, 10.1, 25.1], [0.1, 10.1, 25.1]]
     assert all(not p.exists() for p in exported_paths), "only owned temporary exports are removed"
@@ -218,3 +221,19 @@ def test_model_diagnostics_do_not_contaminate_stdout_protocol(tmp_path, monkeypa
     events = [json.loads(line) for line in captured.out.splitlines()]
     assert events[-1]["type"] == "result"
     assert "model diagnostic is not JSON" in captured.err
+
+
+def test_missing_metadata_session_does_not_compress_legacy_timeline(tmp_path, monkeypatch):
+    audio = tmp_path / "audio-session-2"
+    audio.mkdir()
+    _write_wav_stub(audio / "mic.wav")
+    (tmp_path / "meeting.json").write_text(json.dumps({"sessions": [
+        {"session_id": 1, "audio_folder": "audio"},
+        {"session_id": 2, "audio_folder": "audio-session-2"}]}))
+    events = []
+    monkeypatch.setattr(reprocess, "emit", events.append)
+    monkeypatch.setattr(sys, "argv", ["reprocess", str(tmp_path), "--stream", "mic"])
+    assert reprocess.main() == 1
+    assert events[-1]["type"] == "error"
+    assert "media extent is unknown" in events[-1]["message"]
+    assert not any(event["type"] == "result" for event in events)

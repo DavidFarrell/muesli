@@ -279,6 +279,7 @@ final class AppModel: ObservableObject {
     private var sourceRecorder: LocalAudioRecorder?
     private var sourceTimeline: CaptureTimeline?
     private var sessionArtifactStore: SessionArtifactStore?
+    private var isPreparingResume = false
     private var inferenceFailure: String?
     // Backend-readiness handshake state (2026-07-16 RCA rec #3 - backend
     // wedged pre-read-loop, meeting presented as recording, 26 minutes lost).
@@ -3894,12 +3895,29 @@ final class AppModel: ObservableObject {
     }
 
     func resumeMeeting(_ item: MeetingHistoryItem) {
-        do {
-            let metadata = try readMeetingMetadata(from: item.folderURL)
-            meetingTitle = item.title
-            Task { await startMeeting(resuming: item, metadata: metadata, timestampOffset: metadata.lastTimestamp) }
-        } catch {
-            appendBackendLog("Failed to resume meeting \(item.id): \(error.localizedDescription)", toTail: true)
+        guard !isPreparingResume, !isStartingMeeting, !isCapturing, !isFinalizing else { return }
+        isPreparingResume = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { isPreparingResume = false }
+            do {
+                let metadata = try readMeetingMetadata(from: item.folderURL)
+                let directory = item.folderURL
+                let offset = try await Task.detached {
+                    try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: directory, metadata: metadata)
+                }.value
+                guard !isStartingMeeting, !isCapturing, !isFinalizing else { return }
+                let current = try readMeetingMetadata(from: item.folderURL)
+                guard current.sessions.map(\.sessionID) == metadata.sessions.map(\.sessionID) else {
+                    throw NSError(domain: "MeetingResume", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Meeting sources changed during resume preparation"])
+                }
+                meetingTitle = current.title
+                await startMeeting(resuming: item, metadata: current, timestampOffset: offset)
+            } catch {
+                shareableContentError = "Cannot resume this meeting: \(error.localizedDescription)"
+                appendBackendLog("Failed to resume meeting \(item.id): \(error.localizedDescription)", toTail: true)
+            }
         }
     }
 

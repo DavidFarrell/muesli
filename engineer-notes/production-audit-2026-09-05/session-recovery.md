@@ -36,3 +36,32 @@ Release build passed with ad-hoc signing. Logs are
 /private/tmp/muesli-session-recovery-release.log, and
 /private/tmp/muesli-reprocess-integrity-tests.log. No real capture or model
 download was used.
+
+## Resume extent and source provenance corrections
+
+Resume now runs a read-only committed-PCM/both-WAV inspection off UI and starts
+at the verified session end, never metadata.lastTimestamp. Missing/truncated
+source extents cause an explicit resume error. A video artifact session also
+requires a durable capture_stopped ledger extent; valid zero-byte audio cannot
+certify a zero-length video session. Recovery can show measured screenshot lower
+bounds for an unclosed session, but leaves it interrupted and cannot invent a
+closed extent. A positively observed source-stop scope advances the timeline
+without adding days of later idle time or claiming MP4 first-frame alignment.
+Valid committed PCM duration survives a derived-WAV export failure; the export
+failure is separately reported and source PCM remains recoverable.
+
+Reprocessing now fails on missing metadata-listed source folders rather than
+compressing the remaining legacy timeline. Result duration is measured from both
+source media extents, not selected ASR word ends. Each turn preserves the raw
+stream-prefixed speaker_id plus source_session_id (manifest identity or full
+legacy audio-folder identity). Result sources inventory contains each session's
+identity, audio folder, explicit offset, measured duration and storage kind,
+independent of the selected streams. Swift BatchRediarizer preserves these fields
+through its authoritative callback accumulator; parallel app persistence work
+uses (source, stream, raw speaker) identity without implicit cross-session names.
+
+The corrective Python reprocess/recovery suite passes 13 tests with synthetic
+sources and mocked models, including a missing first legacy source and source
+inventory equality between mic-only and both-stream runs. Swift tests add a
+60-second source with last word at 10 seconds, an unknown earlier extent, derived
+export failure, and a zero-audio 300-second captured scope.

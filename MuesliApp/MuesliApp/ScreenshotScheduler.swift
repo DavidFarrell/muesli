@@ -20,20 +20,37 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     }
     private let queue = DispatchQueue(label: "muesli.screenshots", qos: .utility)
     private let lock = NSLock()
+    private let requestTimeoutSeconds: Double
+    private let now: @Sendable () -> Double
     private var currentStore: SessionArtifactStore?
+    private var pendingSince: Double?
     private var timer: DispatchSourceTimer?
+    private var requestDeadlineTimer: DispatchSourceTimer?
     private var run: Run?
     private var outstanding: UUID?
+    private var unavailableReportedForRun: UUID?
+
+    init(requestTimeoutSeconds: Double = 10,
+         now: @escaping @Sendable () -> Double = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }) {
+        precondition(requestTimeoutSeconds.isFinite && requestTimeoutSeconds > 0)
+        self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.now = now
+    }
 
     func start(every intervalSeconds: Double, store: SessionArtifactStore,
                request: @escaping Request,
                onCommitted: @escaping @Sendable (ScreenshotArtifact) -> Void) {
         precondition(intervalSeconds.isFinite && intervalSeconds > 0)
-        lock.withLock { currentStore?.stopScreenshots(); currentStore = store }
         let newRun = Run(id: UUID(), store: store, request: request, onCommitted: onCommitted)
+        let unavailable = lock.withLock {
+            currentStore?.stopScreenshots(); currentStore = store
+            return pendingSince.map { now() - $0 >= requestTimeoutSeconds } ?? false
+        }
+        if unavailable { store.recordScreenshotFailure(ownershipUnavailable: true) }
         queue.async { [self] in
             timer?.cancel()
             run = newRun
+            unavailableReportedForRun = unavailable ? newRun.id : nil
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + intervalSeconds, repeating: intervalSeconds)
             timer.setEventHandler { [weak self] in self?.tick() }
@@ -51,14 +68,31 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     func requestNow() { queue.async { [self] in tick() } }
 
     private func tick() {
-        guard let run, outstanding == nil else { return }
+        guard let run else { return }
+        guard outstanding == nil else {
+            let unavailable = lock.withLock { pendingSince.map { now() - $0 >= requestTimeoutSeconds } ?? false }
+            if unavailable, unavailableReportedForRun != run.id {
+                unavailableReportedForRun = run.id
+                run.store.recordScreenshotFailure(ownershipUnavailable: true)
+            }
+            return
+        }
         let requestID = UUID()
         outstanding = requestID
+        lock.withLock { pendingSince = now() }
+        let deadline = DispatchSource.makeTimerSource(queue: queue)
+        deadline.schedule(deadline: .now() + requestTimeoutSeconds)
+        deadline.setEventHandler { [weak self] in self?.tick() }
+        requestDeadlineTimer = deadline
+        deadline.resume()
         run.request { [weak self] image in
             guard let self else { return }
             self.queue.async { [self] in
                 guard self.outstanding == requestID else { return }
                 self.outstanding = nil
+                self.requestDeadlineTimer?.cancel()
+                self.requestDeadlineTimer = nil
+                self.lock.withLock { self.pendingSince = nil }
                 guard self.run?.id == run.id else { return }
                 guard let image else { run.store.recordScreenshotFailure(); return }
                 run.store.submitScreenshot(image.image, captureTimeUs: image.captureTimeUs, onCommitted: run.onCommitted)
