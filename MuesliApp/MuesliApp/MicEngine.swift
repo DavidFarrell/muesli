@@ -33,11 +33,12 @@ actor MicEngine: MicCapturing {
         preferredInputDeviceID: UInt32?,
         pinned: Bool = false,
         onConfigurationChange: (@Sendable () -> Void)? = nil,
+        onCaptureProblem: (@Sendable (CapturedSourceProblem) -> Void)?,
         onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) throws {
         guard !isRunning else { return }
 
-        self.processor = MicCaptureProcessor(generation: generation, output: onAudioData)
+        self.processor = MicCaptureProcessor(generation: generation, onProblem: onCaptureProblem, output: onAudioData)
         self.onConfigurationChange = onConfigurationChange
         do {
             try startEngine(

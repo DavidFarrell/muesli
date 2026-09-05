@@ -14,11 +14,16 @@ nonisolated final class MicAudioIngress: @unchecked Sendable {
         let firstDroppedPTS: Int64?
         let lastDroppedEndPTS: Int64?
         let closed: Bool
+        let sourceProblemCount: Int
+        let latestSourceProblem: CapturedSourceProblem?
     }
 
     private let lock = NSLock()
     enum RejectionReason: String, Sendable { case capacity, retired, empty }
     private let onRejected: (@Sendable (CapturedMicAudio, RejectionReason) -> Void)?
+    private let onProblem: (@Sendable (CapturedSourceProblem) -> Void)?
+    private var sourceProblemCount = 0
+    private var latestSourceProblem: CapturedSourceProblem?
     private let capacityBytes: Int
     private let sink: @Sendable (CapturedMicAudio) async -> Void
     private var queue: [CapturedMicAudio?] = []
@@ -34,16 +39,18 @@ nonisolated final class MicAudioIngress: @unchecked Sendable {
     private var lastDroppedEndPTS: Int64?
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(capacityBytes: Int = 2 * 1024 * 1024, onRejected: (@Sendable (CapturedMicAudio, RejectionReason) -> Void)? = nil, sink: @escaping @Sendable (CapturedMicAudio) async -> Void) {
+    init(capacityBytes: Int = 2 * 1024 * 1024, onRejected: (@Sendable (CapturedMicAudio, RejectionReason) -> Void)? = nil, onProblem: (@Sendable (CapturedSourceProblem) -> Void)? = nil, sink: @escaping @Sendable (CapturedMicAudio) async -> Void) {
         precondition(capacityBytes > 0)
         self.onRejected = onRejected
+        self.onProblem = onProblem
         self.capacityBytes = capacityBytes
         self.sink = sink
     }
 
     static func forwarding(to forwarder: MicAudioForwarder, display: MicDeliveryDisplayMailbox,
-                           onRejected: (@Sendable (CapturedMicAudio, RejectionReason) -> Void)? = nil) -> MicAudioIngress {
-        MicAudioIngress(onRejected: onRejected) { packet in
+                           onRejected: (@Sendable (CapturedMicAudio, RejectionReason) -> Void)? = nil,
+                           onProblem: (@Sendable (CapturedSourceProblem) -> Void)? = nil) -> MicAudioIngress {
+        MicAudioIngress(onRejected: onRejected, onProblem: onProblem) { packet in
             if let result = await forwarder.deliver(packet) { display.publish(result) }
         }
     }
@@ -52,6 +59,16 @@ nonisolated final class MicAudioIngress: @unchecked Sendable {
     /// in nonisolated code prevents default MainActor closure inheritance.
     func callback() -> @Sendable (CapturedMicAudio) -> Void {
         { [self] packet in enqueue(packet) }
+    }
+
+    func problemCallback() -> @Sendable (CapturedSourceProblem) -> Void {
+        { [self] problem in
+            lock.withLock {
+                sourceProblemCount += 1
+                latestSourceProblem = problem
+            }
+            onProblem?(problem)
+        }
     }
 
     @discardableResult
@@ -128,7 +145,8 @@ nonisolated final class MicAudioIngress: @unchecked Sendable {
             Snapshot(queuedBytes: queuedBytes, acceptedFrames: acceptedFrames,
                      droppedFrames: droppedFrames, droppedSamples: droppedSamples,
                      droppedBytes: droppedBytes, firstDroppedPTS: firstDroppedPTS,
-                     lastDroppedEndPTS: lastDroppedEndPTS, closed: closed)
+                     lastDroppedEndPTS: lastDroppedEndPTS, closed: closed,
+                     sourceProblemCount: sourceProblemCount, latestSourceProblem: latestSourceProblem)
         }
     }
 }

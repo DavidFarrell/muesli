@@ -148,8 +148,13 @@ final class AppModel: ObservableObject {
             UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey)
             // A mode change is a fresh chance for VPIO; restart so it takes effect.
             micVoiceProcessingDowngraded = false
+            micHealth.reset()
+            previewMicHealth.reset()
             if isCapturing {
                 enqueueMicLifecycle("aec-change") { await $0.restartMeetingMicEngineForInputSwitch() }
+            } else if isStartScreenActive {
+                previewVoiceProcessingDowngraded = false
+                enqueueMicLifecycle("aec-change-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
             }
         }
     }
@@ -180,11 +185,27 @@ final class AppModel: ObservableObject {
     private var previewMicEngine: (any MicCapturing)?
     private var isPreviewCaptureRunning = false
     private var previewLifecycleTask: Task<Void, Never>?
+    private var pendingPreviewOperation: (@MainActor (AppModel) async -> Void)?
     // Single serializer for ALL mic engine start/stop/restart operations so two
     // device events can't interleave at an await suspension and orphan the engine
     // (audit D2/D8). Plus a monotonic generation token as belt-and-braces against
     // any stray start completing into a superseded generation.
     private var micLifecycleTask: Task<Void, Never>?
+    private var pendingMicOperation: (@MainActor (AppModel) async -> Void)?
+    private var pendingMicReason = ""
+    private let micOperationOwner = CaptureOperationOwner()
+    private var micHealth = CaptureSourceHealth()
+    private var previewMicHealth = CaptureSourceHealth()
+    private var previewMicForwarder: MicAudioForwarder?
+    private var previewVoiceProcessingDowngraded = false
+    private var previewVoiceProcessingRequested = false
+    private var systemRecoveryPending = false
+    private var observedMicProblems = 0
+    private var observedPreviewMicProblems = 0
+    private var lastRetiredMicIngress: MicAudioIngress.Snapshot?
+    private var lastRetiredPreviewMicIngress: MicAudioIngress.Snapshot?
+    private var lastResolvedInputConfiguration: String?
+    private var lastObservedOutputDeviceID: UInt32?
     private var micEngineGeneration: Int = 0
     // The device the running engine is actually bound to / started on. The
     // restart decision compares the DESIRED device to this, not a bare ID delta
@@ -394,6 +415,7 @@ final class AppModel: ObservableObject {
         captureEngine.onStreamStopped = { [weak self] error in
             Task { @MainActor [weak self] in
                 self?.appendBackendLog("System audio capture stopped: \(error.localizedDescription)", toTail: true)
+                if let self, !self.isCapturing { self.isPreviewCaptureRunning = false }
             }
         }
         AudioDeviceManager.observeInputDeviceChanges { [weak self] in
@@ -740,6 +762,10 @@ final class AppModel: ObservableObject {
     private func onMicAudioDelivered(_ result: MicAudioForwarder.DeliveryResult, generation: Int) {
         guard generation == micEngineGeneration else { return }
         guard transcribeMic else { return }
+        guard !micHealth.invalidated else { return }
+        _ = micHealth.progress(frames: result.totalFrameCount, generation: generation)
+        debugMicErrorMessage = "-"
+        publishMicError()
 
         // A frame actually arriving is the ladder's success signal - not
         // just on the first frame of a generation, but also whenever a
@@ -778,6 +804,11 @@ final class AppModel: ObservableObject {
     }
 
     private func handlePreviewMicAudio(_ result: MicAudioForwarder.DeliveryResult) {
+        guard !previewMicHealth.invalidated else { return }
+        _ = previewMicHealth.progress(frames: result.totalFrameCount, generation: previewMicGeneration)
+        debugMicErrorMessage = "-"
+        publishMicError()
+        meters.clearMicAlert()
         micLevel = result.level
         publishMicMeters()
     }
@@ -790,30 +821,94 @@ final class AppModel: ObservableObject {
     private func runPreviewLifecycleOperation(
         _ operation: @escaping @MainActor (AppModel) async -> Void
     ) async {
-        let previousTask = previewLifecycleTask
-        let task = Task { @MainActor [weak self] in
-            await previousTask?.value
-            guard let self else { return }
-            await operation(self)
+        pendingPreviewOperation = operation
+        if previewLifecycleTask == nil {
+            previewLifecycleTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                while let operation = pendingPreviewOperation {
+                    pendingPreviewOperation = nil
+                    await operation(self)
+                }
+                previewLifecycleTask = nil
+            }
         }
-        previewLifecycleTask = task
-        await task.value
+        await previewLifecycleTask?.value
     }
 
-    /// Serialize ALL mic engine start/stop/restart work through one chained task
-    /// so two device events cannot interleave at an await and orphan the engine
-    /// (audit D2/D8). Fire-and-forget; ordering is preserved. NEVER call this
-    /// from within an op already running on this chain - that self-awaits and
-    /// deadlocks; call `restartMeetingMicEngineForInputSwitch()` directly there.
+    /// One worker resolves the latest desired microphone route after each
+    /// native operation. Bursts replace pending intent instead of accumulating
+    /// one Task per notification. Do not call recursively from its operation.
+
     private func enqueueMicLifecycle(_ reason: String, _ op: @escaping @MainActor (AppModel) async -> Void) {
-        let previous = micLifecycleTask
-        let task = Task { @MainActor [weak self] in
-            await previous?.value
+        pendingMicOperation = op
+        pendingMicReason = reason
+        guard micLifecycleTask == nil else { return }
+        micLifecycleTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            AudioLog.event("lifecycle.run", ["reason": reason])
-            await op(self)
+            while let operation = pendingMicOperation {
+                let reason = pendingMicReason
+                pendingMicOperation = nil
+                AudioLog.event("lifecycle.run", ["reason": reason])
+                await operation(self)
+            }
+            micRecoveryPending = false
+            micLifecycleTask = nil
         }
-        micLifecycleTask = task
+    }
+
+    private func invalidateMicrophone(generation: Int, preview: Bool) {
+        if preview {
+            guard generation == previewMicGeneration, previewMicHealth.invalidate(generation: generation) else { return }
+            enqueueMicLifecycle("preview-configuration-invalidated") { await $0.restartPreviewMicEngineForInputSwitch() }
+        } else {
+            guard generation == micEngineGeneration, micHealth.invalidate(generation: generation) else { return }
+            enqueueMicLifecycle("configuration-invalidated") { await $0.restartMeetingMicEngineForInputSwitch() }
+        }
+    }
+
+    private func startNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress,
+                                      generation: Int, voiceProcessing: Bool, resolvedID: UInt32,
+                                      pinned: Bool, preview: Bool) async throws {
+        let problem = ingress.problemCallback()
+        let invalidation = CaptureInvalidationMailbox(onInvalidated: {
+            problem(.unknown(generation: generation, message: "The native microphone configuration was invalidated."))
+        }) { [weak self] in
+            self?.invalidateMicrophone(generation: generation, preview: preview)
+        }
+        let changed = invalidation.callback()
+        try await micOperationOwner.perform(onFailure: { error in
+            problem(.unknown(generation: generation, message: "Microphone start failed: \(error.localizedDescription)"))
+        }, operation: {
+            try await engine.start(generation: generation, enableVoiceProcessing: voiceProcessing,
+                                   preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
+                                   pinned: pinned, onConfigurationChange: changed,
+                                   onCaptureProblem: ingress.problemCallback(), onAudioData: ingress.callback())
+        }, cleanupIfAbandoned: {
+            await engine.stop()
+            await ingress.finish()
+        })
+    }
+
+    @discardableResult
+    private func stopNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress?, preview: Bool) async -> Bool {
+        let generation = preview ? previewMicGeneration : micEngineGeneration
+        let problem = ingress?.problemCallback()
+        do {
+            try await micOperationOwner.perform(onFailure: { error in
+                problem?(.unknown(generation: generation, message: "Microphone stop failed: \(error.localizedDescription)"))
+            }) {
+                await engine.stop()
+                await ingress?.finish()
+            }
+            return true
+        } catch {
+            if let failure = error as? CaptureOperationOwner.Failure, case .busy = failure { return false }
+            let message = error.localizedDescription
+            if preview { previewMicHealth.fail(message, quarantined: true) }
+            else { micHealth.fail(message, quarantined: true) }
+            meters.setMicAlert(message)
+            return false
+        }
     }
 
     // MARK: Selection persistence
@@ -952,17 +1047,24 @@ final class AppModel: ObservableObject {
             // it the system default output so playback actually moves there.
             _ = AudioDeviceManager.setDefaultOutputDevice(id)
         }
+        micHealth.reset()
+        previewMicHealth.reset()
         loadOutputDevices()
         // An output change is a fresh chance for VPIO; let the engine re-evaluate.
         if isCapturing {
             micVoiceProcessingDowngraded = false
             enqueueMicLifecycle("output-pick") { await $0.restartMeetingMicEngineForInputSwitch() }
+        } else if isStartScreenActive {
+            previewVoiceProcessingDowngraded = false
+            enqueueMicLifecycle("output-pick-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
         }
     }
 
     /// Apply an input policy change: re-resolve + (if capturing) restart the
     /// meeting engine when the device actually differs, else refresh the preview.
     private func applyInputSelectionChange() {
+        micHealth.reset()
+        previewMicHealth.reset()
         micVoiceProcessingDowngraded = false
         // A manual device pick is fresh user intent - same rationale as
         // Refresh. But requestMicRecovery's own fallback step calls
@@ -980,6 +1082,7 @@ final class AppModel: ObservableObject {
     }
 
     private func startHomeLevelPreviewNow() async {
+        startMicFramesWatchdog()
         guard !isCapturing else { return }
         guard !isStartingMeeting else { return }
         // A meeting that just stopped is still tearing down (capture engine,
@@ -1001,10 +1104,7 @@ final class AppModel: ObservableObject {
         }
 
         if !isPreviewCaptureRunning {
-            guard let display = selectedDisplay ?? displays.first else {
-                isPreviewingLevels = previewMicEngine != nil
-                return
-            }
+            if let display = selectedDisplay ?? displays.first {
             let audioFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
             do {
                 try await captureEngine.startCapture(contentFilter: audioFilter, writer: nil, recordTo: nil)
@@ -1019,9 +1119,15 @@ final class AppModel: ObservableObject {
             } catch {
                 shareableContentError = "Failed to start system audio preview: \(error.localizedDescription)"
             }
+            } else {
+                shareableContentError = "System audio preview needs an available display."
+            }
         }
 
-        if previewMicEngine == nil {
+        if previewMicEngine == nil, micOperationOwner.isBusy {
+            previewMicHealth.fail("The previous microphone operation is still owned by macOS.", quarantined: true)
+        }
+        if previewMicEngine == nil, previewMicHealth.phase != .failed, !micOperationOwner.isBusy {
             let (resolvedID, pinned) = resolvedInputDeviceID()
             previewMicEngineBoundDeviceID = resolvedID
             let usesCaptureSession = shouldUseCaptureSessionEngine(
@@ -1057,35 +1163,26 @@ final class AppModel: ObservableObject {
         previewMicGeneration += 1
         let generation = previewMicGeneration
         let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        previewMicForwarder = forwarder
+        previewMicHealth.begin(generation: generation)
+        previewVoiceProcessingRequested = !usesCaptureSession && shouldEnableVoiceProcessing() && !previewVoiceProcessingDowngraded
         await forwarder.beginMeeting()
         await forwarder.beginGeneration(generation, writer: nil)
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             guard let self, self.previewMicGeneration == generation, self.isStartScreenActive else { return }
             self.handlePreviewMicAudio(result)
         }
-        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display)
+        observedPreviewMicProblems = 0
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display,
+                                               onProblem: await forwarder.captureFailureHandler())
         previewMicAudioIngress = ingress
         do {
-            try await engine.start(
-                generation: generation,
-                // CaptureSessionMicEngine has no VPIO equivalent - never request it there.
-                enableVoiceProcessing: usesCaptureSession ? false : shouldEnableVoiceProcessing(),
-                preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
-                pinned: pinned,
-                onConfigurationChange: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        AudioLog.event("preview.engine.configchange", ["snap": AudioDeviceManager.snapshot()])
-                        // Same re-resolve the meeting engine's hook does;
-                        // loadInputDevices() restarts the preview itself
-                        // if the resolved device actually moved.
-                        self.loadInputDevices()
-                    }
-                },
-                onAudioData: ingress.callback()
-            )
+            try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
+                                            voiceProcessing: previewVoiceProcessingRequested,
+                                            resolvedID: resolvedID, pinned: pinned, preview: true)
         } catch {
             await previewMicAudioIngress?.finish()
+            lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
             previewMicAudioIngress = nil
             previewMicGeneration += 1
             previewMicEngine = nil
@@ -1093,8 +1190,9 @@ final class AppModel: ObservableObject {
         }
 
         guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
-            await engine.stop()
+            guard await stopNativeMicrophone(engine, ingress: previewMicAudioIngress, preview: true) else { return }
             await previewMicAudioIngress?.finish()
+            lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
             previewMicAudioIngress = nil
             previewMicGeneration += 1
             previewMicEngine = nil
@@ -1110,14 +1208,22 @@ final class AppModel: ObservableObject {
         previewMicEngineUsesCaptureSession = false
         debugMicErrors += 1
         debugMicErrorMessage = "mic_preview_start_failed: \(error.localizedDescription)"
+        if previewVoiceProcessingRequested && !previewVoiceProcessingDowngraded && !(error is CaptureOperationOwner.Failure) {
+            previewVoiceProcessingDowngraded = true
+        }
+        previewMicHealth.fail(error.localizedDescription, retryable: micPermission == .authorised,
+                              quarantined: error is CaptureOperationOwner.Failure)
+        meters.setMicAlert(previewMicHealth.message ?? "Microphone unavailable")
         publishMicError()
     }
 
     private func stopHomeLevelPreviewNow() async {
-        if let engine = previewMicEngine {
-            await engine.stop()
+        if let engine = previewMicEngine,
+           await stopNativeMicrophone(engine, ingress: previewMicAudioIngress, preview: true) {
             await previewMicAudioIngress?.finish()
+            lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
             previewMicAudioIngress = nil
+            previewMicForwarder = nil
             previewMicGeneration += 1
             previewMicEngine = nil
             previewMicEngineBoundDeviceID = 0
@@ -1131,10 +1237,9 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if isPreviewCaptureRunning {
-            await captureEngine.stopCapture()
-            isPreviewCaptureRunning = false
-        }
+        // Source identity protects a recording started while preview teardown awaited macOS.
+        if captureEngine.isPreviewSource { _ = await captureEngine.stopCapture() }
+        isPreviewCaptureRunning = false
 
         isPreviewingLevels = false
         micLevel = 0
@@ -1175,16 +1280,27 @@ final class AppModel: ObservableObject {
     }
 
     private func startMeetingMicEngine() async {
+        startMicFramesWatchdog()
         guard transcribeMic else {
             micEngine = nil
             micEngineStartedAt = nil
             await micAudioIngress?.finish()
+            lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
             micAudioIngress = nil
             await micAudioForwarder.stop()
             cancelMicStartupHealthCheck()
             return
         }
 
+        guard !micOperationOwner.isBusy else {
+            micHealth.fail("The previous microphone operation is still owned by macOS.", quarantined: true)
+            sourceRecorder?.reportFailure(stream: .mic, message: "The requested microphone could not start while a previous operation was still running.")
+            return
+        }
+        guard micHealth.phase != .failed else {
+            sourceRecorder?.reportFailure(stream: .mic, message: micHealth.message ?? "The requested microphone is unavailable.")
+            return
+        }
         micEngineGeneration += 1
         let generation = micEngineGeneration
 
@@ -1213,9 +1329,11 @@ final class AppModel: ObservableObject {
             // leave a broken pin permanently dead, surviving even Refresh.
             AudioLog.event("engine.select.capturesession-fallback", ["gen": generation, "resolvedID": resolvedID])
             micEngineUsesCaptureSession = false
+            micEngineGeneration += 1
+            let fallbackGeneration = micEngineGeneration
             do {
                 try await attemptMeetingMicEngineStart(
-                    usesCaptureSession: false, resolvedID: resolvedID, pinned: pinned, generation: generation
+                    usesCaptureSession: false, resolvedID: resolvedID, pinned: pinned, generation: fallbackGeneration
                 )
             } catch {
                 await handleMeetingMicEngineStartFailure(error)
@@ -1258,36 +1376,25 @@ final class AppModel: ObservableObject {
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             self?.onMicAudioDelivered(result, generation: generation)
         }
+        observedMicProblems = 0
+        let reportProblem = await micAudioForwarder.captureFailureHandler()
         let recorder = sourceRecorder
         let timeline = sourceTimeline
         let ingress = MicAudioIngress.forwarding(to: micAudioForwarder, display: display, onRejected: { packet, reason in
             guard let timeline else { return }
             recorder?.reportLoss(stream: .mic, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
                                  frames: Int64(packet.outputFrameCount), reason: reason.rawValue)
-        })
+        }, onProblem: reportProblem)
         micAudioIngress = ingress
 
-        try await engine.start(
-            generation: generation,
-            enableVoiceProcessing: enableVPIO,
-            preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
-            pinned: pinned,
-            onConfigurationChange: { [weak self] in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    AudioLog.event("engine.configchange", ["snap": AudioDeviceManager.snapshot()])
-                    // Re-resolve under the new route; restarts only if the
-                    // device the engine should be on actually moved.
-                    self.loadInputDevices()
-                }
-            },
-            onAudioData: ingress.callback()
-        )
+        micHealth.begin(generation: generation)
+        try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
+                                        voiceProcessing: enableVPIO, resolvedID: resolvedID, pinned: pinned, preview: false)
         // Serialization should prevent overlap, but bail if a newer start
         // superseded this one before it completed (audit D2 belt-and-braces).
         guard generation == micEngineGeneration else {
             AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
-            await engine.stop()
+            _ = await stopNativeMicrophone(engine, ingress: ingress, preview: false)
             return
         }
         // A stop() that ran concurrently with this start (e.g. a recovery
@@ -1296,7 +1403,7 @@ final class AppModel: ObservableObject {
         // what we just started and leave micEngine untouched instead.
         guard !isFinalizing else {
             AudioLog.event("engine.start.superseded-by-stop", ["gen": generation])
-            await engine.stop()
+            _ = await stopNativeMicrophone(engine, ingress: ingress, preview: false)
             return
         }
         micEngine = engine
@@ -1314,8 +1421,6 @@ final class AppModel: ObservableObject {
         if sourceRecorder != nil {
             await micAudioForwarder.setOutputEnabled(true)
         }
-        debugMicErrorMessage = "-"
-        publishMicError()
         if isCapturing {
             scheduleMicStartupHealthCheck()
         }
@@ -1324,9 +1429,8 @@ final class AppModel: ObservableObject {
     private func handleMeetingMicEngineStartFailure(_ error: Error) async {
         // A VPIO-format failure is not a hard failure: downgrade to plain
         // capture once and restart rather than leaving the mic dead.
-        if let micEngineError = error as? MicEngineError,
-           case .invalidInputFormat(_, _, _, let vpioRequested) = micEngineError,
-           vpioRequested, !micVoiceProcessingDowngraded {
+        if micVoiceProcessingRequested, !micVoiceProcessingDowngraded,
+           !(error is CaptureOperationOwner.Failure), micPermission == .authorised {
             micVoiceProcessingDowngraded = true
             appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
             AudioLog.event("engine.start.vpio-downgrade-retry")
@@ -1347,6 +1451,7 @@ final class AppModel: ObservableObject {
         micEngineBoundDeviceID = 0
         micEngineUsesCaptureSession = false
         await micAudioIngress?.finish()
+        lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
         cancelMicStartupHealthCheck()
@@ -1356,7 +1461,9 @@ final class AppModel: ObservableObject {
         // The red debugMicErrorMessage line takes precedence in SessionView,
         // but a stale "reconnecting..." alert must not be left to resurface
         // after a later successful start, before the first frame arrives.
-        meters.clearMicAlert()
+        micHealth.fail(error.localizedDescription, retryable: micPermission == .authorised,
+                       quarantined: error is CaptureOperationOwner.Failure)
+        meters.setMicAlert(micHealth.message ?? "Microphone unavailable")
         AudioLog.error("engine.start.fail.surfaced", ["error": String(describing: error)])
         appendBackendLog("Mic engine failed to start: \(error.localizedDescription)", toTail: true)
     }
@@ -1376,7 +1483,7 @@ final class AppModel: ObservableObject {
         AudioLog.event("engine.restart.begin", ["boundID": micEngineBoundDeviceID])
 
         if let engine = micEngine {
-            await engine.stop()
+            guard await stopNativeMicrophone(engine, ingress: micAudioIngress, preview: false) else { return }
             micEngine = nil
         }
         micEngineBoundDeviceID = 0
@@ -1388,6 +1495,7 @@ final class AppModel: ObservableObject {
         // explicitly here too so forwarding halts the instant the engine
         // does, rather than lingering until the new generation is armed.
         await micAudioIngress?.finish()
+        lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
         micLevel = 0
@@ -1403,8 +1511,9 @@ final class AppModel: ObservableObject {
     private func restartPreviewMicEngineForInputSwitch() async {
         await runPreviewLifecycleOperation { model in
             if let engine = model.previewMicEngine {
-                await engine.stop()
+                guard await model.stopNativeMicrophone(engine, ingress: model.previewMicAudioIngress, preview: true) else { return }
                 await model.previewMicAudioIngress?.finish()
+                model.lastRetiredPreviewMicIngress = model.previewMicAudioIngress?.snapshot() ?? model.lastRetiredPreviewMicIngress
                 model.previewMicAudioIngress = nil
                 model.previewMicGeneration += 1
                 model.previewMicEngine = nil
@@ -1426,74 +1535,92 @@ final class AppModel: ObservableObject {
     /// once frames have actually been flowing. This is the recovery for the
     /// silent-dead-mic-on-device-change symptom.
     private func startMicFramesWatchdog() {
-        stopMicFramesWatchdog()
+        guard micFramesWatchdogTask == nil else { return }
         micFramesWatchdogTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: self?.micWatchdogIntervalNs ?? 2_000_000_000)
-                guard let self else { return }
-                guard !Task.isCancelled else { return }
-                guard self.isCapturing else { continue }
-                // Backpressure check rides the existing watchdog cadence
-                // (2026-07-16 RCA rec #2: cheap counter comparison, no
-                // per-frame timers). Deliberately BEFORE the transcribeMic
-                // guard - a system-only meeting pipes audio too and needs
-                // the same alarm.
-                self.checkBackendWriteBacklog()
-                guard self.transcribeMic else { continue }
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                guard let self, !Task.isCancelled else { return }
+                guard !isFinalizing else { continue }
+                if isCapturing { checkBackendWriteBacklog() }
+                let preview = !isCapturing && !isStartingMeeting && isStartScreenActive && !shouldShowOnboarding
+                guard isCapturing || preview else { continue }
 
-                // Ground truth from the forwarder, NOT the MainActor mirrors
-                // (`lastMicAudioAt`/`micFrameCount`) - those can lag behind
-                // reality under exactly the MainActor storm this watchdog
-                // needs to stay correct through (2026-07-06 livelock fix,
-                // item 1). A delayed mirror must never read as "mic stopped"
-                // when the forwarder is still delivering fine off-actor.
-                let snap = await self.micAudioForwarder.snapshot()
-                let reference = snap.lastFrameAt ?? self.micStartTime
-                let since = reference.map { Date().timeIntervalSince($0) }
-                AudioLog.event("heartbeat", [
-                    "frames": snap.frameCount,
-                    "sinceLastFrameMs": since.map { Int($0 * 1000) } ?? -1,
-                    "micLevel": String(format: "%.3f", self.micLevel),
-                    "engineAlive": self.micEngine != nil,
-                    "boundID": self.micEngineBoundDeviceID,
-                    "snap": AudioDeviceManager.snapshot()
-                ])
+                let recoverSystem = captureEngine.supervise()
+                if preview, captureEngine.health.phase == .healthy { isPreviewCaptureRunning = true }
+                if recoverSystem, !systemRecoveryPending {
+                    systemRecoveryPending = true
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        defer { systemRecoveryPending = false }
+                        let recovered = await captureEngine.restartCapture()
+                        if preview { isPreviewCaptureRunning = recovered }
+                    }
+                }
 
-                guard self.micEngine != nil else { continue }
-                // Once the ladder has given up, stop re-detecting the same
-                // dead stall every tick - that would re-log heartbeat.STALL
-                // and re-announce "attempting recovery" for the rest of the
-                // meeting even though requestMicRecovery itself would no-op.
-                guard !self.micRecoveryParked else { continue }
-                if let last = snap.lastFrameAt {
-                    // Delivered-then-stopped: frames were flowing and died.
-                    guard Date().timeIntervalSince(last) > self.micStallThresholdSeconds else { continue }
-                    AudioLog.error("heartbeat.STALL", [
-                        "sinceLastFrameMs": Int(Date().timeIntervalSince(last) * 1000),
-                        "snap": AudioDeviceManager.snapshot()
-                    ])
-                    self.appendBackendLog("Mic stopped delivering audio - restarting capture.", toTail: true)
-                    self.requestMicRecovery(reason: "watchdog-stall")
-                } else if let startedAt = self.micEngineStartedAt,
-                          Date().timeIntervalSince(startedAt) > self.micStallThresholdSeconds {
-                    // Never-delivered-at-all: lastFrameAt only arms after a
-                    // first frame, so an engine that never delivers frame one
-                    // was previously invisible here (the 5 Jul 2026 incident -
-                    // engine.start.ok pinned=true but zero frames, ever).
-                    AudioLog.error("heartbeat.STALL.no-first-frame", [
-                        "sinceStartMs": Int(Date().timeIntervalSince(startedAt) * 1000),
-                        "snap": AudioDeviceManager.snapshot()
-                    ])
-                    self.appendBackendLog("Mic never delivered audio after switching input - attempting recovery.", toTail: true)
-                    self.requestMicRecovery(reason: "watchdog-no-first-frame")
+                if preview {
+                    observeMicrophoneProblems(preview: true)
+                    if previewMicHealth.phase == .quarantined, !micOperationOwner.isBusy {
+                        previewMicHealth.fail("The previous microphone operation has finished.")
+                    }
+                    if let forwarder = previewMicForwarder {
+                        let snapshot = await forwarder.snapshot()
+                        if previewMicHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                                      at: snapshot.lastFrameAt ?? Date()) {
+                            debugMicErrorMessage = "-"
+                            publishMicError()
+                            meters.clearMicAlert()
+                        }
+                    }
+                    if previewMicHealth.shouldRecover(requireContinuousCallbacks: true), !micOperationOwner.isBusy {
+                        if previewVoiceProcessingRequested { previewVoiceProcessingDowngraded = true }
+                        meters.setMicAlert("Reconnecting microphone preview…")
+                        enqueueMicLifecycle("preview-health-recovery") { await $0.restartPreviewMicEngineForInputSwitch() }
+                    }
+                    if previewMicHealth.phase == .failed { meters.setMicAlert(previewMicHealth.message ?? "Microphone preview is unavailable.") }
+                } else if transcribeMic {
+                    observeMicrophoneProblems(preview: false)
+                    if micHealth.phase == .quarantined, !micOperationOwner.isBusy {
+                        micHealth.fail("The previous microphone operation has finished.")
+                    }
+                    let snapshot = await micAudioForwarder.snapshot()
+                    if micHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                           at: snapshot.lastFrameAt ?? Date()) {
+                        resetMicRecoveryLadder()
+                        debugMicErrorMessage = "-"
+                        publishMicError()
+                    }
+                    if micHealth.shouldRecover(requireContinuousCallbacks: true), !micOperationOwner.isBusy {
+                        if micVoiceProcessingRequested { micVoiceProcessingDowngraded = true }
+                        meters.setMicAlert("Reconnecting microphone…")
+                        enqueueMicLifecycle("meeting-health-recovery") { await $0.restartMeetingMicEngineForInputSwitch() }
+                    }
+                    if micHealth.phase == .failed { meters.setMicAlert(micHealth.message ?? "Microphone is unavailable.") }
                 }
             }
         }
     }
 
+    private func observeMicrophoneProblems(preview: Bool) {
+        guard let snapshot = (preview ? previewMicAudioIngress : micAudioIngress)?.snapshot(),
+              let problem = snapshot.latestSourceProblem else { return }
+        if preview {
+            guard snapshot.sourceProblemCount > observedPreviewMicProblems, problem.generation == previewMicGeneration else { return }
+            observedPreviewMicProblems = snapshot.sourceProblemCount
+            previewMicHealth.fail(problem.message)
+        } else {
+            guard snapshot.sourceProblemCount > observedMicProblems, problem.generation == micEngineGeneration else { return }
+            observedMicProblems = snapshot.sourceProblemCount
+            micHealth.fail(problem.message)
+        }
+        debugMicErrorMessage = problem.message
+        publishMicError()
+        meters.setMicAlert(problem.message)
+    }
+
     private func stopMicFramesWatchdog() {
         micFramesWatchdogTask?.cancel()
         micFramesWatchdogTask = nil
+        micHealth.reset()
     }
 
     /// The writequeue-backpressure detector (2026-07-16 RCA rec #2), run
@@ -1539,46 +1666,9 @@ final class AppModel: ObservableObject {
     /// is the debounce: it stops the watchdog and the health check racing each
     /// other into a double rebuild for the same stall.
     private func requestMicRecovery(reason: String) {
-        guard !micRecoveryPending else { return }
-        guard !micRecoveryParked else { return }
-        guard isCapturing, transcribeMic else { return }
-        guard !isFinalizing else { return }
-
-        micNoAudioRecoveryAttempts += 1
-        let attempt = micNoAudioRecoveryAttempts
-        let pinnedAway = isPinnedAwayFromSystemDefaultInput()
-        let step = MicRecoveryLadder.step(forAttempt: attempt, isPinnedAwayFromDefault: pinnedAway)
-        AudioLog.event("mic.recovery", ["reason": reason, "attempt": attempt, "step": String(describing: step)])
-
-        switch step {
-        case .rebuild:
-            meters.setMicAlert("Mic stopped delivering audio - reconnecting...")
-            micRecoveryPending = true
-            enqueueMicLifecycle(reason) { model in
-                await model.restartMeetingMicEngineForInputSwitch()
-                model.micRecoveryPending = false
-            }
-        case .fallbackToSystemDefault:
-            var deviceName = "the pinned input"
-            if case .pinned(let uid) = inputSelection, let id = AudioDeviceManager.deviceID(forUID: uid) {
-                deviceName = inputDeviceName(for: id)
-            }
-            let message = "No audio from \(deviceName) - switched back to the system default input"
-            appendBackendLog(message, toTail: true)
-            meters.setMicAlert(message)
-            micRecoveryPending = true
-            // The normal UI pathway: updates the picker AND, since the
-            // resolved device now differs from the dead-bound one, enqueues
-            // the rebuild itself via loadInputDevices - a second explicit
-            // restart here would just be a redundant extra rebuild.
-            selectInputDevice(0)
-            enqueueMicLifecycle(reason) { model in
-                model.micRecoveryPending = false
-            }
-        case .giveUp:
-            meters.setMicAlert("Microphone is not delivering audio. Try Refresh or pick a different input.")
-            micRecoveryParked = true
-        }
+        guard isCapturing, transcribeMic, !isFinalizing else { return }
+        micHealth.fail("Microphone needs recovery (\(reason)).")
+        meters.setMicAlert("Reconnecting microphone…")
     }
 
     /// Resets all recovery-ladder bookkeeping in lockstep. Called wherever a
@@ -1596,79 +1686,62 @@ final class AppModel: ObservableObject {
     /// id has not changed - the old Refresh only restarted on an id delta and so
     /// could not rescue a dead-but-present mic (audit D3).
     func refreshMicrophones() {
+        Task { @MainActor [weak self] in _ = await self?.refreshMicrophonesAwaitingCompletion() }
+    }
+
+    func refreshMicrophonesAwaitingCompletion() async -> AudioRefreshResult {
         AudioLog.event("user.refresh", ["snap": AudioDeviceManager.snapshot()])
         loadInputDevices()
         loadOutputDevices()
-
-        guard isCapturing else {
-            // Not in a meeting: this is the fix for "Refresh does nothing" on
-            // the start screen (audit A3) - re-enumerating devices alone never
-            // touched the preview engine driving the meters, so a dead/stale
-            // preview meter had nothing to bring it back except a manual
-            // device pick. No `previewMicEngine != nil` gate here on purpose:
-            // the dead-preview case a user actually hits is the engine having
-            // FAILED to start and been nilled (mic_preview_start_failed), and
-            // restartPreviewMicEngineForInputSwitch already handles a nil
-            // engine fine (skips the stop, goes straight to
-            // startHomeLevelPreviewNow, which has its own guards).
-            if isStartScreenActive {
-                enqueueMicLifecycle("refresh-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
+        guard !isFinalizing, !isStartingMeeting else { return AudioRefreshResult(microphone: .failed, system: .failed) }
+        let preview = !isCapturing && isStartScreenActive
+        if preview {
+            observeMicrophoneProblems(preview: true)
+            previewMicHealth.observeExpectedProgress()
+        } else if transcribeMic {
+            observeMicrophoneProblems(preview: false)
+            micHealth.observeExpectedProgress()
+        }
+        _ = captureEngine.supervise(allowRecovery: false)
+        if preview {
+            previewMicHealth.reset()
+            previewVoiceProcessingDowngraded = false
+            captureEngine.resetRecoveryBudget()
+            await refreshHomeLevelPreview()
+        } else if isCapturing {
+            if transcribeMic, micHealth.phase != .healthy {
+                micHealth.reset()
+                micVoiceProcessingDowngraded = false
+                enqueueMicLifecycle("user-refresh-microphone") { await $0.restartMeetingMicEngineForInputSwitch() }
             }
-            return
+            if captureEngine.health.phase != .healthy {
+                captureEngine.resetRecoveryBudget()
+                _ = await captureEngine.restartCapture()
+            }
+            await micLifecycleTask?.value
         }
-        guard transcribeMic else { return }
-        let stale = lastMicAudioAt.map { Date().timeIntervalSince($0) > micStallThresholdSeconds } ?? true
-        if micEngine == nil || debugMicBuffers == 0 || stale {
-            AudioLog.event("user.refresh.force-restart", [
-                "engineAlive": micEngine != nil, "buffers": debugMicBuffers
-            ])
-            micVoiceProcessingDowngraded = false
-            // A manual refresh is a fresh user intent - the ladder starts over.
-            resetMicRecoveryLadder()
-            enqueueMicLifecycle("refresh") { await $0.restartMeetingMicEngineForInputSwitch() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while ContinuousClock.now < deadline {
+            let microphone = preview ? previewMicHealth.phase : micHealth.phase
+            _ = captureEngine.supervise(allowRecovery: false)
+            if (microphone == .healthy || (!preview && !transcribeMic)), captureEngine.health.phase == .healthy { break }
+            if microphone == .failed || microphone == .quarantined { break }
+            do { try await Task.sleep(for: .milliseconds(50)) } catch { break }
         }
-    }
-
-    /// Runs `refreshMicrophones()` and waits for whatever lifecycle work it
-    /// enqueued (a meeting-engine restart, a preview restart, or nothing) so
-    /// the Refresh button can show feedback tied to real completion rather
-    /// than a guessed delay.
-    func refreshMicrophonesAwaitingCompletion() async {
-        refreshMicrophones()
-        await micLifecycleTask?.value
+        func outcome(_ phase: CaptureSourceHealth.Phase) -> AudioRefreshResult.Outcome {
+            switch phase {
+            case .healthy: return .healthy
+            case .failed, .quarantined: return .failed
+            default: return .unverified
+            }
+        }
+        return AudioRefreshResult(microphone: (!preview && !transcribeMic) ? .notRequested : outcome(preview ? previewMicHealth.phase : micHealth.phase),
+                                  system: outcome(captureEngine.health.phase))
     }
 
     private func scheduleMicStartupHealthCheck() {
         cancelMicStartupHealthCheck()
-        guard transcribeMic else { return }
-
-        micStartupHealthTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
-            guard isCapturing else { return }
-            guard transcribeMic else { return }
-            guard micEngine != nil else { return }
-            guard debugMicBuffers == 0 else { return }
-
-            // A VPIO route that delivered no audio is the silent-failure case:
-            // downgrade once to plain capture and health-check that too. The
-            // restart reschedules the health check itself on success.
-            if micVoiceProcessingRequested && !micVoiceProcessingDowngraded {
-                micVoiceProcessingDowngraded = true
-                appendBackendLog("Echo cancellation could not start on this audio route; continuing without it.", toTail: true)
-                AudioLog.event("healthcheck.no-audio.vpio-downgrade")
-                enqueueMicLifecycle("vpio-downgrade") { await $0.restartMeetingMicEngineForInputSwitch() }
-                return
-            }
-
-            // Plain capture with no audio is a genuine mic problem, not VPIO -
-            // route into the shared recovery ladder instead of logging and
-            // giving up (this was the dead end in the 5 Jul 2026 incident).
-            AudioLog.error("healthcheck.no-audio")
-            appendBackendLog("Mic health check: still no audio.", toTail: true)
-            requestMicRecovery(reason: "healthcheck-no-audio")
-        }
+        startMicFramesWatchdog()
     }
 
     @MainActor
@@ -1688,19 +1761,18 @@ final class AppModel: ObservableObject {
         }
         loadOutputDevices()
 
-        // No active mic generation means nothing to re-evaluate; the next start
-        // resets the downgrade flag itself.
-        guard isCapturing, transcribeMic else { return }
-
-        // An output change is a fresh chance for VPIO, in any mode.
+        let outputID = AudioDeviceManager.defaultOutputDeviceID()
+        guard outputID != lastObservedOutputDeviceID else { return }
+        lastObservedOutputDeviceID = outputID
+        micHealth.reset()
+        previewMicHealth.reset()
         micVoiceProcessingDowngraded = false
-
-        // Only Auto's decision depends on the output route; manual On/Off keep
-        // their decision (the reset above still lets a later restart retry VPIO).
-        guard aecMode == .auto else { return }
-        guard shouldEnableVoiceProcessing() != micVoiceProcessingRequested else { return }
-
-        enqueueMicLifecycle("output-change") { await $0.restartMeetingMicEngineForInputSwitch() }
+        previewVoiceProcessingDowngraded = false
+        if isCapturing, transcribeMic {
+            enqueueMicLifecycle("output-change") { await $0.restartMeetingMicEngineForInputSwitch() }
+        } else if isStartScreenActive {
+            enqueueMicLifecycle("output-change-preview") { await $0.restartPreviewMicEngineForInputSwitch() }
+        }
     }
 
     private func rmsLevelInt16(_ data: Data) -> Float {
@@ -1960,6 +2032,13 @@ final class AppModel: ObservableObject {
             resolvedID: desiredID, pinned: pinned, liveDefaultInputID: liveDefaultInputID
         )
 
+        let configuration = "\(desiredID):\(pinned):\(desiredUsesCaptureSession)"
+        if lastResolvedInputConfiguration != configuration {
+            lastResolvedInputConfiguration = configuration
+            micHealth.reset()
+            previewMicHealth.reset()
+        }
+
         // Restart only when capturing and EITHER the device the engine SHOULD
         // be on differs from what it's actually bound to, OR the bound device
         // is unchanged but now needs a different ENGINE KIND. The kind case
@@ -1979,11 +2058,12 @@ final class AppModel: ObservableObject {
         // Same liveness check for the start-screen preview engine (audit A2
         // preview parity) - only meaningful when there's no meeting running
         // and a preview engine actually exists to be stale.
-        let willRestartPreview = !isCapturing && previewMicEngine != nil
-            && shouldRestartForSelection(
+        let willRestartPreview = !isCapturing && !isStartingMeeting && !isFinalizing
+            && isStartScreenActive && !shouldShowOnboarding
+            && ((previewMicEngine == nil && previewMicHealth.phase != .failed) || shouldRestartForSelection(
                 desiredID: desiredID, boundID: previewMicEngineBoundDeviceID,
                 desiredUsesCaptureSession: desiredUsesCaptureSession, currentUsesCaptureSession: previewMicEngineUsesCaptureSession
-            )
+            ))
 
         AudioLog.event("resolve.input", [
             "mode": inputSelection.logDescription,
@@ -2542,7 +2622,7 @@ final class AppModel: ObservableObject {
 
         enqueueMicLifecycle("start-failure-cleanup") { model in
             if let engine = model.micEngine {
-                await engine.stop()
+                _ = await model.stopNativeMicrophone(engine, ingress: model.micAudioIngress, preview: false)
             }
             model.micEngine = nil
             model.micEngineStartedAt = nil
@@ -2551,6 +2631,7 @@ final class AppModel: ObservableObject {
         }
         await micLifecycleTask?.value
         await micAudioIngress?.finish()
+        lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
@@ -2671,11 +2752,12 @@ final class AppModel: ObservableObject {
         screenshotScheduler.stop()
         await captureEngine.stopCapture()
         if let engine = micEngine {
-            await engine.stop()
+            _ = await stopNativeMicrophone(engine, ingress: micAudioIngress, preview: false)
         }
         micEngine = nil
         micEngineStartedAt = nil
         await micAudioIngress?.finish()
+        lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()

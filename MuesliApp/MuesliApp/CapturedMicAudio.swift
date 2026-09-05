@@ -49,3 +49,20 @@ nonisolated struct CapturedMicAudio: Sendable {
 
     var outputFrameCount: Int { data.count / MemoryLayout<Int16>.size }
 }
+
+/// A native failure is evidence even if it is the final callback. Unknown
+/// timestamp/format failures still degrade the source; they never borrow the
+/// previous callback's range. Stored metadata is bounded to the latest problem.
+nonisolated struct CapturedSourceProblem: Sendable {
+    let generation: Int
+    let captureTimeUs: Int64?
+    let nativeSampleRate: Double?
+    let nativeFrameCount: Int
+    let missingOutputFrames: Int
+    let message: String
+
+    static func unknown(generation: Int, message: String) -> CapturedSourceProblem {
+        CapturedSourceProblem(generation: generation, captureTimeUs: nil, nativeSampleRate: nil,
+                              nativeFrameCount: 0, missingOutputFrames: 0, message: message)
+    }
+}

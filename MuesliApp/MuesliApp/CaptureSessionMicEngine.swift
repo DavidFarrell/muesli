@@ -46,6 +46,7 @@ actor CaptureSessionMicEngine: MicCapturing {
         preferredInputDeviceID: UInt32?,
         pinned: Bool,
         onConfigurationChange: (@Sendable () -> Void)?,
+        onCaptureProblem: (@Sendable (CapturedSourceProblem) -> Void)?,
         onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) throws {
         guard !isRunning else { return }
@@ -53,7 +54,7 @@ actor CaptureSessionMicEngine: MicCapturing {
             throw CaptureSessionMicEngineError.deviceNotFound(uid: "none")
         }
 
-        self.processor = MicCaptureProcessor(generation: generation, output: onAudioData)
+        self.processor = MicCaptureProcessor(generation: generation, onProblem: onCaptureProblem, output: onAudioData)
         do {
             try startSession(deviceUID: uid, onConfigurationChange: onConfigurationChange)
         } catch {

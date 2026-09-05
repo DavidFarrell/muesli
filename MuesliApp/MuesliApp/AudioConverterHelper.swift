@@ -201,6 +201,10 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
     private let converter: AudioConverterHelper
     private let generation: Int
     private let output: @Sendable (CapturedMicAudio) -> Void
+    private let onProblem: (@Sendable (CapturedSourceProblem) -> Void)?
+    private var currentTimeUs: Int64?
+    private var currentRate: Double?
+    private var currentFrameCount = 0
     private var stopped = false
     private var epochUs: Int64?
     private var nativeFrames: Int64 = 0
@@ -232,16 +236,18 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
         }
     }
 
-    init(generation: Int, mixPolicy: AudioConverterHelper.ChannelMixPolicy = .meanOfActiveChannels, output: @escaping @Sendable (CapturedMicAudio) -> Void) {
+    init(generation: Int, mixPolicy: AudioConverterHelper.ChannelMixPolicy = .meanOfActiveChannels, onProblem: (@Sendable (CapturedSourceProblem) -> Void)? = nil, output: @escaping @Sendable (CapturedMicAudio) -> Void) {
         self.converter = AudioConverterHelper(mixPolicy: mixPolicy)
         self.generation = generation
         self.output = output
+        self.onProblem = onProblem
     }
 
     func receive(_ buffer: AVAudioPCMBuffer, captureTimeUs: Int64?) {
         lock.withLock {
             guard !stopped else { return }
             callbackCount += 1
+            setProblemContext(timeUs: captureTimeUs, rate: buffer.format.sampleRate, frames: Int(buffer.frameLength))
             processPCM(buffer, captureTimeUs: captureTimeUs)
         }
     }
@@ -251,6 +257,7 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
     private func processPCM(_ buffer: AVAudioPCMBuffer, captureTimeUs: Int64?) {
         lastCaptureTimeUs = captureTimeUs
         do {
+            guard buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0, buffer.format.channelCount > 0 else { throw AudioConverterHelper.ConversionError.invalidFormat }
             guard let captureTimeUs else { throw AudioConverterHelper.ConversionError.invalidTimestamp }
             let expected = epochUs.map { $0 + Int64((Double(nativeFrames) * 1_000_000 / nativeRate).rounded()) }
             // Source gaps and native format changes are real SRC epochs;
@@ -274,7 +281,11 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
         lock.withLock {
             guard !stopped else { return }
             callbackCount += 1
-            guard let sourceClock else {
+            let timeUs = sourceClock.flatMap {
+                CaptureTimeline.microseconds(CMSyncConvertTime(sampleBuffer.presentationTimeStamp, from: $0, to: CMClockGetHostTimeClock()))
+            }
+            setProblemContext(timeUs: timeUs, rate: nil, frames: CMSampleBufferGetNumSamples(sampleBuffer))
+            guard sourceClock != nil else {
                 noteFailure(AudioConverterHelper.ConversionError.invalidTimestamp); return
             }
             guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else {
@@ -282,6 +293,7 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
             }
             let format = AVAudioFormat(cmAudioFormatDescription: description)
             let count = CMSampleBufferGetNumSamples(sampleBuffer)
+            setProblemContext(timeUs: timeUs, rate: format.sampleRate, frames: count)
             guard count > 0, count <= Int(Int32.max),
                   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else {
                 noteFailure(AudioConverterHelper.ConversionError.unsupportedPCM); return
@@ -290,8 +302,7 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
             guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(count), into: buffer.mutableAudioBufferList) == noErr else {
                 noteFailure(AudioConverterHelper.ConversionError.unsupportedPCM); return
             }
-            let hostPTS = CMSyncConvertTime(sampleBuffer.presentationTimeStamp, from: sourceClock, to: CMClockGetHostTimeClock())
-            processPCM(buffer, captureTimeUs: CaptureTimeline.microseconds(hostPTS))
+            processPCM(buffer, captureTimeUs: timeUs)
         }
     }
 
@@ -299,6 +310,9 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
         lock.withLock {
             guard !stopped else { return }
             stopped = true
+            let remaining = max(0, Int(nativeFrames) - Int((Double(outputFrames) * nativeRate / 16000).rounded(.down)))
+            setProblemContext(timeUs: epochUs.map { $0 + outputFrames * 1_000_000 / 16000 },
+                              rate: nativeRate, frames: remaining)
             do { try flush() } catch { noteFailure(error) }
         }
     }
@@ -315,8 +329,18 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
                                 nativeFrameCount: nativeFrameCount, formatEpoch: formatEpoch, outputSampleRate: 16000))
     }
 
+    private func setProblemContext(timeUs: Int64?, rate: Double?, frames: Int) {
+        currentTimeUs = timeUs
+        currentRate = rate.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        currentFrameCount = max(0, frames)
+    }
+
     private func noteFailure(_ error: Error) {
         conversionFailures += 1
+        let missing = currentRate.map { Int((Double(currentFrameCount) * 16000 / $0).rounded(.up)) } ?? 0
+        onProblem?(CapturedSourceProblem(generation: generation, captureTimeUs: currentTimeUs,
+                                        nativeSampleRate: currentRate, nativeFrameCount: currentFrameCount,
+                                        missingOutputFrames: missing, message: "Audio conversion failed: \(error)"))
         if conversionFailures == 1 || conversionFailures % 256 == 0 {
             AudioLog.error("capture.convert.fail", ["generation": generation, "failures": conversionFailures, "error": String(describing: error)])
         }

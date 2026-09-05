@@ -8,10 +8,12 @@ import Foundation
 nonisolated protocol FrameSending: AnyObject, Sendable {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
     func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String)
+    func reportFailure(stream: StreamID, message: String)
 }
 
 extension FrameSending {
     nonisolated func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {}
+    nonisolated func reportFailure(stream: StreamID, message: String) {}
 }
 
 /// Abstraction over a monotonic time source, used for the forwarder's
@@ -194,6 +196,20 @@ actor MicAudioForwarder {
         pendingMicAudio.removeAll()
         pendingMicBytes = 0
         meterGate = MeterPublishGate(minPublishInterval: 0.066)
+    }
+
+    /// Capture immutable sink/epoch ownership before native start. Errors go
+    /// directly to the durable sink, including after UI starvation or retirement.
+    func captureFailureHandler() -> @Sendable (CapturedSourceProblem) -> Void {
+        let writer = writer, epoch = meetingEpochUs, stream = stream, generation = generation
+        return { problem in
+            guard problem.generation == generation else { return }
+            if let epoch, let time = problem.captureTimeUs, problem.missingOutputFrames > 0 {
+                writer?.reportLoss(stream: stream, ptsUs: time - epoch,
+                                   frames: Int64(problem.missingOutputFrames), reason: problem.message)
+            }
+            writer?.reportFailure(stream: stream, message: problem.message)
+        }
     }
 
     /// Flip on right after a successful engine start (or, under the

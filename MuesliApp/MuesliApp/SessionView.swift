@@ -73,7 +73,10 @@ struct SessionView: View {
                                 .font(.footnote)
                             }
 
-                            Text("If a meter is flat at 0, your capture is not receiving that stream.")
+                            if meters.system.debugErrorMessage != "-", !meters.system.debugErrorMessage.isEmpty {
+                                Text(meters.system.debugErrorMessage).font(.footnote).foregroundStyle(.orange)
+                            }
+                            Text("A zero meter can be normal silence. Refresh checks whether audio samples are arriving.")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
@@ -351,29 +354,34 @@ struct LevelMeter: View {
 struct RefreshFeedbackButton: View {
     let title: String
     let help: String
-    let action: () async -> Void
+    let action: () async -> AudioRefreshResult
 
-    private enum FeedbackState {
+    private enum FeedbackState: Equatable {
         case idle
         case working
         case done
+        case needsAttention
     }
 
     @State private var state: FeedbackState = .idle
+    @State private var resultMessage: String?
 
     var body: some View {
         Button {
-            guard state == .idle else { return }
+            guard state != .working else { return }
             // Set synchronously, before spawning the Task - a fast double
             // click can fire twice before SwiftUI re-renders `.disabled`, and
             // only a synchronous flip here makes the `guard` above actually
             // exclude the second click.
             state = .working
             Task {
-                await action()
-                state = .done
-                try? await Task.sleep(nanoseconds: 900_000_000)
-                state = .idle
+                let result = await action()
+                resultMessage = result.message
+                state = result.verified ? .done : .needsAttention
+                if result.verified {
+                    try? await Task.sleep(nanoseconds: 900_000_000)
+                    state = .idle
+                }
             }
         } label: {
             HStack(spacing: 4) {
@@ -383,6 +391,9 @@ struct RefreshFeedbackButton: View {
                 case .working:
                     ProgressView().controlSize(.small)
                     Text(title)
+                case .needsAttention:
+                    Image(systemName: "exclamationmark.triangle")
+                    Text("Check audio")
                 case .done:
                     Image(systemName: "checkmark")
                     Text(title)
@@ -390,7 +401,7 @@ struct RefreshFeedbackButton: View {
             }
         }
         .buttonStyle(.link)
-        .disabled(state != .idle)
-        .help(help)
+        .disabled(state == .working)
+        .help(resultMessage ?? help)
     }
 }
