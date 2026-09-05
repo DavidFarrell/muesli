@@ -67,6 +67,39 @@ nonisolated final class BackendProcess: @unchecked Sendable {
         stdoutLines = output.lines
     }
 
+    /// Pass only the fixed source identity contract to package initialization.
+    /// Child descriptors are acquired independently; no parent fd inheritance
+    /// or app lifetime assumption can authorize recreating a moved source.
+    func installMeetingLease(access: MeetingFileAccess, backendLease: FileHandle) throws {
+        try access.validate()
+        var value = stat(), current = stat()
+        let path = access.folderURL.appendingPathComponent(".backend-owner.lock").path
+        guard fstat(backendLease.fileDescriptor, &value) == 0, lstat(path, &current) == 0,
+              value.st_mode & S_IFMT == S_IFREG, value.st_nlink == 1, value.st_uid == geteuid(),
+              value.st_dev == current.st_dev, value.st_ino == current.st_ino else {
+            throw BackendAdmissionOwner.Failure(message: "The backend ownership file changed before child launch.")
+        }
+        let identity = access.identity
+        let token: [String: Any] = [
+            "version": 1,
+            "folder": access.folderURL.path,
+            "directory": ["device": identity.directoryDevice, "inode": identity.directoryInode],
+            "locks": [
+                ".meeting-access.lock": ["device": identity.lockDevice, "inode": identity.lockInode],
+                ".backend-owner.lock": ["device": UInt64(value.st_dev), "inode": value.st_ino]
+            ]
+        ]
+        let encoded = String(decoding: try JSONSerialization.data(withJSONObject: token, options: [.sortedKeys]), as: UTF8.self)
+        try processQueue.sync {
+            guard !processLock.withLock({ attemptedStart }) else {
+                throw BackendAdmissionOwner.Failure(message: "Cannot change meeting identity after child launch begins.")
+            }
+            var environment = process.environment ?? ProcessInfo.processInfo.environment
+            environment["MUESLI_MEETING_LEASE"] = encoded
+            process.environment = environment
+        }
+    }
+
     /// Called by BackendAdmissionOwner's worker. The cheap state lock is never
     /// held across native launch, journal work, or process-control calls.
     func start(checkAdmission: @Sendable () throws -> Void = {}) throws {
