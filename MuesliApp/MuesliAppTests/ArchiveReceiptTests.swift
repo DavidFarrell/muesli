@@ -13,8 +13,12 @@ final class ArchiveReceiptTests: XCTestCase {
             .appendingPathComponent("archive-receipt-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-        let source = ArchiveReceipt.Source(folder: root.appendingPathComponent("meeting").path,
-                                          directoryDevice: 1, directoryInode: 42,
+        let folder = root.appendingPathComponent("meeting")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        var identity = stat()
+        XCTAssertEqual(lstat(folder.path, &identity), 0)
+        let source = ArchiveReceipt.Source(folder: folder.path,
+                                          directoryDevice: UInt64(UInt32(bitPattern: identity.st_dev)), directoryInode: UInt64(identity.st_ino),
                                           files: [.init(path: "audio/mic.pcm", bytes: 32000, sha256: String(repeating: "a", count: 64))],
                                           sessionIDs: ["source-1"])
         let outputs = try ArchiveReceipt.Output.Role.allCases.filter { $0 != .attachment }.map { role in
@@ -27,7 +31,9 @@ final class ArchiveReceiptTests: XCTestCase {
                                      checks: .init(reprocessExitCode: 0, finalResultCount: 1, errorEventCount: 0,
                                                    coveredSessionIDs: ["source-1"], deterministicRedactionsVerified: true,
                                                    imageLinksVerified: true, sourceIntegrityProblems: []), cleanup: cleanup)
-        return Fixture(root: root, receipt: receipt, receiptURL: root.appendingPathComponent("receipt.json"))
+        let receiptURL = root.appendingPathComponent("receipt.json")
+        try JSONEncoder().encode(receipt).write(to: receiptURL)
+        return Fixture(root: root, receipt: receipt, receiptURL: receiptURL)
     }
     func testRoundTripAndPersistedOutputsMatch() throws {
         let value = try fixture()
@@ -100,10 +106,12 @@ final class ArchiveReceiptTests: XCTestCase {
         }
         let split = ArchiveReceipt(schemaVersion: 2, operationID: value.receipt.operationID, source: value.receipt.source,
                                    outputs: outputs, checks: value.receipt.checks, cleanup: .retained)
+        try JSONEncoder().encode(split).write(to: value.receiptURL)
         try split.validate(currentSource: split.source, receiptURL: value.receiptURL)
         outputs.removeLast()
         let incomplete = ArchiveReceipt(schemaVersion: 2, operationID: split.operationID, source: split.source,
                                         outputs: outputs, checks: split.checks, cleanup: .retained)
+        try JSONEncoder().encode(incomplete).write(to: value.receiptURL)
         XCTAssertThrowsError(try incomplete.validate(currentSource: split.source, receiptURL: value.receiptURL))
     }
     func testFailedChecksAndDuplicateCoverageDoNotAuthorizeCleanup() throws {
@@ -119,7 +127,53 @@ final class ArchiveReceiptTests: XCTestCase {
             checks[key] = failure
             object["checks"] = checks
             let receipt = try ArchiveReceipt.decode(JSONSerialization.data(withJSONObject: object))
+            try JSONEncoder().encode(receipt).write(to: value.receiptURL)
             XCTAssertThrowsError(try receipt.validate(currentSource: value.receipt.source, receiptURL: value.receiptURL), key)
+        }
+    }
+
+    func testCaseAliasCannotPlaceOutputOrReceiptInsideSource() throws {
+        let value = try fixture()
+        let alias = value.root.appendingPathComponent("MEETING")
+        guard FileManager.default.fileExists(atPath: alias.path) else { throw XCTSkip("Requires a case-insensitive filesystem") }
+        let inside = URL(fileURLWithPath: value.receipt.source.folder).appendingPathComponent("note.txt")
+        try Data("inside original".utf8).write(to: inside)
+        let fingerprint = try ArchiveReceipt.readFingerprint(at: alias.appendingPathComponent("note.txt"), maximumBytes: 1024)
+        var outputs = value.receipt.outputs
+        outputs[0] = .init(role: outputs[0].role, file: fingerprint, noteID: outputs[0].noteID)
+        let receipt = ArchiveReceipt(schemaVersion: 2, operationID: value.receipt.operationID,
+                                     source: value.receipt.source, outputs: outputs, checks: value.receipt.checks, cleanup: .retained)
+        try JSONEncoder().encode(receipt).write(to: value.receiptURL)
+        XCTAssertThrowsError(try receipt.validate(currentSource: receipt.source, receiptURL: value.receiptURL)) {
+            XCTAssertTrue($0.localizedDescription.contains("physically inside"))
+        }
+        let receiptAlias = alias.appendingPathComponent("receipt.json")
+        try JSONEncoder().encode(value.receipt).write(to: receiptAlias)
+        XCTAssertThrowsError(try value.receipt.validate(currentSource: value.receipt.source, receiptURL: receiptAlias)) {
+            XCTAssertTrue($0.localizedDescription.contains("physically inside"))
+        }
+    }
+    func testDistinctPathSpellingsCannotCountOneOutputTwice() throws {
+        let value = try fixture()
+        let raw = value.receipt.outputs[0]
+        let alias = value.root.appendingPathComponent(URL(fileURLWithPath: raw.file.path).lastPathComponent.uppercased())
+        guard FileManager.default.fileExists(atPath: alias.path) else { throw XCTSkip("Requires a case-insensitive filesystem") }
+        let fingerprint = try ArchiveReceipt.readFingerprint(at: alias, maximumBytes: 1024)
+        var outputs = value.receipt.outputs
+        outputs[1] = .init(role: outputs[1].role, file: fingerprint, noteID: outputs[1].noteID)
+        let receipt = ArchiveReceipt(schemaVersion: 2, operationID: value.receipt.operationID,
+                                     source: value.receipt.source, outputs: outputs, checks: value.receipt.checks, cleanup: .retained)
+        try JSONEncoder().encode(receipt).write(to: value.receiptURL)
+        XCTAssertThrowsError(try receipt.validate(currentSource: receipt.source, receiptURL: value.receiptURL)) {
+            XCTAssertTrue($0.localizedDescription.contains("same physical file"))
+        }
+    }
+    func testReceiptObjectMustMatchItsPersistedFile() throws {
+        let value = try fixture()
+        let different = ArchiveReceipt(schemaVersion: 2, operationID: UUID(), source: value.receipt.source,
+                                       outputs: value.receipt.outputs, checks: value.receipt.checks, cleanup: .retained)
+        XCTAssertThrowsError(try different.validate(currentSource: different.source, receiptURL: value.receiptURL)) {
+            XCTAssertTrue($0.localizedDescription.contains("persisted receipt differs"))
         }
     }
 

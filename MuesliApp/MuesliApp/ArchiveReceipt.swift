@@ -6,7 +6,7 @@ import Darwin
 /// verifies a handoff; it never grants a move or opens an archive lease. The
 /// native archive owner must separately prove source eligibility and retain
 /// all leases through revalidation, durable pending state and the actual move.
-nonisolated struct ArchiveReceipt: Codable, Sendable {
+nonisolated struct ArchiveReceipt: Codable, Equatable, Sendable {
     struct FileRecord: Codable, Equatable, Sendable {
         let path: String
         let bytes: Int64
@@ -25,7 +25,7 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
             case directoryDevice = "directory_device", directoryInode = "directory_inode", sessionIDs = "session_ids"
         }
     }
-    struct Output: Codable, Sendable {
+    struct Output: Codable, Equatable, Sendable {
         enum Role: String, Codable, CaseIterable, Sendable {
             case rawNote = "raw_note", officialNote = "official_note", redactionReport = "redaction_report"
             case speakerProvenance = "speaker_provenance", reprocessEvents = "reprocess_events"
@@ -36,7 +36,7 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
         let noteID: String?
         enum CodingKeys: String, CodingKey { case role, file; case noteID = "note_id" }
     }
-    struct Checks: Codable, Sendable {
+    struct Checks: Codable, Equatable, Sendable {
         let reprocessExitCode: Int
         let finalResultCount: Int
         let errorEventCount: Int
@@ -112,6 +112,13 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
         let receiptPath = receiptURL.path
         try Self.require(Self.absolute(receiptPath) && !Self.inside(receiptPath, source.folder),
                          "The receipt must remain outside the source folder.")
+        let sourceIdentity = FileIdentity(device: source.directoryDevice, inode: source.directoryInode)
+        let storedReceipt = try Self.readSnapshot(at: receiptURL, maximumBytes: 8 * 1024 * 1024, captureBytes: true)
+        try Self.require(!storedReceipt.ancestors.contains(sourceIdentity),
+                         "The receipt is physically inside the source folder.")
+        try Self.require(try Self.decode(storedReceipt.data) == self,
+                         "The persisted receipt differs from the validated handoff.")
+        var outputIdentities: Set<FileIdentity> = [storedReceipt.identity]
         try Self.require(outputs.count >= 6 && outputs.count <= 4096
                          && Set(outputs.map { $0.file.path }).count == outputs.count,
                          "The output inventory is incomplete or contains duplicate paths.")
@@ -146,8 +153,11 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
             if output.role != .reprocessDiagnostics {
                 try Self.require(file.bytes > 0, "A required handoff output is empty.")
             }
-            let actual = try Self.readFingerprint(at: URL(fileURLWithPath: file.path), maximumBytes: file.bytes)
-            try Self.require(actual == file, "A saved handoff output no longer matches its receipt.")
+            let actual = try Self.readSnapshot(at: URL(fileURLWithPath: file.path), maximumBytes: file.bytes)
+            try Self.require(!actual.ancestors.contains(sourceIdentity), "A handoff output is physically inside the source folder.")
+            try Self.require(outputIdentities.insert(actual.identity).inserted,
+                             "Handoff outputs or the receipt alias the same physical file.")
+            try Self.require(actual.record == file, "A saved handoff output no longer matches its receipt.")
         }
     }
 
@@ -166,6 +176,21 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
     /// hard-linked outputs. All descriptors stay open until identity and size
     /// are checked again. The caller retains its actual operation across waits.
     static func readFingerprint(at url: URL, maximumBytes: Int64) throws -> FileRecord {
+        try readSnapshot(at: url, maximumBytes: maximumBytes).record
+    }
+    private struct FileIdentity: Hashable {
+        let device: UInt64
+        let inode: UInt64
+        init(device: UInt64, inode: UInt64) { self.device = device; self.inode = inode }
+        init(_ value: stat) { device = UInt64(UInt32(bitPattern: value.st_dev)); inode = UInt64(value.st_ino) }
+    }
+    private struct Snapshot {
+        let record: FileRecord
+        let identity: FileIdentity
+        let ancestors: Set<FileIdentity>
+        let data: Data
+    }
+    private static func readSnapshot(at url: URL, maximumBytes: Int64, captureBytes: Bool = false) throws -> Snapshot {
         let path = url.path
         try require(absolute(path) && maximumBytes >= 0, "The output path or size limit is invalid.")
         let components = path.split(separator: "/").map(String.init)
@@ -189,6 +214,7 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
                     && before.st_nlink == 1 && before.st_size >= 0 && before.st_size <= maximumBytes,
                     "A handoff output is not an independent regular file of the expected size.")
         var hasher = SHA256()
+        var data = Data()
         var count: Int64 = 0
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
@@ -198,7 +224,9 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
             if size == 0 { break }
             try require(Int64(size) <= maximumBytes - count, "A handoff output grew during validation.")
             count += Int64(size)
-            hasher.update(data: Data(buffer.prefix(size)))
+            let chunk = Data(buffer.prefix(size))
+            hasher.update(data: chunk)
+            if captureBytes { data.append(chunk) }
         }
         var after = stat()
         try require(fstat(descriptor, &after) == 0 && count == before.st_size && before.st_size == after.st_size
@@ -207,12 +235,20 @@ nonisolated struct ArchiveReceipt: Codable, Sendable {
                     && before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec
                     && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec && after.st_nlink == 1,
                     "A handoff output changed during validation.")
+        var ancestors: Set<FileIdentity> = []
+        for descriptor in descriptors.dropLast() {
+            var value = stat()
+            try require(fstat(descriptor, &value) == 0, "An output ancestor is unavailable.")
+            ancestors.insert(FileIdentity(value))
+        }
         for (parent, name, child) in links {
             var named = stat(); var opened = stat()
             try require(fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) == 0 && fstat(child, &opened) == 0
                         && named.st_dev == opened.st_dev && named.st_ino == opened.st_ino,
                         "A handoff output path changed during validation.")
         }
-        return FileRecord(path: path, bytes: count, sha256: hasher.finalize().map { String(format: "%02x", $0) }.joined())
+        return Snapshot(record: FileRecord(path: path, bytes: count,
+                                           sha256: hasher.finalize().map { String(format: "%02x", $0) }.joined()),
+                        identity: FileIdentity(after), ancestors: ancestors, data: data)
     }
 }
