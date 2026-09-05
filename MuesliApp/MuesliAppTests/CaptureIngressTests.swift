@@ -7,7 +7,7 @@ nonisolated private final class CaptureTestSender: FrameSending, @unchecked Send
     private let lock = NSLock()
     private var frames: [Frame] = []
     private var failures: [String] = []
-    private var losses: [(Int64, Int)] = []
+    private var losses: [(Int64, Int64)] = []
     let failureComplete = DispatchSemaphore(value: 0)
     let complete: DispatchSemaphore?
     let expectedCount: Int
@@ -20,14 +20,14 @@ nonisolated private final class CaptureTestSender: FrameSending, @unchecked Send
             if frames.count == expectedCount { complete?.signal() }
         }
     }
-    func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int, reason: String) {
+    func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {
         lock.withLock { losses.append((ptsUs, frames)) }
     }
     func reportFailure(stream: StreamID, message: String) {
         lock.withLock { failures.append(message) }
         failureComplete.signal()
     }
-    func failureSnapshot() -> (Int, [(Int64, Int)]) { lock.withLock { (failures.count, losses) } }
+    func failureSnapshot() -> (Int, [(Int64, Int64)]) { lock.withLock { (failures.count, losses) } }
     func snapshot() -> [Frame] { lock.withLock { frames } }
 }
 
