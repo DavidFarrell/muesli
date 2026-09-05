@@ -14,6 +14,8 @@ import Foundation
 /// reads it). Moving both the ring buffer and the file I/O off MainActor
 /// removes that drumbeat entirely and means backend.log can keep being
 /// written even if the main thread is wedged.
+// The app defaults unannotated types to MainActor. Explicitly opt out: every
+// mutable field below is confined to `queue`, including handle close/reset.
 nonisolated final class BackendLogWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "muesli.backend-log", qos: .utility)
     private var handle: FileHandle?
@@ -44,6 +46,7 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     }
 
     private func appendOnQueue(_ line: String, toTail: Bool, handle target: FileHandle?) {
+        dispatchPrecondition(condition: .onQueue(queue))
         if let data = (line + "\n").data(using: .utf8), let target {
             do {
                 try target.write(contentsOf: data)
@@ -58,6 +61,7 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     }
 
     private func appendTailOnQueue(_ line: String) {
+        dispatchPrecondition(condition: .onQueue(queue))
         ringBuffer.append(line)
         if ringBuffer.count > ringBufferLimit {
             ringBuffer.removeFirst(ringBuffer.count - ringBufferLimit)

@@ -245,19 +245,13 @@ final class AppModel: ObservableObject {
     private var previewMicGeneration = 0
     private let micAudioForwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
     // Owns backend.log file writes + the copy-debug ring buffer off
-    // MainActor (2026-07-06 livelock fix, item 5). `nonisolated(unsafe)`:
-    // BackendLogWriter is internally serialized on its own private queue
-    // (see its doc comment), so it is genuinely safe to call from any
-    // isolation domain, incl. `AudioLog.sink`'s arbitrary-queue closure -
-    // that is the entire point of moving it off MainActor.
+    // MainActor. The writer explicitly opts out of default MainActor
+    // isolation and confines its mutable state to its own serial queue.
     private nonisolated let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
     // Detects (and logs) a wedged main thread from entirely off-main code -
     // see its doc comment (2026-07-06 livelock fix, item 2). Assigned in
-    // init() since it depends on `backendLogWriter`/`micAudioForwarder`.
+    // init() since it depends on `backendLogWriter`.
     private let mainActorStarvationWatchdog: MainActorStarvationWatchdog
-    // Cheap storm tripwire - see its doc comment (2026-07-06 livelock fix,
-    // item 7). Assigned in init() for the same reason.
-    private let stormTripwire: RunLoopStormTripwire
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
@@ -355,9 +349,8 @@ final class AppModel: ObservableObject {
 
     init() {
         mainActorStarvationWatchdog = MainActorStarvationWatchdog(
-            logWriter: backendLogWriter, forwarder: micAudioForwarder
+            logWriter: backendLogWriter
         )
-        stormTripwire = RunLoopStormTripwire(logWriter: backendLogWriter)
 
         if let stored = UserDefaults.standard.string(forKey: aecModeKey),
            let mode = AECMode(rawValue: stored) {
@@ -377,16 +370,11 @@ final class AppModel: ObservableObject {
             self?.backendLogWriter.append("[audio] \(line)", toTail: true)
         }
 
-        // Safe only now: every stored property (including stormTripwire
-        // itself) is assigned by this point, so this escaping closure can
-        // capture `self`.
-        stormTripwire.setContextProvider { [weak self] in
-            guard let self else {
-                return RunLoopStormTripwire.Context(
-                    activeScreen: "-", transcriptRows: 0, historyCount: 0, meterPublishCount: 0
-                )
-            }
-            return RunLoopStormTripwire.Context(
+        // Sample UI context only when the watchdog's one outstanding echo
+        // executes. A stall report uses the last successful sample and its age.
+        mainActorStarvationWatchdog.setContextProvider { [weak self] in
+            guard let self else { return nil }
+            return MainActorStarvationWatchdog.Context(
                 activeScreen: String(describing: self.activeScreen),
                 transcriptRows: self.transcriptModel.segments.count,
                 historyCount: self.meetingHistory.count,
@@ -394,7 +382,6 @@ final class AppModel: ObservableObject {
             )
         }
         mainActorStarvationWatchdog.start()
-        stormTripwire.start()
 
         // Restore the persisted device policy (a pin survives relaunch by UID).
         inputSelection = Self.persistedSelection(
