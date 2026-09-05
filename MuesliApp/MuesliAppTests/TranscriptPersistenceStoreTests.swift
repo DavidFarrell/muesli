@@ -12,7 +12,7 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
-        let metadata = MeetingMetadata(version: 1, title: "Meeting", createdAt: Date(), updatedAt: Date(), durationSeconds: 11, lastTimestamp: 8, status: .interrupted, sessions: [], segmentCount: 1, speakerNames: ["system:0": "Stale name"])
+        let metadata = MeetingMetadata(version: 1, title: "Meeting", createdAt: Date(), updatedAt: Date(), durationSeconds: 600, lastTimestamp: 800, status: .interrupted, sessions: [], segmentCount: 1, speakerNames: ["system:0": "Stale name"])
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
         let old: [String: Data] = ["meeting.json": try encoder.encode(metadata), "transcript.txt": Data("old text".utf8), "transcript.jsonl": Data(#"{"speaker_id":"system:0","stream":"system","t0":0,"t1":1,"text":"old text"}"#.utf8)]
         for (name, data) in old { try data.write(to: folder.appendingPathComponent(name)) }
@@ -22,6 +22,43 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
     private func assertOld(_ old: [String: Data], in folder: URL, file: StaticString = #filePath, line: UInt = #line) throws {
         for (name, data) in old { XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent(name)), data, file: file, line: line) }
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript_sources.json").path), file: file, line: line)
+    }
+
+    func testStoppedFinalizerReplaysOnlyDurableJournalAndCommitsAllFilesTogether() async throws {
+        for fail in [false, true] {
+            let (folder, old, _) = try fixture()
+            let recorder = try LocalAudioRecorder(directory: folder.appendingPathComponent("audio"))
+            let source = await recorder.finish(timeoutSeconds: 3)
+            let journal = folder.appendingPathComponent("events.jsonl")
+            let line = #"{"type":"segment","speaker_id":"system:0","stream":"system","source_session_id":"original","t0":0,"t1":1,"text":"durable word"}"# + "\n"
+            try Data((line + #"{"type":"segment","text":"not committed"}"# + "\n").utf8).write(to: journal)
+            var status = BackendStdoutStatus()
+            status.durableBytes = UInt64(line.utf8.count)
+            let frozenStatus = status
+            let store = TranscriptPersistenceStore { step in
+                if fail && step == .replace("transcript.txt") { throw CocoaError(.fileWriteOutOfSpace) }
+            }
+            let operation = try store.start(in: folder) { context in
+                try TranscriptReplacement.commitStoppedMeeting(context: context, timestampOffset: 30,
+                    segments: [], speakerNames: [:], journalURL: journal, journalStatus: frozenStatus,
+                    sourceManifest: source, artifactResult: nil, incomplete: false)
+            }
+            switch await operation.wait(timeoutSeconds: 3) {
+            case .completed(let metadata):
+                XCTAssertFalse(fail)
+                XCTAssertEqual(metadata.status, .degraded, "missing indexed source history must not be certified")
+                let text = try String(contentsOf: folder.appendingPathComponent("transcript.txt"), encoding: .utf8)
+                XCTAssertTrue(text.contains("durable word"))
+                XCTAssertTrue(text.contains("t=30.00s"))
+                XCTAssertFalse(text.contains("not committed"))
+                let json = try String(contentsOf: folder.appendingPathComponent("transcript.jsonl"), encoding: .utf8)
+                XCTAssertTrue(json.contains("original"))
+            case .failed:
+                XCTAssertTrue(fail)
+                try assertOld(old, in: folder)
+            default: XCTFail("Finalizer did not reach a terminal result")
+            }
+        }
     }
 
     func testSuccessfulReplacementPersistsRawProvenanceInventoryAndMetadataBeforePublishing() async throws {

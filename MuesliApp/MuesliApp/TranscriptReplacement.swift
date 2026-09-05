@@ -17,12 +17,39 @@ nonisolated struct TranscriptReplacement: Sendable {
         metadata.segmentCount = segments.count
         let lastTimestamp = segments.map { $0.t1 ?? $0.t0 }.max() ?? 0
         metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
-        metadata.durationSeconds = max(metadata.durationSeconds, result.duration, lastTimestamp)
+        metadata.durationSeconds = max(result.duration, result.sources?.map { $0.timelineOffsetSeconds + $0.durationSeconds }.max() ?? 0)
         metadata.speakerNames = [:]
         // Reprocessing cannot certify or repair capture integrity.
         self.metadata = metadata
         files = try Self.files(segments: segments, text: TranscriptModel.plainText(from: segments),
                                metadata: metadata, sources: result.sources)
+    }
+
+    /// One folder owner performs the whole stopped-session projection and save.
+    static func commitStoppedMeeting(context: TranscriptPersistenceStore.Context,
+        timestampOffset: Double, segments initialSegments: [TranscriptSegment], speakerNames: [String: String],
+        journalURL: URL?, journalStatus: BackendStdoutStatus?, sourceManifest: LocalAudioRecorder.Manifest?,
+        artifactResult: SessionArtifactFinishResult?, incomplete: Bool) throws -> MeetingMetadata {
+        var accumulator = TranscriptAccumulator(timestampOffset: timestampOffset,
+            segments: initialSegments, speakerNames: speakerNames)
+        let replay: TranscriptEventJournal.Replay
+        if let url = journalURL, let status = journalStatus {
+            replay = TranscriptEventJournal.replay(url: url, start: status.journalStartOffset,
+                byteCount: status.durableBytes)
+        } else {
+            replay = TranscriptEventJournal.Replay(error: "No authoritative transcript journal was available.")
+        }
+        for line in replay.lines { accumulator.ingest(jsonLine: line) }
+        let segments = accumulator.segments.filter { !$0.isPartial }
+        let prior = try context.readMetadata()
+        let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
+        var metadata = prior.finalized(segments: segments, sourceManifest: sourceManifest,
+            artifactResult: artifactResult, incomplete: incomplete || replay.error != nil,
+            sourceProblems: problems)
+        metadata.speakerNames.merge(accumulator.speakerNames) { reviewed, _ in reviewed }
+        try context.commit(files: TranscriptReplacement.files(segments: segments,
+            text: TranscriptModel.plainText(from: segments, names: metadata.speakerNames), metadata: metadata))
+        return metadata
     }
 
     /// Shared by batch replacement and the stopped-session finalizer. All

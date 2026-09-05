@@ -111,8 +111,6 @@ final class TranscriptModel: ObservableObject {
     @Published var lastTranscriptText: String = ""
     var echoSuppressionEnabled: Bool = true
 
-    private let echoTimeWindowSeconds: Double = 1.0
-
     func displayName(for speakerKey: String) -> String {
         guard let identity = TranscriptSpeakerIdentity(storageKey: speakerKey) else {
             return speakerNames[speakerKey] ?? speakerKey
@@ -211,6 +209,29 @@ final class TranscriptModel: ObservableObject {
         }.joined(separator: "\n")
     }
 
+    func ingest(jsonLine: String, sourceSessionID fallbackSourceSessionID: String? = nil) {
+        var value = TranscriptAccumulator(timestampOffset: timestampOffset, segments: segments,
+            speakerNames: speakerNames, lastTranscriptAt: lastTranscriptAt,
+            lastTranscriptText: lastTranscriptText, echoSuppressionEnabled: echoSuppressionEnabled)
+        value.ingest(jsonLine: jsonLine, sourceSessionID: fallbackSourceSessionID)
+        segments = value.segments
+        speakerNames = value.speakerNames
+        lastTranscriptAt = value.lastTranscriptAt
+        lastTranscriptText = value.lastTranscriptText
+    }
+}
+
+/// The same event reduction serves live UI and durable off-UI replay. It owns
+/// value state only and never reads files or publishes UI observations.
+nonisolated struct TranscriptAccumulator: Sendable {
+    var timestampOffset: Double = 0
+    var segments: [TranscriptSegment] = []
+    var speakerNames: [String: String] = [:]
+    var lastTranscriptAt: Date?
+    var lastTranscriptText: String = ""
+    var echoSuppressionEnabled: Bool = true
+    private let echoTimeWindowSeconds: Double = 1.0
+
     private func mergeSegment(_ newSegment: TranscriptSegment, into existingSegments: [TranscriptSegment]) -> [TranscriptSegment] {
         let epsilon: Double = 0.05
         let newStart = newSegment.t0
@@ -271,20 +292,21 @@ final class TranscriptModel: ObservableObject {
         }
     }
 
-    private func removeEchoes(causedBy systemSegment: TranscriptSegment) {
+    private mutating func removeEchoes(causedBy systemSegment: TranscriptSegment) {
         guard echoSuppressionEnabled else { return }
         guard systemSegment.stream == "system" else { return }
 
+        let echoWindow = echoTimeWindowSeconds
         segments.removeAll { existing in
             !existing.isPartial &&
             existing.stream == "mic" &&
             existing.sourceSessionID == systemSegment.sourceSessionID &&
-            abs(existing.t0 - systemSegment.t0) < echoTimeWindowSeconds &&
+            abs(existing.t0 - systemSegment.t0) < echoWindow &&
             existing.text.isEchoOf(systemSegment.text)
         }
     }
 
-    func ingest(jsonLine: String, sourceSessionID fallbackSourceSessionID: String? = nil) {
+    mutating func ingest(jsonLine: String, sourceSessionID fallbackSourceSessionID: String? = nil) {
         guard let data = jsonLine.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return

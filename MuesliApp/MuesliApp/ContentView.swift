@@ -19,7 +19,16 @@ struct RootView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        content
+        VStack(spacing: 0) {
+            if let notice = model.meetingSaveNotice {
+                Label(notice, systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.callout)
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.12))
+            }
+            content
+        }
             .padding(.top, 28)
             .toolbar {
                 ToolbarItem(placement: .automatic) {

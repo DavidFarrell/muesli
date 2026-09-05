@@ -114,6 +114,10 @@ final class AppModel: ObservableObject {
     @Published var showPermissionsSheet = false
     @Published var isCapturing = false
     @Published var isFinalizing = false
+    @Published private var meetingSaveNotices: [String: String] = [:]
+    var meetingSaveNotice: String? {
+        meetingSaveNotices.isEmpty ? nil : meetingSaveNotices.keys.sorted().compactMap { meetingSaveNotices[$0] }.joined(separator: "\n")
+    }
     @Published var captureMode: CaptureMode = .video
     @Published var sourceKind: SourceKind = .display
     @Published var transcribeSystem = true
@@ -1839,63 +1843,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func saveTranscriptFiles(
-        for session: MeetingSession,
-        segments: [TranscriptSegment],
-        text: String,
-        logToTail: Bool = true,
-        logHandle: FileHandle? = nil
-    ) {
-        let jsonlURL = session.folderURL.appendingPathComponent("transcript.jsonl")
-        let txtURL = session.folderURL.appendingPathComponent("transcript.txt")
-
-        let jsonlString = buildTranscriptJSONL(from: segments)
-        let textString = text
-
-        let jsonlData = jsonlString.data(using: .utf8)
-        let textData = textString.data(using: .utf8)
-
-        writeTranscriptData(
-            jsonlData,
-            to: jsonlURL,
-            encodeFailure: "Failed to encode transcript JSONL.",
-            writeFailure: "Failed to save transcript JSONL",
-            logToTail: logToTail,
-            logHandle: logHandle
-        )
-        writeTranscriptData(
-            textData,
-            to: txtURL,
-            encodeFailure: "Failed to encode transcript text.",
-            writeFailure: "Failed to save transcript text",
-            logToTail: logToTail,
-            logHandle: logHandle
-        )
-
-        let tempBase = FileManager.default.temporaryDirectory
-            .appendingPathComponent(TempTranscriptCleanup.stagingDirectoryName, isDirectory: true)
-        let tempFolder = tempBase.appendingPathComponent("\(session.title)-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
-            if let jsonlData {
-                try jsonlData.write(to: tempFolder.appendingPathComponent("transcript.jsonl"))
-            }
-            if let textData {
-                try textData.write(to: tempFolder.appendingPathComponent("transcript.txt"))
-            }
-            if logToTail {
-                tempTranscriptFolderPath = tempFolder.path
-            }
-            appendBackendLog("Transcript temp folder: \(tempFolder.path)", toTail: logToTail, handle: logHandle)
-        } catch {
-            appendBackendLog(
-                "Failed to save transcript temp copy: \(error.localizedDescription)",
-                toTail: logToTail,
-                handle: logHandle
-            )
-        }
-    }
-
     func exportTranscriptFiles() {
         guard let session = currentSession else {
             appendBackendLog("Export failed: no active session.", toTail: true)
@@ -2696,7 +2643,7 @@ final class AppModel: ObservableObject {
         if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
-            finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
+            await finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
                                     artifactResult: artifactResult, incomplete: true)
         } else {
             rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
@@ -2968,37 +2915,41 @@ final class AppModel: ObservableObject {
         backend?.cleanup()
         backendLogWriter.synchronize(label: "backend log")
 
-        let model = TranscriptModel()
-        model.timestampOffset = timestampOffsetSnapshot
-        model.segments = transcriptSegmentsSnapshot
-        model.speakerNames = speakerNamesSnapshot
-        let replay: TranscriptEventJournal.Replay
-        if let url = transcriptEventsURL, let status = journalDrain?.status {
-            replay = TranscriptEventJournal.replay(url: url, start: status.journalStartOffset,
-                                                   byteCount: status.durableBytes)
-        } else {
-            replay = TranscriptEventJournal.Replay(error: "No authoritative transcript journal was available.")
+        let journalStatus = journalDrain?.status
+        let incomplete = inferenceFailed || exitStatus != 0 || !journalComplete
+        do {
+            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+                onCompletion: { [weak self] result in
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL) }
+                }) { context in
+                try TranscriptReplacement.commitStoppedMeeting(context: context,
+                    timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
+                    speakerNames: speakerNamesSnapshot, journalURL: transcriptEventsURL,
+                    journalStatus: journalStatus, sourceManifest: sourceManifest,
+                    artifactResult: artifactResult, incomplete: incomplete)
+            }
+            switch await operation.wait(timeoutSeconds: 5) {
+            case .completed, .failed: break // Actual completion publishes the observed result.
+            case .timedOut, .cancelled:
+                meetingSaveNotices[session.folderURL.path] = "The meeting is still being saved. Its original disk operation retains ownership; the source recording and recovery files are preserved."
+            }
+        } catch {
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL)
         }
-        for line in replay.lines { model.ingest(jsonLine: line) }
-        if let error = replay.error { appendBackendLog(error, toTail: false, handle: backendLogHandle) }
+    }
 
-        let finalizedSegments = model.segments.filter { !$0.isPartial }
-        saveTranscriptFiles(
-            for: session,
-            segments: finalizedSegments,
-            text: model.asPlainText(),
-            logToTail: false,
-            logHandle: backendLogHandle
-        )
-        finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments,
-                                sourceManifest: sourceManifest,
-                                artifactResult: artifactResult,
-                                incomplete: inferenceFailed || exitStatus != 0 || !journalComplete || replay.error != nil)
-        if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
-           let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
-            meetingHistory[idx] = updatedItem
-        } else if let updatedItem = buildMeetingHistoryItem(for: session.folderURL) {
-            meetingHistory.insert(updatedItem, at: 0)
+    private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL) {
+        switch result {
+        case .success(let metadata):
+            meetingSaveNotices[folder.path] = nil
+            let item = MeetingHistoryItem(id: folder.lastPathComponent, folderURL: folder, title: metadata.title,
+                createdAt: metadata.createdAt, durationSeconds: metadata.durationSeconds,
+                segmentCount: metadata.segmentCount, status: metadata.status)
+            if let index = meetingHistory.firstIndex(where: { $0.folderURL == folder }) {
+                meetingHistory[index] = item
+            } else { meetingHistory.insert(item, at: 0) }
+        case .failure(let error):
+            meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
     }
 
@@ -3276,14 +3227,29 @@ final class AppModel: ObservableObject {
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
         artifactResult: SessionArtifactFinishResult? = nil,
         incomplete: Bool = false
-    ) {
+    ) async {
         do {
-            var metadata = try readMeetingMetadata(from: session.folderURL)
-            metadata = metadata.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,
-                                          artifactResult: artifactResult, incomplete: incomplete)
-            try writeMeetingMetadata(metadata, to: session.folderURL)
+            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+                onCompletion: { [weak self] result in
+                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL) }
+                }) { context in
+                let prior = try context.readMetadata()
+                let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
+                let metadata = prior.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,
+                    artifactResult: artifactResult, incomplete: incomplete, sourceProblems: problems)
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try context.commit(files: ["meeting.json": encoder.encode(metadata)])
+                return metadata
+            }
+            switch await operation.wait(timeoutSeconds: 5) {
+            case .completed, .failed: break
+            case .timedOut, .cancelled:
+                meetingSaveNotices[session.folderURL.path] = "The interrupted meeting is still being saved. Its source recording and recovery files are preserved."
+            }
         } catch {
-            appendBackendLog("Failed to update meeting.json: \(error.localizedDescription)", toTail: true)
+            publishMeetingSave(.failure(.operationFailed(error.localizedDescription)), folder: session.folderURL)
         }
     }
 
