@@ -69,9 +69,9 @@ nonisolated struct CaptureSourceHealth: Sendable {
     }
 
     mutating func shouldRecover(now: Date = Date(), requireContinuousCallbacks: Bool,
-                                stallThreshold: TimeInterval = 4) -> Bool {
+                                canStartRecovery: Bool = true, stallThreshold: TimeInterval = 4) -> Bool {
         if requireContinuousCallbacks { observeExpectedProgress(now: now, stallThreshold: stallThreshold) }
-        guard phase == .recovering, let retryAt, now >= retryAt else { return false }
+        guard canStartRecovery, phase == .recovering, let retryAt, now >= retryAt else { return false }
         self.retryAt = nil // exactly one queued reconciliation owns this attempt
         return true
     }

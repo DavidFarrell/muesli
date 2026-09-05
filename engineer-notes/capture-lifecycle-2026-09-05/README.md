@@ -32,3 +32,5 @@ The first frozen lifecycle review found two ownership defects: an older system r
 Retry-budget reset now preserves a valid active health generation and its progress. Only actual source retirement uses a full reset. Native busy rejection also records the requested source failure through the independent callback.
 
 The corrected snapshot passes **160 Swift tests, zero failures**, and the Release ad-hoc build. Logs: `/private/tmp/muesli-lifecycle-review-fix-tests.log` and `/private/tmp/muesli-lifecycle-review-fix-release.log`. Four additional regression tests cover stop during a delayed recovery operation, unchanged-ID policy transitions, preview retirement precedence, and failure evidence on busy admission.
+
+A final retry-admission check keeps due recovery pending while its native owner or recovery worker is unavailable. It cannot consume a retry ticket without launching the corresponding reconciliation. The final snapshot passes **161 Swift tests** and the Release build (`/private/tmp/muesli-lifecycle-final-{tests,release}.log`).

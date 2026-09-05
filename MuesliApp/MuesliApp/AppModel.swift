@@ -1555,7 +1555,7 @@ final class AppModel: ObservableObject {
                 let preview = !isCapturing && !isStartingMeeting && isStartScreenActive && !shouldShowOnboarding
                 guard isCapturing || preview else { continue }
 
-                let recoverSystem = captureEngine.supervise()
+                let recoverSystem = captureEngine.supervise(allowRecovery: !systemRecoveryPending)
                 if preview, captureEngine.health.phase == .healthy { isPreviewCaptureRunning = true }
                 if recoverSystem, !systemRecoveryPending, let requestToken = captureEngine.requestToken {
                     systemRecoveryPending = true
@@ -1584,7 +1584,7 @@ final class AppModel: ObservableObject {
                             meters.clearMicAlert()
                         }
                     }
-                    if previewMicHealth.shouldRecover(requireContinuousCallbacks: true), !micOperationOwner.isBusy {
+                    if previewMicHealth.shouldRecover(requireContinuousCallbacks: true, canStartRecovery: !micOperationOwner.isBusy) {
                         if previewVoiceProcessingRequested { previewVoiceProcessingDowngraded = true }
                         meters.setMicAlert("Reconnecting microphone preview…")
                         enqueueMicLifecycle("preview-health-recovery") { await $0.restartPreviewMicEngineForInputSwitch() }
@@ -1602,7 +1602,7 @@ final class AppModel: ObservableObject {
                         debugMicErrorMessage = "-"
                         publishMicError()
                     }
-                    if micHealth.shouldRecover(requireContinuousCallbacks: true), !micOperationOwner.isBusy {
+                    if micHealth.shouldRecover(requireContinuousCallbacks: true, canStartRecovery: !micOperationOwner.isBusy) {
                         if micVoiceProcessingRequested { micVoiceProcessingDowngraded = true }
                         meters.setMicAlert("Reconnecting microphone…")
                         enqueueMicLifecycle("meeting-health-recovery") { await $0.restartMeetingMicEngineForInputSwitch() }

@@ -253,6 +253,17 @@ final class CaptureLifecycleTests: XCTestCase {
         await existing.value
     }
 
+    func testBusyOwnerDoesNotConsumePendingRecovery() {
+        let now = Date(timeIntervalSince1970: 100)
+        var health = CaptureSourceHealth()
+        health.begin(generation: 1, now: now)
+        health.fail("Native source failed", now: now)
+        XCTAssertFalse(health.shouldRecover(now: now.addingTimeInterval(5), requireContinuousCallbacks: true,
+                                           canStartRecovery: false))
+        XCTAssertTrue(health.shouldRecover(now: now.addingTimeInterval(6), requireContinuousCallbacks: true))
+        XCTAssertFalse(health.shouldRecover(now: now.addingTimeInterval(7), requireContinuousCallbacks: true))
+    }
+
     func testRefreshDoesNotTreatUnverifiedOrFailedSourceAsSuccess() {
         XCTAssertFalse(AudioRefreshResult(microphone: .healthy, system: .unverified).verified)
         XCTAssertFalse(AudioRefreshResult(microphone: .failed, system: .healthy).verified)
