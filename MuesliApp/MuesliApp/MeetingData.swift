@@ -100,6 +100,55 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
     var segmentCount: Int
     var speakerNames: [String: String]
 
+    /// Pure metadata preparation for a folder-owned off-UI persistence operation.
+    func finalized(segments finalizedSegments: [TranscriptSegment],
+                   sourceManifest: LocalAudioRecorder.Manifest?,
+                   artifactResult: SessionArtifactFinishResult?,
+                   incomplete: Bool, now: Date = Date()) -> MeetingMetadata {
+        var metadata = self
+        let artifacts = artifactResult.map(MeetingArtifactFinalization.init)
+        let artifactsRequired = metadata.sessions.last?.artifactsFolder != nil
+        let artifactsIncomplete = artifactsRequired && artifacts?.isComplete != true
+        let lastTimestamp = max(
+            metadata.lastTimestamp,
+            finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
+        )
+        let segmentCount = max(metadata.segmentCount, finalizedSegments.count)
+        let savedDuration = sourceManifest.map { manifest in
+            Double(manifest.timeline_offset_us) / 1_000_000
+            + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
+        } ?? metadata.durationSeconds
+        // A verified source offset already includes earlier sessions. Do
+        // not carry old wall-clock durations or ASR timing into media time.
+        let durationSeconds = max(savedDuration, artifacts?.mediaEndSeconds ?? 0,
+                                  artifacts?.captureEndSeconds ?? 0)
+
+        metadata.updatedAt = now
+        metadata.durationSeconds = durationSeconds
+        metadata.lastTimestamp = lastTimestamp
+        metadata.segmentCount = segmentCount
+        metadata.status = incomplete || artifactsIncomplete || sourceManifest?.completed != true ? .degraded : .completed
+        if let lastIndex = metadata.sessions.indices.last {
+            var lastSession = metadata.sessions[lastIndex]
+            lastSession.artifactFinalization = artifacts
+            if lastSession.endedAt == nil {
+                lastSession.endedAt = now
+            }
+            if let sourceManifest {
+                lastSession.timelineOffsetSeconds = Double(sourceManifest.timeline_offset_us) / 1_000_000
+                lastSession.durationSeconds = Double(sourceManifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
+            }
+            if let mediaEnd = artifacts?.mediaEndSeconds, let offset = lastSession.timelineOffsetSeconds {
+                lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, mediaEnd - offset)
+            }
+            if let captureEnd = artifacts?.captureEndSeconds, let offset = lastSession.timelineOffsetSeconds {
+                lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, captureEnd - offset)
+            }
+            metadata.sessions[lastIndex] = lastSession
+        }
+        return metadata
+    }
+
     enum CodingKeys: String, CodingKey {
         case version
         case title

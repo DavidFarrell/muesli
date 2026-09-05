@@ -1,6 +1,22 @@
 import XCTest
 
 final class OrphanedMeetingRecoveryTests: XCTestCase {
+    func testFinalMetadataUsesVerifiedMediaInsteadOfOldWallClockOrASRExtent() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio"),
+                                             timelineOffsetUs: 60_000_000)
+        recorder.record(source: .mic, ptsUs: 0, payload: Data(repeating: 0, count: 320_000))
+        let source = await recorder.finish(timeoutSeconds: 3)
+        XCTAssertNotNil(source)
+        var previous = metadata(oldDuration: 900_000)
+        previous.lastTimestamp = 80_000
+        let saved = previous.finalized(segments: [], sourceManifest: source, artifactResult: nil,
+                                       incomplete: false)
+        XCTAssertEqual(saved.durationSeconds, 70)
+        XCTAssertEqual(saved.sessions.last?.durationSeconds, 10)
+        XCTAssertEqual(saved.sessions.last?.timelineOffsetSeconds, 60)
+    }
+
     func testResumeWaitsForOriginalWriterAfterCloseDeadlineThenUsesItsFullExtent() async throws {
         let root = try folder(), audio = root.appendingPathComponent("audio")
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)

@@ -3277,44 +3277,8 @@ final class AppModel: ObservableObject {
     ) {
         do {
             var metadata = try readMeetingMetadata(from: session.folderURL)
-            let artifacts = artifactResult.map(MeetingArtifactFinalization.init)
-            let artifactsRequired = metadata.sessions.last?.artifactsFolder != nil
-            let artifactsIncomplete = artifactsRequired && artifacts?.isComplete != true
-            let lastTimestamp = max(
-                metadata.lastTimestamp,
-                finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
-            )
-            let segmentCount = max(metadata.segmentCount, finalizedSegments.count)
-            let savedDuration = sourceManifest.map { manifest in
-                Double(manifest.timeline_offset_us) / 1_000_000
-                + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
-            } ?? metadata.durationSeconds
-            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration,
-                                      artifacts?.mediaEndSeconds ?? 0, artifacts?.captureEndSeconds ?? 0)
-
-            metadata.updatedAt = Date()
-            metadata.durationSeconds = durationSeconds
-            metadata.lastTimestamp = lastTimestamp
-            metadata.segmentCount = segmentCount
-            metadata.status = incomplete || artifactsIncomplete || sourceManifest?.completed != true ? .degraded : .completed
-            if let lastIndex = metadata.sessions.indices.last {
-                var lastSession = metadata.sessions[lastIndex]
-                lastSession.artifactFinalization = artifacts
-                if lastSession.endedAt == nil {
-                    lastSession.endedAt = Date()
-                }
-                if let sourceManifest {
-                    lastSession.timelineOffsetSeconds = Double(sourceManifest.timeline_offset_us) / 1_000_000
-                    lastSession.durationSeconds = Double(sourceManifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
-                }
-                if let mediaEnd = artifacts?.mediaEndSeconds, let offset = lastSession.timelineOffsetSeconds {
-                    lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, mediaEnd - offset)
-                }
-                if let captureEnd = artifacts?.captureEndSeconds, let offset = lastSession.timelineOffsetSeconds {
-                    lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, captureEnd - offset)
-                }
-                metadata.sessions[lastIndex] = lastSession
-            }
+            metadata = metadata.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,
+                                          artifactResult: artifactResult, incomplete: incomplete)
             try writeMeetingMetadata(metadata, to: session.folderURL)
         } catch {
             appendBackendLog("Failed to update meeting.json: \(error.localizedDescription)", toTail: true)
