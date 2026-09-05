@@ -43,6 +43,7 @@
 				BackendProcess.swift,
 				BackendAdmissionOwner.swift,
 				BuildIdentity.swift,
+				ByteEditEvidence.swift,
 				BatchRediarizer.swift,
 				BackendLogWriter.swift,
 				BackendOutputReader.swift,
