@@ -119,7 +119,12 @@ struct AttachmentDetailSheet: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(attachment.filename).font(.headline)
-                    Text(formatTimestamp(attachment.timestamp)).font(.caption).foregroundStyle(.secondary)
+                    if attachment.sourceSessionID == nil {
+                        Text("Legacy attachment: session and time alignment unknown.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text(formatTimestamp(attachment.timestamp)).font(.caption).foregroundStyle(.secondary)
+                    }
                     if attachment.sha256 == nil { Text("Legacy attachment: no saved fingerprint.").font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer()

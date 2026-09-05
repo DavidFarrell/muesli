@@ -237,8 +237,8 @@ nonisolated final class AttachmentPreviewReader: @unchecked Sendable {
                   let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
                   let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
                   width.doubleValue > 0, height.doubleValue > 0,
-                  width.doubleValue * height.doubleValue <= 100_000_000 else {
-                throw fail("The image is invalid or exceeds the 100 megapixel preview limit.")
+                  width.doubleValue * height.doubleValue <= 16_000_000 else {
+                throw fail("The image is invalid or exceeds the 16 megapixel preview limit.")
             }
             let pixels = request.mode == .thumbnail ? 160 : 2048
             guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
