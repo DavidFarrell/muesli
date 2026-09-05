@@ -2,14 +2,14 @@ import Foundation
 
 // MARK: - Meeting Metadata
 
-enum MeetingStatus: String, Codable {
+nonisolated enum MeetingStatus: String, Codable, Sendable {
     case recording
     case completed
     case degraded
     case interrupted
 }
 
-struct MeetingStreamInfo: Codable, Hashable {
+nonisolated struct MeetingStreamInfo: Codable, Hashable, Sendable {
     let sampleRate: Int?
     let channels: Int?
 
@@ -19,12 +19,14 @@ struct MeetingStreamInfo: Codable, Hashable {
     }
 }
 
-struct MeetingSessionMetadata: Codable, Hashable {
+nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
     let sessionID: Int
     let startedAt: Date
-    let endedAt: Date?
+    var endedAt: Date?
     let audioFolder: String
-    let streams: [String: MeetingStreamInfo]
+    var streams: [String: MeetingStreamInfo]
+    var timelineOffsetSeconds: Double? = nil
+    var durationSeconds: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -32,10 +34,12 @@ struct MeetingSessionMetadata: Codable, Hashable {
         case endedAt = "ended_at"
         case audioFolder = "audio_folder"
         case streams
+        case timelineOffsetSeconds = "timeline_offset_seconds"
+        case durationSeconds = "duration_seconds"
     }
 }
 
-struct MeetingMetadata: Codable {
+nonisolated struct MeetingMetadata: Codable, Sendable {
     var version: Int
     var title: String
     var createdAt: Date

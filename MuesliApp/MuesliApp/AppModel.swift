@@ -3262,15 +3262,13 @@ final class AppModel: ObservableObject {
             if let lastIndex = metadata.sessions.indices.last {
                 var lastSession = metadata.sessions[lastIndex]
                 if lastSession.endedAt == nil {
-                    lastSession = MeetingSessionMetadata(
-                        sessionID: lastSession.sessionID,
-                        startedAt: lastSession.startedAt,
-                        endedAt: Date(),
-                        audioFolder: lastSession.audioFolder,
-                        streams: lastSession.streams
-                    )
-                    metadata.sessions[lastIndex] = lastSession
+                    lastSession.endedAt = Date()
                 }
+                if let sourceManifest {
+                    lastSession.timelineOffsetSeconds = Double(sourceManifest.timeline_offset_us) / 1_000_000
+                    lastSession.durationSeconds = Double(sourceManifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
+                }
+                metadata.sessions[lastIndex] = lastSession
             }
             try writeMeetingMetadata(metadata, to: session.folderURL)
         } catch {
@@ -3676,14 +3674,7 @@ final class AppModel: ObservableObject {
                     "system": MeetingStreamInfo(sampleRate: systemSampleRate, channels: systemChannels),
                     "mic": MeetingStreamInfo(sampleRate: micSampleRate, channels: micChannels)
                 ]
-                let lastSession = metadata.sessions[lastIndex]
-                metadata.sessions[lastIndex] = MeetingSessionMetadata(
-                    sessionID: lastSession.sessionID,
-                    startedAt: lastSession.startedAt,
-                    endedAt: lastSession.endedAt,
-                    audioFolder: lastSession.audioFolder,
-                    streams: streams
-                )
+                metadata.sessions[lastIndex].streams = streams
                 metadata.updatedAt = Date()
                 try writeMeetingMetadata(metadata, to: session.folderURL)
             }
@@ -3730,75 +3721,48 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Finalizes any meeting left at `status: recording` with no live
-    /// session - i.e. the app crashed or was force-quit mid-meeting (see
-    /// engineer-notes/incident-2026-07-06-mainthread-livelock.md, where a
-    /// 54-minute main-thread livelock led to a SIGKILL and the meeting was
-    /// never finalized despite the audio underneath being completely
-    /// healthy). Called from `init()`, before any meeting could possibly be
-    /// live in THIS process, so a `.recording` `meeting.json` found here is
-    /// unconditionally orphaned. Resume stays disabled for the recovered
-    /// meeting - it's `.completed` now, which is the point: the recording is
-    /// over and its audio should be usable in-app (viewer, rediarize,
-    /// export) rather than permanently locked out.
+    /// Snapshot orphan candidates before init returns, then recover source
+    /// prefixes off the UI actor. Applying the result rechecks session identity
+    /// and status so a later user action cannot receive a stale recovery write.
     private func recoverOrphanedMeetingsIfNeeded() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Muesli", isDirectory: true)
             .appendingPathComponent("Meetings", isDirectory: true)
         guard let folders = try? FileManager.default.contentsOfDirectory(
-            at: base,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
+            at: base, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ) else { return }
-
-        for folderURL in folders {
-            let resourceValues = try? folderURL.resourceValues(forKeys: [.isDirectoryKey])
-            guard resourceValues?.isDirectory == true else { continue }
-            guard let metadata = try? readMeetingMetadata(from: folderURL),
-                  OrphanedMeetingRecovery.needsRecovery(metadata) else { continue }
-
-            let wavDuration = wavDurationSeconds(for: folderURL, metadata: metadata)
-            let fallbackEnd = latestModificationDate(for: folderURL) ?? metadata.updatedAt
-            let fallbackDuration = max(0, fallbackEnd.timeIntervalSince(metadata.createdAt))
-            let recovered = OrphanedMeetingRecovery.finalize(
-                metadata,
-                wavDurationSeconds: wavDuration,
-                fallbackDurationSeconds: fallbackDuration,
-                now: Date()
-            )
-            do {
-                try writeMeetingMetadata(recovered, to: folderURL)
-                appendBackendLog(
-                    "Recovered orphaned meeting '\(recovered.title)' left mid-recording (likely a crash or " +
-                    "force-quit) - marked completed, duration=\(String(format: "%.1f", recovered.durationSeconds))s.",
-                    toTail: true
-                )
-            } catch {
-                appendBackendLog(
-                    "Failed to recover orphaned meeting \(folderURL.lastPathComponent): \(error.localizedDescription)",
-                    toTail: true
-                )
+        let jobs: [(URL, MeetingMetadata)] = folders.compactMap { folder in
+            guard let metadata = try? readMeetingMetadata(from: folder),
+                  OrphanedMeetingRecovery.needsRecovery(metadata) else { return nil }
+            return (folder, metadata)
+        }
+        guard !jobs.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            let results = await Task.detached {
+                jobs.map { folder, metadata in
+                    (folder, metadata.sessions.map { $0.sessionID },
+                     OrphanedMeetingRecovery.inspectAndRecover(folderURL: folder, metadata: metadata))
+                }
+            }.value
+            guard let self else { return }
+            for (folder, sessionIDs, evidence) in results {
+                guard self.currentSession?.folderURL != folder,
+                      let current = try? self.readMeetingMetadata(from: folder),
+                      OrphanedMeetingRecovery.needsRecovery(current),
+                      current.sessions.map({ $0.sessionID }) == sessionIDs else { continue }
+                let recovered = OrphanedMeetingRecovery.finalize(current, evidence: evidence, now: Date())
+                do {
+                    try self.writeMeetingMetadata(recovered, to: folder)
+                    self.appendBackendLog(
+                        "Recovered interrupted meeting '\(recovered.title)' from source media; duration=\(String(format: "%.1f", recovered.durationSeconds))s.",
+                        toTail: true)
+                    for problem in evidence.problems { self.appendBackendLog(problem, toTail: true) }
+                } catch {
+                    self.appendBackendLog("Failed to record recovery for \(folder.lastPathComponent): \(error.localizedDescription)", toTail: true)
+                }
             }
+            self.loadMeetingHistory()
         }
-    }
-
-    /// The longer of the mic/system wav durations, read via `AVAudioFile` -
-    /// `nil` if neither wav exists or is readable, so the caller can fall
-    /// back to an mtime-based estimate.
-    private func wavDurationSeconds(for folderURL: URL, metadata: MeetingMetadata) -> Double? {
-        let audioFolderName = metadata.sessions.last?.audioFolder ?? findAudioFolderName(in: folderURL) ?? "audio"
-        let audioDir = folderURL.appendingPathComponent(audioFolderName, isDirectory: true)
-        var longest: Double?
-        for name in ["mic.wav", "system.wav"] {
-            let url = audioDir.appendingPathComponent(name)
-            guard FileManager.default.fileExists(atPath: url.path),
-                  let file = try? AVAudioFile(forReading: url),
-                  file.fileFormat.sampleRate > 0 else { continue }
-            let seconds = Double(file.length) / file.fileFormat.sampleRate
-            guard seconds.isFinite else { continue }
-            longest = max(longest ?? 0, seconds)
-        }
-        return longest
     }
 
     private func loadMeetingHistory() {
@@ -3839,13 +3803,14 @@ final class AppModel: ObservableObject {
         }
 
         let createdAt = creationDate(for: folderURL) ?? Date()
-        let updatedAt = latestModificationDate(for: folderURL) ?? createdAt
-        let durationSeconds = max(0, updatedAt.timeIntervalSince(createdAt))
         let title = legacyMeetingTitle(for: folderURL)
         let segmentStats = parseSegmentStats(
             from: folderURL.appendingPathComponent("transcript.jsonl"),
             expectsTypeField: false
         )
+        let audioFolder = folderURL.appendingPathComponent(findAudioFolderName(in: folderURL) ?? "audio")
+        let durationSeconds = max(segmentStats.lastTimestamp,
+                                  OrphanedMeetingRecovery.legacyDuration(audioDirectory: audioFolder) ?? 0)
 
         return MeetingHistoryItem(
             id: folderURL.lastPathComponent,
@@ -3854,7 +3819,7 @@ final class AppModel: ObservableObject {
             createdAt: createdAt,
             durationSeconds: durationSeconds,
             segmentCount: segmentStats.count,
-            status: .completed
+            status: .interrupted
         )
     }
 
@@ -3984,7 +3949,8 @@ final class AppModel: ObservableObject {
             speakerNames = stats.speakerNames
         }
 
-        let durationSeconds = max(lastTimestamp, updatedAt.timeIntervalSince(createdAt))
+        let durationSeconds = max(lastTimestamp, OrphanedMeetingRecovery.legacyDuration(
+            audioDirectory: folderURL.appendingPathComponent(audioFolderName)) ?? 0)
         let streams: [String: MeetingStreamInfo] = [
             "system": MeetingStreamInfo(sampleRate: nil, channels: nil),
             "mic": MeetingStreamInfo(sampleRate: nil, channels: nil)
@@ -3993,7 +3959,7 @@ final class AppModel: ObservableObject {
         let session = MeetingSessionMetadata(
             sessionID: 1,
             startedAt: createdAt,
-            endedAt: updatedAt,
+            endedAt: nil,
             audioFolder: audioFolderName,
             streams: streams
         )
@@ -4005,7 +3971,7 @@ final class AppModel: ObservableObject {
             updatedAt: updatedAt,
             durationSeconds: durationSeconds,
             lastTimestamp: lastTimestamp,
-            status: .completed,
+            status: .interrupted,
             sessions: [session],
             segmentCount: segmentCount,
             speakerNames: speakerNames
