@@ -31,6 +31,7 @@
 				BackendProcess.swift,
 				BackendStartupGate.swift,
 				DurationFormatting.swift,
+				LocalAudioRecorder.swift,
 				MeetingData.swift,
 				MeetingRenamer.swift,
 				MeterPublishGate.swift,

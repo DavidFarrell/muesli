@@ -182,6 +182,8 @@ def test_compute_incremental_window_looks_back_by_context_and_clamps_at_zero():
 
 class _FakeState:
     def __init__(self, writer, sample_rate, channels, stream_name):
+        self.source_directory = None
+        self.source_session_id = None
         self.lock = _NullLock()
         self._writer = writer
         self._sample_rate = sample_rate
