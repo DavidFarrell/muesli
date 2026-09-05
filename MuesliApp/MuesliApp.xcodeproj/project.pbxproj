@@ -36,6 +36,7 @@
 				AECMode.swift,
 				Attachment.swift,
 				AttachmentPersistence.swift,
+				AttachmentPreviewReader.swift,
 				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
