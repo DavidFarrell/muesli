@@ -21,8 +21,7 @@ jobs:
         with:
           version: '0.11.3'
           python-version: '3.12.13'
-          enable-cache: true
-          cache-dependency-glob: backend/fast_mac_transcribe_diarise_local_models_only/uv.lock
+          enable-cache: false # verify.sh deliberately uses a fresh isolated package cache
       - name: Locked bootstrap, tests and Release compilation
         run: bash scripts/verify.sh "$RUNNER_TEMP/muesli-verification"
       - name: Retain verification evidence

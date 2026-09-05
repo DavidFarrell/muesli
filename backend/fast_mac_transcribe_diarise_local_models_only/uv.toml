@@ -1,0 +1,3 @@
+# Preserve the existing lock's package cutoff as a fixed project policy.
+# A relative duration would make lock freshness depend on the machine/date.
+exclude-newer = "2026-05-29T14:22:51.381105Z"

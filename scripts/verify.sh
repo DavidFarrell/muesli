@@ -1,5 +1,11 @@
 #!/bin/bash
 set -euo pipefail
+# Verification must not inherit resolver/index/python settings from the caller.
+# Names are enumerated without printing their potentially sensitive values.
+for verification_setting in ${!UV_@} ${!PIP_@}; do
+  unset "$verification_setting"
+done
+unset PYTHONPATH PYTHONHOME PYTHONUSERBASE VIRTUAL_ENV CONDA_PREFIX
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 backend_root="$project_root/backend/fast_mac_transcribe_diarise_local_models_only"
 output_root="${1:-$(mktemp -d "${TMPDIR:-/tmp}/muesli-verify.XXXXXX")}"
@@ -24,10 +30,14 @@ if ! head -1 "$output_root/xcode-version.txt" | /usr/bin/grep -qx 'Xcode 26.6'; 
 fi
 shasum -a 256 "$backend_root/uv.lock" > "$output_root/lock-before.txt"
 export UV_PROJECT_ENVIRONMENT="$output_root/runtime"
-if [[ -e "$UV_PROJECT_ENVIRONMENT" ]]; then
-  echo 'Choose a fresh output folder; its runtime must not already exist.' >&2; exit 1
+if [[ -e "$UV_PROJECT_ENVIRONMENT" || -e "$output_root/uv-cache" ]]; then
+  echo 'Choose a fresh output folder; its runtime and package cache must not already exist.' >&2; exit 1
 fi
-uv sync --project "$backend_root" --locked --extra dev --python 3.12.13 > "$output_root/bootstrap.log" 2>&1
+# Explicit configuration replaces discovered user/system settings. Each run
+# also starts with an empty package cache, rather than trusting a warmed cache.
+uv sync --project "$backend_root" --config-file "$backend_root/uv.toml" \
+  --cache-dir "$output_root/uv-cache" --locked --extra dev --python 3.12.13 \
+  > "$output_root/bootstrap.log" 2>&1
 shasum -a 256 "$backend_root/uv.lock" > "$output_root/lock-after.txt"
 cmp "$output_root/lock-before.txt" "$output_root/lock-after.txt"
 export PYTHONPATH="$backend_root/src"
