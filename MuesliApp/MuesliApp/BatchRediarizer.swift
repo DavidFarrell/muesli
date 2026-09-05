@@ -211,8 +211,6 @@ actor BatchRediarizer {
             "PYTHONPATH": root.appendingPathComponent("src").path,
             "PATH": mergedPath,
             "NUMBA_CACHE_DIR": numbaCacheDir.path,
-            "MUESLI_ALLOW_MODEL_DOWNLOADS": "0",
-            "HF_HUB_OFFLINE": "1",
         ]
     }
 }
