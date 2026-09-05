@@ -2905,18 +2905,23 @@ final class AppModel: ObservableObject {
     private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL, id: UUID) {
         guard meetingSavePublication.markTerminal(folder: folder, id: id) else { return }
         meetingCatalog.invalidate()
+        metadataEdits.completeRetirement(in: folder)
         switch result {
-        case .success(let metadata):
+        case .success:
             meetingSaveNotices[folder.path] = nil
-            let item = MeetingHistoryItem(id: folder.lastPathComponent, folderURL: folder, title: metadata.title,
-                createdAt: metadata.createdAt, durationSeconds: metadata.durationSeconds,
-                segmentCount: metadata.segmentCount, status: metadata.status)
-            if let index = meetingHistory.firstIndex(where: { $0.folderURL == folder }) {
-                meetingHistory[index] = item
-            } else { meetingHistory.insert(item, at: 0) }
+            metadataEditNotices[folder.path] = nil
+            // The terminal result can wait behind a later edit's UI callback.
+            // Read the current disk snapshot under ownership instead of putting
+            // its older title/count/status snapshot back into history.
+            loadMeetingHistory()
         case .failure(let error):
             meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
+    }
+
+    /// Root finalization carries this patch into its retained terminal intent.
+    func retireMetadataEdits(in folder: URL) -> [String: String] {
+        metadataEdits.retire(in: folder)
     }
 
     /// Post-stop exit wait: up to `maxWaitSeconds` for a clean exit, but

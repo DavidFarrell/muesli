@@ -136,6 +136,38 @@ final class MeetingMetadataEditsTests: XCTestCase {
         XCTAssertFalse(pending)
     }
 
+    func testStopTransfersQueuedNamesAndFencesNewEditsThroughOriginalCompletion() async throws {
+        let folder = try fixture(), gate = Gate()
+        let edits = MeetingMetadataEdits(store: TranscriptPersistenceStore {
+            if $0 == .stage("meeting.json") { gate.first() }
+        }, timeoutSeconds: 0.02) { _ in }
+        edits.submitNames(["source-A": "Initial"], in: folder, contentGeneration: 1)
+        let entered = await gate.entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(entered, .completed)
+        edits.submitNames(["source-A": "Reviewed A", "source-B": "Reviewed B"], in: folder, contentGeneration: 1)
+        let accepted = edits.retire(in: folder)
+        XCTAssertEqual(accepted, ["source-A": "Reviewed A", "source-B": "Reviewed B"])
+        edits.submitNames(["source-A": "After Stop"], in: folder, contentGeneration: 1)
+        XCTAssertThrowsError(try TranscriptPersistenceStore.shared.start(in: folder) { _ in 1 })
+        gate.release.signal()
+        // The original callback may complete, but only the terminal finalizer
+        // can reopen admission. No queued edit starts ahead of that finalizer.
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(edits.isPending(in: folder))
+        XCTAssertEqual(gate.visits, 1)
+        let finalized = try await TranscriptPersistenceStore.shared.start(in: folder) { context in
+            var metadata = try context.readMetadata()
+            metadata.speakerNames.merge(accepted) { _, latest in latest }
+            metadata.status = .completed
+            try MeetingCatalogOwner.commit(metadata, context: context)
+            return metadata
+        }.value()
+        XCTAssertEqual(finalized.speakerNames["source-A"], "Reviewed A")
+        XCTAssertEqual(finalized.speakerNames["source-B"], "Reviewed B")
+        edits.completeRetirement(in: folder)
+        try await idle(edits, folder: folder)
+    }
+
     func testSourceScopedAssignmentsNeverMatchAnotherResumedSpeaker() {
         let model = TranscriptModel(); Self.retainedModels.append(model)
         for source in ["A", "B"] {

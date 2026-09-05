@@ -142,15 +142,28 @@ final class SessionArtifactStoreTests: XCTestCase {
         delegate.recordingOutputDidStartRecording(output)
         guard case .timedOut(let pending) = await store.finish(timeoutSeconds: 0.02) else { return XCTFail("missing SDK finish") }
         XCTAssertEqual(pending.pendingVideos, 1)
+        XCTAssertThrowsError(try SessionArtifactStore.acquireInactiveLease(directory: store.directory))
         XCTAssertNil(store.nextVideoURL())
         delegate.recordingOutputDidFinishRecording(output)
         guard case .completed(let status) = await store.finish(timeoutSeconds: 2) else { return XCTFail("late completion") }
         XCTAssertTrue(status.isComplete)
         XCTAssertEqual(status.finishedVideos, 1)
+        let inactiveLease = try SessionArtifactStore.acquireInactiveLease(directory: store.directory)
+        try inactiveLease?.close()
         XCTAssertEqual(try ledger(store).last?["status"] as? String, "finished")
         XCTAssertNotNil(try ledger(store).last?["requested_t"])
         XCTAssertNil(try ledger(store).last?["t"])
         XCTAssertNil(status.mediaEndSeconds)
+    }
+
+    func testDroppingUnusedArtifactStoreReleasesKernelLease() throws {
+        var current: SessionArtifactStore? = try store(folder())
+        let directory = try XCTUnwrap(current?.directory)
+        XCTAssertThrowsError(try SessionArtifactStore.acquireInactiveLease(directory: directory))
+        current = nil
+        let released = try SessionArtifactStore.acquireInactiveLease(directory: directory)
+        XCTAssertNotNil(released)
+        try released?.close()
     }
 
     func testNativeFailureAndUnregisteredReservationRemainIncomplete() async throws {

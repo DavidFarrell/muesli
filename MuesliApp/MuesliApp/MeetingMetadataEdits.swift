@@ -42,14 +42,30 @@ final class MeetingMetadataEdits {
     private let onEvent: @MainActor (Event) -> Void
     private var active: [URL: Active] = [:]
     private var desiredNames: [URL: MeetingMetadataMutation.Patch] = [:]
+    private var retired: Set<URL> = []
     init(store: TranscriptPersistenceStore = .shared, timeoutSeconds: Double = 5,
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.store = store; self.timeoutSeconds = timeoutSeconds; self.onEvent = onEvent
     }
-    func isPending(in folder: URL) -> Bool { active[folder] != nil }
+    func isPending(in folder: URL) -> Bool { active[folder] != nil || retired.contains(folder) }
+
+    /// Stop transfers accepted name intent into its immutable finalizer payload.
+    /// The active disk operation is not cancelled or released; the finalizer
+    /// must queue behind that owner and apply this patch after reading metadata.
+    func retire(in folder: URL) -> [String: String] {
+        retired.insert(folder)
+        let current = active[folder]?.patch.names ?? [:]
+        let queued = desiredNames.removeValue(forKey: folder)?.names ?? [:]
+        return current.merging(queued) { _, latest in latest }
+    }
+    func completeRetirement(in folder: URL) { retired.remove(folder) }
 
     func submitNames(_ names: [String: String], in folder: URL, contentGeneration: UInt64) {
         guard !names.isEmpty else { return }
+        guard !retired.contains(folder) else {
+            onEvent(.failed(folder, "This meeting is finishing its saved transcript. Wait for that save before editing speakers."))
+            return
+        }
         if active[folder] != nil {
             var patch = desiredNames[folder] ?? MeetingMetadataMutation.Patch(contentGeneration: contentGeneration)
             // A new viewer generation supersedes queued UI edits to old labels.
@@ -64,7 +80,7 @@ final class MeetingMetadataEdits {
     }
 
     func rename(in folder: URL, to title: String) async throws -> String {
-        guard active[folder] == nil else { throw TranscriptPersistenceStore.Failure.busy }
+        guard active[folder] == nil, !retired.contains(folder) else { throw TranscriptPersistenceStore.Failure.busy }
         let operation = try start(in: folder, patch: .init(title: title))
         return try await operation.value(timeoutSeconds: timeoutSeconds).title
     }

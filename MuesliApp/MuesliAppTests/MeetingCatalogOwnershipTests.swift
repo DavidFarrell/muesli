@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 
 @MainActor
 final class MeetingCatalogOwnershipTests: XCTestCase {
@@ -128,6 +129,46 @@ final class MeetingCatalogOwnershipTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path))
     }
 
+    func testDeletionWaitsForActualArtifactLeaseButStaleMetadataDoesNotBlockForever() async throws {
+        let (base, folder) = try fixture(status: .recording), gate = Gate()
+        let recorder = try LocalAudioRecorder(directory: folder.appendingPathComponent("audio"))
+        _ = await recorder.finish(timeoutSeconds: 2)
+        let artifacts = try SessionArtifactStore(meetingDirectory: folder, sourceSessionID: UUID().uuidString,
+            timeline: CaptureTimeline(epochMicroseconds: 0), timelineOffsetUs: 0,
+            pngWriter: { _, _ in gate.blockOnce() })
+        let image = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
+        XCTAssertTrue(artifacts.submitScreenshot(image, captureTimeUs: 1) { _ in XCTFail("Stopped screenshot was published") })
+        let entered = await gate.entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(entered, .completed)
+        let pending = await artifacts.finish(timeoutSeconds: 0.02)
+        XCTAssertFalse(pending.status.closed)
+        let mutation = try TranscriptPersistenceStore.shared.start(in: folder) { context in
+            var metadata = try context.readMetadata()
+            metadata.sessions[0].artifactsFolder = artifacts.relativeDirectory
+            metadata.sessions[0].artifactFinalization = MeetingArtifactFinalization(pending)
+            try MeetingCatalogOwner.commit(metadata, context: context)
+        }
+        _ = try await mutation.value()
+        let catalog = MeetingCatalogOwner()
+        guard case .completed(let active) = await catalog.scan(in: base) else { return XCTFail("Catalog") }
+        XCTAssertEqual(active.items.first?.status, .recording, "Pending native/image artifact ownership also prevents orphan recovery")
+        let deletion = try MeetingCatalogOwner.trash(in: folder, onCompletion: { _ in }, move: { _ in
+            XCTFail("Closed PCM cannot authorize moving a still-owned artifact path")
+        })
+        guard case .failed(let failure) = await deletion.wait(timeoutSeconds: 1) else { return XCTFail("Unresolved artifact accepted") }
+        XCTAssertTrue(failure.localizedDescription.contains("still owned"))
+        gate.release.signal()
+        guard case .completed = await artifacts.finish(timeoutSeconds: 2) else { return XCTFail("Original artifact owner did not close") }
+        let retry = try MeetingCatalogOwner.trash(in: folder, onCompletion: { _ in }, move: { _ in
+            XCTAssertFalse(Thread.isMainThread)
+            // The delete worker holds the inactive artifact lease across the move.
+            XCTAssertThrowsError(try SessionArtifactStore.acquireInactiveLease(directory: artifacts.directory))
+        })
+        guard case .completed = await retry.wait(timeoutSeconds: 1) else { return XCTFail("Stale metadata permanently blocked deletion") }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path), "The test uses a fake move")
+    }
+
     func testCorruptExistingMetadataIsPreservedRatherThanReplacedByLegacyFallback() async throws {
         let (base, folder) = try fixture()
         let original = Data("broken JSON".utf8)
@@ -182,23 +223,27 @@ final class MeetingCatalogOwnershipTests: XCTestCase {
     func testLateSnapshotCannotPublishAfterCatalogIntentChanges() async throws {
         let (base, _) = try fixture(), gate = Gate()
         var events: [String] = []
+        let pending = TaskCompletion(), terminal = TaskCompletion()
         let controller = MeetingCatalogController(owner: MeetingCatalogOwner { step in
             if case .inspect = step { gate.blockOnce() }
         }, timeoutSeconds: 0.03) { event in
             switch event {
             case .committed: events.append("committed")
-            case .pending: events.append("pending")
-            case .discarded: events.append("discarded")
+            case .pending: events.append("pending"); pending.markCompleted()
+            case .discarded: events.append("discarded"); terminal.markCompleted()
             case .failed: events.append("failed")
             }
         }
         controller.refresh(in: base)
         let entered = await gate.entered.wait(timeoutSeconds: 1)
         XCTAssertEqual(entered, .completed)
-        try await Task.sleep(for: .milliseconds(60))
+        let waiting = await pending.wait(timeoutSeconds: 2)
+        XCTAssertEqual(waiting, .completed)
         controller.invalidate()
         gate.release.signal()
-        try await Task.sleep(for: .milliseconds(100))
+        let finished = await terminal.wait(timeoutSeconds: 2)
+        withExtendedLifetime(controller) {}
+        XCTAssertEqual(finished, .completed)
         XCTAssertFalse(events.contains("committed"))
         XCTAssertEqual(events.last, "discarded", "An invalidated terminal callback clears its old pending notice")
     }

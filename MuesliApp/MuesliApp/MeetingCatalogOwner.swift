@@ -94,14 +94,22 @@ nonisolated final class MeetingCatalogOwner: @unchecked Sendable {
                     }
                     if OrphanedMeetingRecovery.needsRecovery(metadata), mayRecover(epoch, folder: folder) {
                         try checkpoint(.beforeRecovery(folder))
-                        // New recorders retain an OS lease through actual close.
+                        // New recorders retain OS leases through actual close.
                         // Folder ownership also excludes a new preparation here.
+                        var artifactLeases: [FileHandle] = []
+                        defer { for lease in artifactLeases { try? lease.close() } }
                         for session in metadata.sessions {
                             let root = folder.standardizedFileURL.resolvingSymlinksInPath()
                             let audio = root.appendingPathComponent(session.audioFolder).standardizedFileURL.resolvingSymlinksInPath()
                             guard audio.path.hasPrefix(root.path + "/") else { throw CocoaError(.fileReadInvalidFileName) }
-                            do { try LocalAudioRecorder.withInactiveSource(directory: audio) { } }
-                            catch {
+                            do {
+                                try LocalAudioRecorder.withInactiveSource(directory: audio) { }
+                                if let relative = session.artifactsFolder {
+                                    let artifacts = root.appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
+                                    guard artifacts.path.hasPrefix(root.path + "/") else { throw CocoaError(.fileReadInvalidFileName) }
+                                    if let lease = try SessionArtifactStore.acquireInactiveLease(directory: artifacts) { artifactLeases.append(lease) }
+                                }
+                            } catch {
                                 // An active recorder owns this source even if its
                                 // UI wait expired. Keep its recording status.
                                 return Self.item(metadata, folder: folder)
@@ -151,10 +159,19 @@ nonisolated final class MeetingCatalogOwner: @unchecked Sendable {
         try store.start(in: folder, onCompletion: onCompletion) { context in
             let metadata = try context.readMetadata()
             let root = folder.standardizedFileURL.resolvingSymlinksInPath()
+            var artifactLeases: [FileHandle] = []
+            defer { for lease in artifactLeases { try? lease.close() } }
             for session in metadata.sessions {
                 let audio = root.appendingPathComponent(session.audioFolder).standardizedFileURL.resolvingSymlinksInPath()
                 guard audio.path.hasPrefix(root.path + "/") else { throw CocoaError(.fileReadInvalidFileName) }
                 try LocalAudioRecorder.withInactiveSource(directory: audio) { }
+                if let relative = session.artifactsFolder {
+                    let artifacts = root.appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
+                    guard artifacts.path.hasPrefix(root.path + "/") else { throw CocoaError(.fileReadInvalidFileName) }
+                    if let lease = try SessionArtifactStore.acquireInactiveLease(directory: artifacts) {
+                        artifactLeases.append(lease)
+                    }
+                }
             }
             try move(folder)
         }
