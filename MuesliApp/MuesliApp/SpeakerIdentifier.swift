@@ -2,6 +2,40 @@ import Foundation
 import AppKit
 import CoreGraphics
 import ImageIO
+import Darwin
+
+enum SpeakerIdStatus: Equatable {
+    case unknown
+    case ready
+    case ollamaNotRunning
+    case modelMissing(String)
+    case error(String)
+}
+
+/// Cancellation retires a waiter; a blocked image read or model request keeps
+/// its original admission until identifySpeakers actually returns.
+nonisolated private final class SpeakerIdentificationAdmission: @unchecked Sendable {
+    static let shared = SpeakerIdentificationAdmission()
+    private let lock = NSLock()
+    private var active = Set<String>()
+    final class Reservation: Sendable {
+        let owner: SpeakerIdentificationAdmission
+        let key: String
+        init(owner: SpeakerIdentificationAdmission, key: String) { self.owner = owner; self.key = key }
+        deinit { owner.release(key) }
+    }
+    func reserve(_ access: MeetingFileAccess) throws -> Reservation {
+        let key = "\(access.identity.directoryDevice):\(access.identity.directoryInode)"
+        return try lock.withLock {
+            guard active.count < 8, active.insert(key).inserted else {
+                throw NSError(domain: "SpeakerIdentifier", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Speaker identification is still finishing an earlier request. Wait before retrying."])
+            }
+            return Reservation(owner: self, key: key)
+        }
+    }
+    private func release(_ key: String) { _ = lock.withLock { active.remove(key) } }
+}
 
 actor SpeakerIdentifier {
     struct SpeakerMapping: Codable {
@@ -64,7 +98,6 @@ actor SpeakerIdentifier {
 
     private let ollamaBaseURL = URL(string: "http://localhost:11434")!
     private let model = "gemma3:27b"
-    private let maxImageDimension: CGFloat = 1024
     private let targetScreenshotCount = 16
     private let dedupeHashThreshold = 6
     private let dedupeMinTimeDelta: Double = 10.0
@@ -72,9 +105,10 @@ actor SpeakerIdentifier {
     private let maxRetries = 2
     private let retryDelaySeconds: TimeInterval = 1.5
 
-    private struct ImagePayload {
+    struct ImagePayload {
         let mediaType: String
         let base64Data: String
+        let evidence: String
     }
 
     private struct OllamaHTTPError: LocalizedError {
@@ -86,51 +120,45 @@ actor SpeakerIdentifier {
     }
 
     private struct ScreenshotCandidate {
-        let url: URL
-        let timestamp: Double?
-        let name: String
+        let image: MeetingScreenshotInput.Image
+        var url: URL { image.url }
+        var timestamp: Double? { image.timestamp }
+        var name: String { image.url.lastPathComponent }
     }
 
     func identifySpeakers(
-        screenshots: [URL],
+        screenshots: [MeetingScreenshotInput.Image],
         access: MeetingFileAccess,
         transcript: String,
         speakerIds: [String],
         existingSpeakerNames: [String: String] = [:],
         userHint: String? = nil,
-        progressHandler: ((Progress) -> Void)? = nil
+        progressHandler: ((Progress) -> Void)? = nil,
+        beforePreparation: @Sendable () throws -> Void = {}
     ) async throws -> IdentificationResult {
-        defer { withExtendedLifetime(access) {} }
+        let reservation = try SpeakerIdentificationAdmission.shared.reserve(access)
+        defer { withExtendedLifetime((access, reservation)) {} }
         try access.validate()
-        // DEBUG: Log inputs
-        print("[SpeakerID DEBUG] === Starting speaker identification ===")
-        print("[SpeakerID DEBUG] Screenshots count: \(screenshots.count)")
-        print("[SpeakerID DEBUG] Speaker IDs: \(speakerIds)")
-        print("[SpeakerID DEBUG] Transcript length: \(transcript.count) chars")
-        print("[SpeakerID DEBUG] User hint: \(userHint ?? "(none)")")
+        try beforePreparation()
+        try Task.checkCancellation()
 
         progressHandler?(.extractingFrames)
         try Task.checkCancellation()
-        let selectedScreenshots = selectScreenshots(from: screenshots, targetCount: targetScreenshotCount)
-        print("[SpeakerID DEBUG] Selected \(selectedScreenshots.count) screenshots")
+        let selectedScreenshots = try selectScreenshots(from: screenshots, targetCount: targetScreenshotCount)
 
         let imagePayloads = try loadImagePayloads(from: selectedScreenshots)
-        print("[SpeakerID DEBUG] Loaded \(imagePayloads.count) image payloads")
 
         progressHandler?(.analyzing)
-        let sampledTranscript = sampleTranscript(transcript, speakerIds: speakerIds)
-        print("[SpeakerID DEBUG] Sampled transcript: \(transcript.components(separatedBy: .newlines).count) lines -> \(sampledTranscript.components(separatedBy: .newlines).count) lines")
-        print("[SpeakerID DEBUG] Sampled transcript preview (first 1000 chars):")
-        print(String(sampledTranscript.prefix(1000)))
-        print("[SpeakerID DEBUG] ---")
 
-        let prompt = buildPrompt(transcript: transcript, speakerIds: speakerIds, userHint: userHint)
-        print("[SpeakerID DEBUG] Built prompt (\(prompt.count) chars)")
-        print("[SpeakerID DEBUG] Prompt speaker list section:")
-        // Print just the speaker list part
-        for id in speakerIds {
-            print("[SpeakerID DEBUG]   \(id) = ?")
-        }
+        let imageEvidence = imagePayloads.enumerated().map { "Image \($0.offset + 1): \($0.element.evidence)" }.joined(separator: "\n")
+        let prompt = buildPrompt(transcript: transcript, speakerIds: speakerIds, userHint: userHint) + """
+
+        IMAGE PROVENANCE (same order as the attached images):
+        \(imageEvidence.isEmpty ? "No usable images were attached." : imageEvidence)
+        Recorded session/time identifies where an image belongs, not which visible person spoke.
+        A visible name proves presence only; do not assign a speaker identity from presence or timing alone.
+        Never transfer visual evidence to another source/session. Legacy images have no verified session/time binding.
+        """
 
         let rawResponse = try await requestOllama(images: imagePayloads, prompt: prompt)
         let targetSpeakerIds = mappingTargetSpeakerIds(from: speakerIds)
@@ -141,16 +169,13 @@ actor SpeakerIdentifier {
             existingSpeakerNames: existingSpeakerNames,
             userHint: userHint
         )
-        print("[SpeakerID DEBUG] === Identification complete: \(mappings.count) mappings ===")
         progressHandler?(.complete)
         return IdentificationResult(mappings: mappings, rawResponse: rawResponse)
     }
 
-    private func selectScreenshots(from screenshots: [URL], targetCount: Int) -> [URL] {
+    func selectScreenshots(from screenshots: [MeetingScreenshotInput.Image], targetCount: Int) throws -> [MeetingScreenshotInput.Image] {
         guard !screenshots.isEmpty, targetCount > 0 else { return [] }
-        let candidates = screenshots.map { url in
-            ScreenshotCandidate(url: url, timestamp: extractTimestamp(from: url), name: url.lastPathComponent)
-        }
+        let candidates = screenshots.map { ScreenshotCandidate(image: $0) }
         let sorted = candidates.sorted { lhs, rhs in
             switch (lhs.timestamp, rhs.timestamp) {
             case let (left?, right?):
@@ -166,9 +191,9 @@ actor SpeakerIdentifier {
                 return true
             }
         }
-        let deduped = dedupeNearDuplicates(sorted)
+        let deduped = try dedupeNearDuplicates(sorted)
         let selected = selectEvenly(from: deduped, targetCount: targetCount)
-        return selected.map { $0.url }
+        return selected.map { $0.image }
     }
 
     private func selectEvenly(from candidates: [ScreenshotCandidate], targetCount: Int) -> [ScreenshotCandidate] {
@@ -255,13 +280,18 @@ actor SpeakerIdentifier {
         return result
     }
 
-    private func dedupeNearDuplicates(_ candidates: [ScreenshotCandidate]) -> [ScreenshotCandidate] {
+    private func dedupeNearDuplicates(_ candidates: [ScreenshotCandidate]) throws -> [ScreenshotCandidate] {
+        try Task.checkCancellation()
         guard candidates.count > 1 else { return candidates }
         var result: [ScreenshotCandidate] = []
         var lastHash: UInt64?
         var lastTimestamp: Double?
+        var lastSource: String?
         for candidate in candidates {
-            guard let hash = averageHash(for: candidate.url) else {
+            try Task.checkCancellation()
+            if lastSource != candidate.image.sourceKey { lastHash = nil; lastTimestamp = nil }
+            lastSource = candidate.image.sourceKey
+            guard let hash = try averageHash(for: candidate.url) else {
                 result.append(candidate)
                 lastHash = nil
                 lastTimestamp = candidate.timestamp
@@ -287,18 +317,11 @@ actor SpeakerIdentifier {
         return result
     }
 
-    private func extractTimestamp(from url: URL) -> Double? {
-        let name = url.deletingPathExtension().lastPathComponent
-        guard name.hasPrefix("t+") else { return nil }
-        let start = name.index(name.startIndex, offsetBy: 2)
-        return Double(name[start...])
-    }
-
-    private func averageHash(for url: URL) -> UInt64? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            return nil
-        }
+    private func averageHash(for url: URL) throws -> UInt64? {
+        let image: CGImage
+        do { image = try thumbnail(from: url, maximumPixels: 8) }
+        catch is CancellationError { throw CancellationError() }
+        catch { return nil }
         let width = 8
         let height = 8
         let colorSpace = CGColorSpaceCreateDeviceGray()
@@ -334,50 +357,78 @@ actor SpeakerIdentifier {
         Int((lhs ^ rhs).nonzeroBitCount)
     }
 
-    private func loadImagePayloads(from urls: [URL]) throws -> [ImagePayload] {
+    func loadImagePayloads(from images: [MeetingScreenshotInput.Image]) throws -> [ImagePayload] {
         var payloads: [ImagePayload] = []
-        for url in urls {
+        for input in images {
             try Task.checkCancellation()
-            guard let image = loadImage(from: url),
-                  let resized = resizeImage(image, maxDimension: maxImageDimension),
-                  let data = encodeJPEG(resized, quality: 0.8) else {
-                continue
+            do {
+                let image = try thumbnail(from: input.url, maximumPixels: 1024)
+                guard let data = encodeJPEG(image, quality: 0.8) else { throw imageFailure("The image could not be encoded.") }
+                payloads.append(ImagePayload(mediaType: "image/jpeg", base64Data: data.base64EncodedString(), evidence: input.evidence))
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                if case .committed = input.origin { throw error }
+                // Unusable legacy files have no committed image promise.
             }
-            payloads.append(ImagePayload(mediaType: "image/jpeg", base64Data: data.base64EncodedString()))
         }
         return payloads
     }
 
-    private func loadImage(from url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return nil
-        }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    private func imageFailure(_ detail: String) -> NSError {
+        NSError(domain: "SpeakerIdentifier", code: 2, userInfo: [NSLocalizedDescriptionKey: detail])
     }
 
-    private func resizeImage(_ image: CGImage, maxDimension: CGFloat) -> CGImage? {
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
-        guard width > 0, height > 0 else { return nil }
-
-        let maxInput = max(width, height)
-        let ratio = min(1.0, maxDimension / maxInput)
-        let newWidth = Int(width * ratio)
-        let newHeight = Int(height * ratio)
-
-        guard let context = CGContext(
-            data: nil,
-            width: newWidth,
-            height: newHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
-        return context.makeImage()
+    /// Read a bounded regular file and inspect its dimensions before ImageIO
+    /// decodes pixels. Hashing and model payloads both use small thumbnails.
+    private func thumbnail(from url: URL, maximumPixels: Int) throws -> CGImage {
+        try Task.checkCancellation()
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw imageFailure("A screenshot cannot be opened safely.") }
+        defer { _ = close(fd) }
+        let limit = 32 * 1024 * 1024
+        var initial = stat()
+        guard fstat(fd, &initial) == 0, initial.st_mode & S_IFMT == S_IFREG, initial.st_nlink == 1,
+              initial.st_size > 0, initial.st_size <= limit else {
+            throw imageFailure("The screenshot is invalid or exceeds the 32 MiB image limit.")
+        }
+        var data = Data(), buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            try Task.checkCancellation()
+            let count = Darwin.read(fd, &buffer, min(buffer.count, limit + 1 - data.count))
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw imageFailure("A screenshot could not be read.")
+            }
+            data.append(contentsOf: buffer.prefix(count))
+            guard data.count <= limit else { throw imageFailure("The screenshot exceeds the 32 MiB image limit.") }
+        }
+        var after = stat()
+        guard fstat(fd, &after) == 0, data.count == initial.st_size, after.st_size == initial.st_size,
+              after.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
+              after.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec else {
+            throw imageFailure("A screenshot changed while being read. Reopen the meeting and retry.")
+        }
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.doubleValue > 0, height.doubleValue > 0,
+              width.doubleValue * height.doubleValue <= 16_000_000 else {
+            throw imageFailure("The screenshot is invalid or exceeds the 16 megapixel image limit.")
+        }
+        try Task.checkCancellation()
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixels
+        ] as CFDictionary), image.width <= maximumPixels, image.height <= maximumPixels else {
+            throw imageFailure("The screenshot could not be decoded within its image limit.")
+        }
+        try Task.checkCancellation()
+        return image
     }
 
     private func encodeJPEG(_ image: CGImage, quality: CGFloat) -> Data? {
@@ -572,10 +623,6 @@ actor SpeakerIdentifier {
         var bestBySpeakerId: [String: SpeakerMapping] = [:]
         for mapping in mappings {
             guard let speakerId = canonicalTargetSpeakerId(for: mapping.speakerId, targetSpeakerIds: targetSpeakerIds) else {
-                let raw = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !raw.isEmpty {
-                    print("[SpeakerID DEBUG] Ignoring mapping with unmatched speaker_id: \(raw)")
-                }
                 continue
             }
             guard targetSet.contains(speakerId) else { continue }
@@ -624,7 +671,6 @@ actor SpeakerIdentifier {
                     }
 
                     guard normalizedMappings[idx].speakerId.lowercased().hasPrefix("system:") else { continue }
-                    print("[SpeakerID DEBUG] Blocking recorder name '\(normalizedMappings[idx].name)' from \(normalizedMappings[idx].speakerId); setting Unknown")
                     normalizedMappings[idx].name = "Unknown"
                     normalizedMappings[idx].confidence = 0.0
                 }
@@ -638,7 +684,6 @@ actor SpeakerIdentifier {
                    let strongestRecorderMapping,
                    !isUnknownName(strongestRecorderMapping.name),
                    let micIndex = normalizedMappings.indices.first(where: { normalizedMappings[$0].speakerId.lowercased().hasPrefix("mic:") }) {
-                    print("[SpeakerID DEBUG] Assigning recorder name '\(strongestRecorderMapping.name)' to \(normalizedMappings[micIndex].speakerId)")
                     normalizedMappings[micIndex].name = strongestRecorderMapping.name
                     normalizedMappings[micIndex].confidence = max(normalizedMappings[micIndex].confidence, strongestRecorderMapping.confidence)
                 }
@@ -849,10 +894,8 @@ actor SpeakerIdentifier {
             guard shouldApply else { continue }
 
             if hasCompleteCoverage {
-                print("[SpeakerID DEBUG] Preserving existing name for \(result[idx].speakerId) as '\(fallback)'")
                 result[idx].confidence = max(result[idx].confidence, 0.995)
             } else {
-                print("[SpeakerID DEBUG] Filling \(result[idx].speakerId) from existing name '\(fallback)'")
                 result[idx].confidence = max(result[idx].confidence, 0.99)
             }
             result[idx].name = fallback
@@ -890,7 +933,6 @@ actor SpeakerIdentifier {
                 continue
             }
 
-            print("[SpeakerID DEBUG] Restoring missing system speaker \(result[idx].speakerId) as '\(fallback)'")
             result[idx].name = fallback
             result[idx].confidence = max(result[idx].confidence, 0.98)
             usedSystemNames.insert(normalizedFallback)
@@ -909,12 +951,11 @@ actor SpeakerIdentifier {
         }
 
         var result = mappings
-        for (name, indices) in groups where indices.count > 1 {
+        for (_, indices) in groups where indices.count > 1 {
             let keepIndex = indices.max { lhs, rhs in
                 result[lhs].confidence < result[rhs].confidence
             } ?? indices[0]
             for index in indices where index != keepIndex {
-                print("[SpeakerID DEBUG] Duplicate name '\(name)' for \(result[index].speakerId); setting Unknown")
                 result[index].name = "Unknown"
                 result[index].confidence = 0.0
             }
@@ -931,8 +972,8 @@ actor SpeakerIdentifier {
             Suggest speaker names only where evidence identifies the exact source, stream and original label below.
             Each opaque speaker_id belongs to one source/session and stream. Labels may be permuted between sessions.
             Do not transfer a name across sessions, merge equal labels, or assume microphone audio identifies the recorder.
-            A name visible in a screenshot proves presence, not who spoke. These images have no verified source/time binding;
-            do not use them alone to assign a name to any transcript turn. Keep unsupported or conflicting identities Unknown.
+            A name visible in a screenshot proves presence, not who spoke. Use the attached provenance to keep sources separate;
+            do not use images alone to assign a name to any transcript turn. Keep unsupported or conflicting identities Unknown.
             A user hint is a clue requiring evidence, not a mapping to apply to every source.
             Return the EXACT opaque speaker_id, preserving case. The same real name may occur in independently evidenced sources.
             User hint: \(userHint ?? "none")
@@ -1198,60 +1239,27 @@ actor SpeakerIdentifier {
     }
 
     private func parseMappings(from rawResponse: String, targetSpeakerIds: [String]) -> [SpeakerMapping] {
-        // DEBUG: Log raw response
-        print("[SpeakerID DEBUG] Raw response length: \(rawResponse.count) chars")
-        print("[SpeakerID DEBUG] Raw response (first 500 chars):")
-        print(String(rawResponse.prefix(500)))
-        print("[SpeakerID DEBUG] ---")
 
         let assistantText = extractAssistantText(from: rawResponse) ?? rawResponse
-        print("[SpeakerID DEBUG] Extracted assistant text length: \(assistantText.count) chars")
-        print("[SpeakerID DEBUG] Assistant text (first 500 chars):")
-        print(String(assistantText.prefix(500)))
-        print("[SpeakerID DEBUG] ---")
 
         let jsonString = extractJson(from: assistantText) ?? assistantText
-        print("[SpeakerID DEBUG] Extracted JSON length: \(jsonString.count) chars")
-        print("[SpeakerID DEBUG] JSON string:")
-        print(jsonString)
-        print("[SpeakerID DEBUG] ---")
 
         guard let data = jsonString.data(using: .utf8) else {
-            print("[SpeakerID DEBUG] Failed to convert JSON string to data")
             return []
         }
         let decoder = JSONDecoder()
         if let direct = try? decoder.decode([SpeakerMapping].self, from: data) {
-            print("[SpeakerID DEBUG] Successfully decoded \(direct.count) mappings (direct array)")
-            for m in direct {
-                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
-            }
             return direct
         }
         if let wrapped = try? decoder.decode(MappingWrapper.self, from: data) {
-            print("[SpeakerID DEBUG] Successfully decoded \(wrapped.mappings.count) mappings (wrapped)")
-            for m in wrapped.mappings {
-                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
-            }
             return wrapped.mappings
         }
 
         let lenient = parseMappingsLenient(from: data, targetSpeakerIds: targetSpeakerIds)
         if !lenient.isEmpty {
-            print("[SpeakerID DEBUG] Successfully decoded \(lenient.count) mappings (lenient)")
-            for m in lenient {
-                print("[SpeakerID DEBUG]   \(m.speakerId) -> \(m.name) (\(m.confidence))")
-            }
             return lenient
         }
 
-        print("[SpeakerID DEBUG] Failed to decode JSON as mappings")
-        // Try to see what the decode error is
-        do {
-            _ = try decoder.decode([SpeakerMapping].self, from: data)
-        } catch {
-            print("[SpeakerID DEBUG] Decode error: \(error)")
-        }
         return []
     }
 

@@ -81,6 +81,7 @@
 				RecordingArtifact.swift,
 				SessionArtifactStore.swift,
 				ScreenshotScheduler.swift,
+				SpeakerIdentifier.swift,
 				PendingAudioGate.swift,
 				TaskCompletion.swift,
 				TranscriptModel.swift,

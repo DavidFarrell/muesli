@@ -35,13 +35,6 @@ struct MeetingSession {
     let startedAt: Date
 }
 
-enum SpeakerIdStatus: Equatable {
-    case unknown
-    case ready
-    case ollamaNotRunning
-    case modelMissing(String)
-    case error(String)
-}
 
 enum AppScreen {
     case start

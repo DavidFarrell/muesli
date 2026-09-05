@@ -17,6 +17,7 @@ struct MeetingViewer: View {
     @State private var proposedMappings: [SpeakerIdentifier.SpeakerMapping] = []
     @State private var showMappingSheet = false
     @State private var identificationTask: Task<Void, Never>?
+    @State private var identificationGeneration = UUID()
     @State private var isRediarizing = false
     @State private var rediarizeProgress: BatchRediarizer.Progress?
     @State private var rediarizeError: String?
@@ -211,8 +212,7 @@ struct MeetingViewer: View {
             Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace the transcript with the selected audio streams? Reviewed speaker names will be cleared because the new labels may identify different people.")
         }
         .onDisappear {
-            identificationTask?.cancel()
-            identificationTask = nil
+            cancelSpeakerIdentification()
             rediarizeTask?.cancel()
             rediarizeTask = nil
         }
@@ -465,6 +465,10 @@ struct MeetingViewer: View {
 
         let transcript = transcriptForIdentification()
         let speakerIds = speakerIdsForIdentification()
+        let existingNames = self.transcript.speakerNames
+        let contentGeneration = self.transcript.contentGeneration
+        let requestID = UUID()
+        identificationGeneration = requestID
 
         identificationTask = Task {
             do {
@@ -474,23 +478,34 @@ struct MeetingViewer: View {
                 }
                 let input = try await inputOwner.value(timeoutSeconds: 5)
                 try Task.checkCancellation()
+                guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                    throw TranscriptPersistenceStore.Failure.superseded
+                }
                 let identifier = SpeakerIdentifier()
                 let hint = speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines)
                 let result = try await identifier.identifySpeakers(
-                    screenshots: input.urls,
+                    screenshots: input.images,
                     access: input.access,
                     transcript: transcript,
                     speakerIds: speakerIds,
-                    existingSpeakerNames: self.transcript.speakerNames,
+                    existingSpeakerNames: existingNames,
                     userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in
+                            guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else { return }
                             identificationProgress = progress
                         }
                     }
                 )
                 try Task.checkCancellation()
-                await MainActor.run {
+                guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                    throw TranscriptPersistenceStore.Failure.superseded
+                }
+                try await MainActor.run {
+                    guard identificationGeneration == requestID, self.transcript.contentGeneration == contentGeneration else {
+                        throw TranscriptPersistenceStore.Failure.superseded
+                    }
+                    identificationGeneration = UUID()
                     proposedMappings = result.mappings
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
@@ -498,11 +513,15 @@ struct MeetingViewer: View {
                 }
             } catch is CancellationError {
                 await MainActor.run {
+                    guard identificationGeneration == requestID else { return }
+                    identificationGeneration = UUID()
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
                 }
             } catch {
                 await MainActor.run {
+                    guard identificationGeneration == requestID else { return }
+                    identificationGeneration = UUID()
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
                     if let urlError = error as? URLError, urlError.code == .timedOut {
@@ -516,8 +535,11 @@ struct MeetingViewer: View {
     }
 
     private func cancelSpeakerIdentification() {
+        identificationGeneration = UUID()
         identificationTask?.cancel()
         identificationTask = nil
+        isIdentifyingSpeakers = false
+        identificationProgress = nil
     }
 
     private func speakerIdsForIdentification() -> [String] {
