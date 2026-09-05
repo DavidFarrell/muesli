@@ -14,9 +14,7 @@ struct AttachmentsCard: View {
     var body: some View {
         GroupBox("Attachments") {
             VStack(alignment: .leading, spacing: 8) {
-                // The attachment-persistence integration narrows this existing
-                // notice to AppModel.attachmentNotice for the selected folder.
-                if let notice = model.metadataEditNotice {
+                if let notice = model.attachmentNotice {
                     Text(notice).font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
