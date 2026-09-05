@@ -10,6 +10,32 @@ from diarise_transcribe import senko_diarisation
 from diarise_transcribe.asr import TranscriptResult, Word
 
 
+def test_live_events_keep_source_scoped_speakers_and_do_not_suppress_resumed_turns():
+    import io
+    import json
+    from diarise_transcribe.merge import MergedTranscript, SpeakerTurn
+
+    output = io.StringIO()
+    writer = mb.StdoutWriter(output)
+    emitter = mb.TranscriptEmitter(writer, finalize_lag=0.5)
+    expected = [("session-a", "mic", "Alice"), ("session-a", "system", "Remote"),
+                ("session-b", "mic", "Bob")]
+    for source, stream, text in expected:
+        merged = MergedTranscript(turns=[SpeakerTurn(speaker="SPEAKER_01", start=0, end=1,
+                                                    text=text, words=[])], words=[], segments=[])
+        emitter.emit_transcript(merged, 1, False, stream_name=stream, source_session_id=source)
+        emitter.emit_transcript(merged, 1, True, stream_name=stream, source_session_id=source)
+    assert writer.close()
+    events = [json.loads(line) for line in output.getvalue().splitlines()]
+    for event_type in ("partial", "segment"):
+        assert [(event["source_session_id"], event["stream"], event["text"])
+                for event in events if event["type"] == event_type] == expected
+    known = [event for event in events if event["type"] == "speakers"][-1]["known"]
+    assert {(entry["source_session_id"], entry["stream"], entry["speaker_id"]) for entry in known} == {
+        ("session-a", "mic", "mic:SPEAKER_01"), ("session-a", "system", "system:SPEAKER_01"),
+        ("session-b", "mic", "mic:SPEAKER_01")}
+
+
 def _write_silent_wav(path: Path, seconds: float = 1.0, sample_rate: int = 16000) -> None:
     n_frames = int(seconds * sample_rate)
     with wave.open(str(path), "wb") as wav:

@@ -462,6 +462,7 @@ class TranscriptEmitter:
         finalize: bool,
         stream_name: Optional[str] = None,
         live_asr_only: bool = False,
+        source_session_id: Optional[str] = None,
     ) -> None:
         if not merged.turns:
             return
@@ -475,19 +476,22 @@ class TranscriptEmitter:
             return f"{stream_name}:{speaker}"
 
         with self._lock:
-            stream_key = stream_name or "default"
+            stream_key = (source_session_id, stream_name or "default")
             last_emitted_t1 = self._last_emitted_t1_by_stream.get(stream_key, 0.0)
             last_partial = self._last_partial_by_stream.get(stream_key)
 
             new_speakers = False
             for turn in merged.turns:
                 speaker_id = speaker_id_for(turn.speaker)
-                if speaker_id not in self._seen_speakers:
-                    self._seen_speakers.add(speaker_id)
+                identity = (source_session_id, stream_name, speaker_id)
+                if identity not in self._seen_speakers:
+                    self._seen_speakers.add(identity)
                     new_speakers = True
 
             if new_speakers:
-                known = [{"speaker_id": s, "name": s} for s in sorted(self._seen_speakers)]
+                known = [{"speaker_id": speaker, "name": speaker,
+                          **({"source_session_id": source, "stream": stream} if source is not None else {})}
+                         for source, stream, speaker in sorted(self._seen_speakers, key=lambda item: tuple(value or "" for value in item))]
                 emit_jsonl({"type": "speakers", "known": known}, self._stdout_writer)
 
             cutoff = current_duration if finalize else max(0.0, current_duration - self._finalize_lag)
@@ -499,6 +503,7 @@ class TranscriptEmitter:
                         "speaker": turn.speaker,
                         "speaker_id": speaker_id,
                         "stream": stream_name,
+                        **({"source_session_id": source_session_id} if source_session_id is not None else {}),
                         "t0": turn.start,
                         "t1": turn.end,
                         "text": turn.text,
@@ -515,6 +520,7 @@ class TranscriptEmitter:
                             "type": "partial",
                             "speaker_id": speaker_id,
                             "stream": stream_name,
+                            **({"source_session_id": source_session_id} if source_session_id is not None else {}),
                             "t0": last_turn.start,
                             "text": last_turn.text,
                         }, self._stdout_writer)
@@ -711,6 +717,7 @@ class LiveProcessor:
             finalize=finalize,
             stream_name=self._stream_name,
             live_asr_only=self._live_asr_only,
+            source_session_id=self._state.source_session_id,
         )
         self._last_processed_duration = max(self._last_processed_duration, duration)
         self._last_processed_byte = max(self._last_processed_byte, snapshot.size_bytes)
@@ -1078,6 +1085,7 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                 finalize=True,
                 stream_name=stream_name,
                 live_asr_only=args.live_asr_only,
+                source_session_id=state.source_session_id,
             )
 
     if processing_complete and not args.keep_wav and not args.source_recording:
