@@ -1,0 +1,58 @@
+Compiler-generated evidence from unmodified source at 64cbcafd9d046c65f89934588cd1d13d29a17351.
+Swift 5 language mode, MainActor default isolation, project upcoming concurrency features, macOS 26.5 SDK.
+This is the Task body created by the meeting onAudioData closure.
+Observe the MainActor hop BEFORE the MicAudioForwarder hop.
+
+// closure #1 in closure #2 in AppModel.attemptMeetingMicEngineStart(usesCaptureSession:resolvedID:pinned:generation:)
+// Isolation: global_actor. type: MainActor
+sil private [ossa] @$s9MuesliApp0B5ModelC28attemptMeetingMicEngineStart33_5614121E0DE77104D464A54A22427804LL18usesCaptureSession10resolvedID6pinned10generationySb_s6UInt32VSbSitYaKFy10Foundation4DataVcfU0_yyYacfU_ : $@convention(thin) @Sendable @async @substituted <τ_0_0> (@guaranteed Optional<any Actor>, @guaranteed AppModel, @guaranteed Data, Int) -> @out τ_0_0 for <()> {
+// %0 "$return_value"
+// %2 "self"                                      // users: %29, %13, %5
+// %3 "data"                                      // users: %19, %6
+// %4 "generation"                                // users: %29, %19, %7
+bb0(%0 : $*(), %1 : @guaranteed $Optional<any Actor>, %2 : @closureCapture @guaranteed $AppModel, %3 : @closureCapture @guaranteed $Data, %4 : @closureCapture $Int):
+  debug_value %2, let, name "self", argno 1       // id: %5
+  debug_value %3, let, name "data", argno 2       // id: %6
+  debug_value %4, let, name "generation", argno 3 // id: %7
+  %8 = metatype $@thick MainActor.Type            // user: %10
+  // function_ref static MainActor.shared.getter
+  %9 = function_ref @$sScM6sharedScMvgZ : $@convention(method) (@thick MainActor.Type) -> @owned MainActor // user: %10
+  %10 = apply %9(%8) : $@convention(method) (@thick MainActor.Type) -> @owned MainActor // users: %34, %11
+  %11 = begin_borrow %10                          // users: %33, %21, %12
+  hop_to_executor %11                             // id: %12
+  %13 = ref_element_addr %2, #AppModel.micAudioForwarder // user: %14
+  %14 = load [copy] %13                           // users: %20, %19, %16, %15
+  %15 = class_method %14, #MicAudioForwarder.deliver : (isolated MicAudioForwarder) -> (Data, Int) -> MicAudioForwarder.DeliveryResult?, $@convention(method) (@guaranteed Data, Int, @sil_isolated @guaranteed MicAudioForwarder) -> Optional<MicAudioForwarder.DeliveryResult> // user: %19
+  %16 = begin_borrow %14                          // users: %18, %17
+  hop_to_executor %16                             // id: %17
+  end_borrow %16                                  // id: %18
+  %19 = apply %15(%3, %4, %14) : $@convention(method) (@guaranteed Data, Int, @sil_isolated @guaranteed MicAudioForwarder) -> Optional<MicAudioForwarder.DeliveryResult> // user: %22
+  destroy_value %14                               // id: %20
+  hop_to_executor %11                             // id: %21
+  switch_enum %19, case #Optional.some!enumelt: bb2, case #Optional.none!enumelt: bb1 // id: %22
+
+bb1:                                              // Preds: bb0
+  br bb4                                          // id: %23
+
+// %24                                            // user: %25
+bb2(%24 : $MicAudioForwarder.DeliveryResult):     // Preds: bb0
+  %25 = move_value [var_decl] %24                 // users: %30, %29, %26
+  debug_value %25, let, name "result"             // id: %26
+  br bb3                                          // id: %27
+
+bb3:                                              // Preds: bb2
+  // function_ref AppModel.onMicAudioDelivered(_:generation:)
+  %28 = function_ref @$s9MuesliApp0B5ModelC19onMicAudioDelivered33_5614121E0DE77104D464A54A22427804LL_10generationyAA0eF9ForwarderC14DeliveryResultV_SitF : $@convention(method) (MicAudioForwarder.DeliveryResult, Int, @guaranteed AppModel) -> () // user: %29
+  %29 = apply %28(%25, %4, %2) : $@convention(method) (MicAudioForwarder.DeliveryResult, Int, @guaranteed AppModel) -> ()
+  extend_lifetime %25                             // id: %30
+  br bb5                                          // id: %31
+
+bb4:                                              // Preds: bb1
+  br bb5                                          // id: %32
+
+bb5:                                              // Preds: bb3 bb4
+  end_borrow %11                                  // id: %33
+  destroy_value %10                               // id: %34
+  %35 = tuple ()                                  // user: %36
+  return %35                                      // id: %36
+} // end sil function '$s9MuesliApp0B5ModelC28attemptMeetingMicEngineStart33_5614121E0DE77104D464A54A22427804LL18usesCaptureSession10resolvedID6pinned10generationySb_s6UInt32VSbSitYaKFy10Foundation4DataVcfU0_yyYacfU_'
