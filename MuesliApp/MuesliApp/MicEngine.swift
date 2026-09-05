@@ -13,7 +13,7 @@ actor MicEngine: MicCapturing {
     private var engine: AVAudioEngine?
     private var isRunning = false
     private var processor: MicCaptureProcessor?
-    private var onConfigurationChange: (() -> Void)?
+    private var onConfigurationChange: (@Sendable () -> Void)?
     private var configChangeObserver: NSObjectProtocol?
     private var retiredEngines: [UUID: AVAudioEngine] = [:]
     private let engineRetainDurationNs: UInt64 = 2_000_000_000
