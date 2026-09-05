@@ -22,3 +22,7 @@ audio-session-*/
 *.m4a
 *.mp3
 *.aac
+
+# Machine-local model selection (published explicitly by provisioning)
+local-models.json
+.local-models-*

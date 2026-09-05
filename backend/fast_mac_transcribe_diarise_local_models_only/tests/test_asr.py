@@ -11,6 +11,7 @@ def test_ensure_loaded_shares_one_model_across_instances(monkeypatch) -> None:
         return object()
 
     monkeypatch.setattr(asr, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(asr, "local_asr_directory", lambda model_id: model_id)
 
     first = asr.ASRModel("fake-model")
     second = asr.ASRModel("fake-model")
@@ -32,6 +33,7 @@ def test_ensure_loaded_loads_separately_per_model_id(monkeypatch) -> None:
         return object()
 
     monkeypatch.setattr(asr, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(asr, "local_asr_directory", lambda model_id: model_id)
 
     first = asr.ASRModel("model-a")
     second = asr.ASRModel("model-b")
