@@ -30,7 +30,8 @@ nonisolated struct TranscriptReplacement: Sendable {
     static func commitStoppedMeeting(context: TranscriptPersistenceStore.Context,
         timestampOffset: Double, segments initialSegments: [TranscriptSegment], speakerNames: [String: String],
         journalURL: URL?, journalStatus: BackendStdoutStatus?, sourceManifest: LocalAudioRecorder.Manifest?,
-        artifactResult: SessionArtifactFinishResult?, incomplete: Bool) throws -> MeetingMetadata {
+        artifactResult: SessionArtifactFinishResult?, incomplete: Bool,
+        acceptedSpeakerNames: [String: String] = [:]) throws -> MeetingMetadata {
         var accumulator = TranscriptAccumulator(timestampOffset: timestampOffset,
             segments: initialSegments, speakerNames: speakerNames)
         let replay: TranscriptEventJournal.Replay
@@ -55,6 +56,7 @@ nonisolated struct TranscriptReplacement: Sendable {
             }
         }
         metadata.speakerNames.merge(accumulator.speakerNames) { reviewed, _ in reviewed }
+        metadata.speakerNames.merge(acceptedSpeakerNames) { _, latestAccepted in latestAccepted }
         try context.commit(files: TranscriptReplacement.files(segments: segments,
             text: TranscriptModel.plainText(from: segments, names: metadata.speakerNames), metadata: metadata))
         return metadata

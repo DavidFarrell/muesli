@@ -120,6 +120,33 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         }
     }
 
+    func testStoppedFinalizerPreservesAcceptedNamesWhenPrecedingEditFails() async throws {
+        let (folder, _, _) = try fixture()
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let store = TranscriptPersistenceStore()
+        let edit = try store.start(in: folder) { _ -> Bool in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+            throw CocoaError(.fileWriteOutOfSpace)
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let finalization = try store.startAfterCurrent(in: folder) { context in
+            try TranscriptReplacement.commitStoppedMeeting(context: context, timestampOffset: 0,
+                segments: [], speakerNames: ["system:0": "Older live name"],
+                journalURL: nil, journalStatus: nil, sourceManifest: nil,
+                artifactResult: nil, incomplete: true,
+                acceptedSpeakerNames: ["system:0": "Latest accepted name"])
+        }
+        release.signal()
+        if case .failed = await edit.wait(timeoutSeconds: 3) {} else { XCTFail("Expected failed preceding edit") }
+        let saved = try await finalization.value(timeoutSeconds: 3)
+        XCTAssertEqual(saved.speakerNames["system:0"], "Latest accepted name")
+        let read = try store.start(in: folder) { try $0.readMetadata() }
+        let persisted = try await read.value(timeoutSeconds: 3)
+        XCTAssertEqual(persisted.speakerNames, saved.speakerNames)
+    }
+
     func testSuccessfulReplacementPersistsRawProvenanceInventoryAndMetadataBeforePublishing() async throws {
         let (folder, _, replacement) = try fixture()
         let model = makeModel()

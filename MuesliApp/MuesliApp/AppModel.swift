@@ -2655,9 +2655,12 @@ final class AppModel: ObservableObject {
     }
 
     func stopMeeting() async {
-        guard isCapturing else { return }
+        guard isCapturing, !isFinalizing else { return }
 
         isFinalizing = true
+        // Retire edit admission before any suspension. The retained finalizer
+        // carries accepted names even if their preceding disk edit fails.
+        let acceptedSpeakerNames = currentSession.map { retireMetadataEdits(in: $0.folderURL) } ?? [:]
         let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
@@ -2772,6 +2775,7 @@ final class AppModel: ObservableObject {
                 transcriptEventsURL: stoppingTranscriptEventsURL,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
                 speakerNamesSnapshot: stoppingSpeakerNames,
+                acceptedSpeakerNames: acceptedSpeakerNames,
                 timestampOffsetSnapshot: stoppingTimestampOffset,
                 writer: stoppingWriter,
                 sourceManifest: sourceResult,
@@ -2791,6 +2795,7 @@ final class AppModel: ObservableObject {
         transcriptEventsURL: URL?,
         transcriptSegmentsSnapshot: [TranscriptSegment],
         speakerNamesSnapshot: [String: String],
+        acceptedSpeakerNames: [String: String],
         timestampOffsetSnapshot: Double,
         writer: FramedWriter? = nil,
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
@@ -2889,7 +2894,8 @@ final class AppModel: ObservableObject {
                     timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
                     speakerNames: speakerNamesSnapshot, journalURL: transcriptEventsURL,
                     journalStatus: journalStatus, sourceManifest: sourceManifest,
-                    artifactResult: artifactResult, incomplete: incomplete)
+                    artifactResult: artifactResult, incomplete: incomplete,
+                    acceptedSpeakerNames: acceptedSpeakerNames)
             }
             switch await operation.wait(timeoutSeconds: 5) {
             case .completed, .failed: break // Actual completion publishes the observed result.
