@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import struct
 from contextlib import redirect_stdout
 import json
 import math
@@ -23,6 +22,7 @@ from .processing_evidence import (
     SourceDirectory, OwnedFile, ModelInput, InputChanged, bounded_count, legacy_wav_details, MAX_SESSIONS,
     MAX_METADATA_BYTES, MAX_FILE_BYTES,
 )
+from .wav_derivation import ProducedWAV, canonical_pcm_header
 from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
 
 # Model imports can emit diagnostics; reserve stdout for protocol events.
@@ -133,10 +133,7 @@ def _committed_wav(source: CommittedSource, pcm: Path, destination: Path,
                    budget: SnapshotBudget, expected_pcm_sha256: str) -> tuple[Path, str]:
     """Wrap the frozen prefix and bind the generated WAV to its source digest."""
     budget.reserve_bytes(source.size_bytes + 44)
-    header = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", source.size_bytes + 36,
-                         b"WAVE", b"fmt ", 16, 1, source.channels, source.sample_rate,
-                         source.sample_rate * source.channels * 2, source.channels * 2,
-                         16, b"data", source.size_bytes)
+    header = canonical_pcm_header(source.size_bytes, source.sample_rate, source.channels, 2)
     pcm_digest, wav_digest = hashlib.sha256(), hashlib.sha256(header)
     with SourceDirectory(pcm.parent) as owner:
         fd = owner.open(pcm.name)
@@ -237,9 +234,15 @@ def _run_recovery_pass(
             if expected_slice_bytes > MAX_FILE_BYTES:
                 raise ValueError("Recovery slice exceeds size limit")
             budget.reserve_bytes(expected_slice_bytes)
-            slice_path = slice_wav_to_temp(wav_path, window.start, window.end)
+            produced = slice_wav_to_temp(wav_path, window.start, window.end, return_evidence=True)
+            if not isinstance(produced, ProducedWAV):
+                raise InputChanged("Recovery producer did not return its derivation evidence")
+            slice_path = os.fspath(produced)
             try:
-                with ModelInput(Path(slice_path)) as owned_slice:
+                expected_frames = (expected_slice_bytes - 44) // 2
+                if produced.frame_count != expected_frames or produced.byte_count != expected_slice_bytes:
+                    raise InputChanged("Recovery output does not match the requested source range")
+                with ModelInput(Path(slice_path), expected=produced) as owned_slice:
                     record["model_input"] = owned_slice.payload()
                     if owned_slice.frame_count == 0:
                         raise ValueError("Empty recovery slice")
@@ -335,6 +338,7 @@ def reprocess_stream(
                 raise InputChanged("Owned source snapshot changed before model admission")
         with OwnedFile(copied, snapshot["sha256"]) as owned_source:
             try:
+                produced = None
                 if _normalized_pcm(copied):
                     temp_wav = str(copied)
                 else:
@@ -350,9 +354,12 @@ def reprocess_stream(
                     # header/encoder-packet headroom, with an independent file-size gate.
                     output_limit = min(MAX_FILE_BYTES, math.ceil(duration * 32000) + 1024 * 1024)
                     budget.reserve_bytes(output_limit)
-                    normalise_audio(str(copied), output_path=temp_wav, max_output_bytes=output_limit)
+                    produced = normalise_audio(str(copied), output_path=temp_wav,
+                                               max_output_bytes=output_limit, return_evidence=True)
+                    if not isinstance(produced, ProducedWAV):
+                        raise InputChanged("Normalization producer did not return its derivation evidence")
                 owned_source.verify()
-                with ModelInput(Path(temp_wav)) as owned_input:
+                with ModelInput(Path(temp_wav), expected=produced) as owned_input:
                     evidence.model_input = owned_input.payload()
                     return _process_owned_stream(temp_wav, stream_name, diar_backend, asr_model,
                                                  language, gap_threshold, speaker_tolerance,

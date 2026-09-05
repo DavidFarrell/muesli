@@ -195,12 +195,13 @@ def test_empty_legacy_file_has_verified_zero_frames_no_models(tmp_path, monkeypa
 
 def test_24bit_mono_is_normalized_and_both_models_see_normalized_bytes(tmp_path, monkeypatch):
     wav(tmp_path / "audio/mic.wav", width=3)
+    if not reprocess.check_ffmpeg(): pytest.skip("local decoder unavailable")
     calls = []
-    def normalize(source, output_path, max_output_bytes):
+    real_normalize = reprocess.normalise_audio
+    def normalize(source, output_path, max_output_bytes, **kwargs):
         calls.append((Path(source).read_bytes(), max_output_bytes))
-        wav(Path(output_path), width=2)
+        return real_normalize(source, output_path, max_output_bytes=max_output_bytes, **kwargs)
     monkeypatch.setattr(reprocess, "normalise_audio", normalize)
-    monkeypatch.setattr(reprocess, "check_ffmpeg", lambda: True)
     seen = models(monkeypatch)
     rc, event = run(monkeypatch, tmp_path, "mic")
     assert rc == 0 and len(calls) == 1
@@ -417,13 +418,113 @@ def test_owned_pcm_edit_before_wrapping_cannot_rebind_source_hash(tmp_path, monk
 
 def test_normalization_cannot_rebind_a_changed_private_source(tmp_path, monkeypatch):
     wav(tmp_path / "audio/mic.wav", width=3)
-    def normalize(source, output_path, max_output_bytes):
-        wav(Path(output_path))
+    if not reprocess.check_ffmpeg(): pytest.skip("local decoder unavailable")
+    real_normalize = reprocess.normalise_audio
+    def normalize(source, **kwargs):
+        produced = real_normalize(source, **kwargs)
         with Path(source).open("r+b") as output:
             output.seek(45); output.write(b"x")
+        return produced
     monkeypatch.setattr(reprocess, "normalise_audio", normalize)
-    monkeypatch.setattr(reprocess, "check_ffmpeg", lambda: True)
     seen = models(monkeypatch)
     rc, event = run(monkeypatch, tmp_path, "mic")
     assert rc == 1 and event["type"] == "error" and seen == []
     assert event["processing"]["entries"][1]["failure_code"] == "InputChanged"
+
+
+def _alter_produced_wav(produced, mutation):
+    """Preserve the independent review's exact post-production mutation point."""
+    from dataclasses import replace
+    path = Path(produced)
+    before = path.read_bytes()
+    if mutation == "sample":
+        with path.open("r+b") as handle:
+            handle.seek(44); handle.write(b"\x34\x12")
+        assert len(path.read_bytes()) == len(before) and path.read_bytes() != before
+    elif mutation == "inode":
+        path.unlink()
+        path.write_bytes(before)
+        assert path.read_bytes() == before
+    elif mutation == "missing":
+        path.unlink()
+    elif mutation == "frames":
+        return replace(produced, frame_count=produced.frame_count + 1)
+    else:
+        raise AssertionError(mutation)
+    return produced
+
+
+@pytest.mark.parametrize("producer", ["recovery", "normalization"])
+@pytest.mark.parametrize("mutation", ["sample", "inode", "missing", "frames", "hardlink"])
+def test_actual_derived_output_handoff_must_match_producer_bytes_identity_and_frames(
+        tmp_path, monkeypatch, producer, mutation):
+    if producer == "normalization" and not reprocess.check_ffmpeg():
+        pytest.skip("local decoder unavailable")
+    wav(tmp_path / "audio/mic.wav", frames=16000 * 5, width=3 if producer == "normalization" else 2)
+    original_source = (tmp_path / "audio/mic.wav").read_bytes()
+    function = "slice_wav_to_temp" if producer == "recovery" else "normalise_audio"
+    real_producer = getattr(reprocess, function)
+    handed_off = []
+    def mutate_after_production(*args, **kwargs):
+        produced = real_producer(*args, **kwargs)
+        handed_off.append(Path(produced))
+        if mutation == "hardlink":
+            os.link(os.fspath(produced), tmp_path / "fixture-derived-hardlink.wav")
+            return produced
+        return _alter_produced_wav(produced, mutation)
+    monkeypatch.setattr(reprocess, function, mutate_after_production)
+    seen = models(monkeypatch, words=[Word("word", .2, .4)],
+                  segments=[DiarSegment(1, 4, "speaker")])
+    rc, event = run(monkeypatch, tmp_path, "mic", recovery=producer == "recovery")
+    assert handed_off
+    assert rc == 1 and event["type"] == "error" and not event["processing"]["complete"]
+    entry = event["processing"]["entries"][1]
+    assert entry["status"] == "failed" and entry["failure_code"] == "InputChanged"
+    assert len(seen) == (2 if producer == "recovery" else 0), "changed output must never reach a model"
+    if producer == "recovery":
+        recovery = entry["recovery"]
+        assert recovery["outcome"] == "failed" and recovery["failed_window_count"] == 1
+        window = recovery["windows"][0]
+        assert window["failure_code"] == "InputChanged" and window["model_input"] is None
+    assert (tmp_path / "audio/mic.wav").read_bytes() == original_source
+    assert all(not path.exists() for path in handed_off)
+    (tmp_path / "fixture-derived-hardlink.wav").unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("producer", ["recovery", "normalization"])
+def test_producer_digest_is_observed_during_derivation_not_rebased_at_finish(tmp_path, monkeypatch, producer):
+    from diarise_transcribe.wav_derivation import WAVDerivation
+    if producer == "normalization" and not reprocess.check_ffmpeg():
+        pytest.skip("local decoder unavailable")
+    wav(tmp_path / "audio/mic.wav", frames=16000 * 5, width=3 if producer == "normalization" else 2)
+    original_finish = WAVDerivation.finish
+    changed = []
+    def mutate_before_finish(self, output, path):
+        output.flush()
+        output.seek(44); output.write(b"\x34\x12"); output.flush()
+        changed.append(path)
+        return original_finish(self, output, path)
+    monkeypatch.setattr(WAVDerivation, "finish", mutate_before_finish)
+    seen = models(monkeypatch, words=[Word("word", .2, .4)], segments=[DiarSegment(1, 4, "speaker")])
+    rc, event = run(monkeypatch, tmp_path, "mic", recovery=producer == "recovery")
+    assert changed and rc == 1 and event["type"] == "error"
+    assert event["processing"]["entries"][1]["failure_code"] == "InputChanged"
+    assert len(seen) == (2 if producer == "recovery" else 0)
+    assert all(not Path(path).exists() for path in changed)
+
+
+def test_actual_producer_handoff_is_frozen_and_matches_canonical_output(tmp_path):
+    from dataclasses import FrozenInstanceError
+    from diarise_transcribe.audio import slice_wav_to_temp
+    wav(tmp_path / "input.wav", frames=16000 * 5)
+    result = slice_wav_to_temp(str(tmp_path / "input.wav"), .125, 1.875, return_evidence=True)
+    try:
+        assert result.frame_count == 28000
+        assert result.byte_count == 56044
+        assert result.sha256 == hashlib.sha256(Path(result).read_bytes()).hexdigest()
+        with pytest.raises(FrozenInstanceError):
+            result.frame_count = 0
+        with evidence.ModelInput(Path(result), expected=result) as admitted:
+            assert admitted.frame_count == 28000
+    finally:
+        Path(result).unlink()

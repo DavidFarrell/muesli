@@ -17,6 +17,7 @@ from typing import Literal, TypedDict
 import wave
 
 from .source_recording import MAX_SOURCE_BYTES
+from .wav_derivation import InputChanged, ProducedWAV, file_identity
 
 MAX_SESSIONS = 128
 MAX_METADATA_BYTES = 4 * 1024 * 1024
@@ -61,10 +62,6 @@ class RecoveryWindowRecord(TypedDict):
     asr_word_count: int | None
     recovered_word_count: int | None
     failure_code: str | None
-
-
-class InputChanged(ValueError):
-    """A model input changed, so the output cannot certify its digest."""
 
 
 def bounded_count(value: int) -> int:
@@ -134,7 +131,7 @@ class ProcessingEvidence:
 
 
 def _identity(info: os.stat_result) -> tuple:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return file_identity(info)
 
 
 def _regular(fd: int) -> os.stat_result:
@@ -291,6 +288,14 @@ class OwnedFile:
         return digest.hexdigest()
 
     def verify(self) -> None:
+        try:
+            self._verify()
+        except InputChanged:
+            raise
+        except (OSError, ValueError) as error:
+            raise InputChanged("Owned model input became unavailable or changed shape") from error
+
+    def _verify(self) -> None:
         info = os.stat(self.path, follow_symlinks=False)
         if (_identity(info) != _identity(self.identity) or
                 _identity(_regular(self.fd)) != _identity(self.identity) or self._digest() != self.sha256 or
@@ -299,13 +304,27 @@ class OwnedFile:
             raise InputChanged("Owned model input changed during processing")
 
 class ModelInput(OwnedFile):
-    def __init__(self, path: Path):
-        super().__init__(path)
+    def __init__(self, path: Path, expected: ProducedWAV | None = None):
         try:
+            super().__init__(path, expected.sha256 if expected else None)
+        except (OSError, ValueError) as error:
+            if expected is None or isinstance(error, InputChanged):
+                raise
+            raise InputChanged("Produced WAV became unavailable or changed shape before admission") from error
+        try:
+            if expected is not None and (
+                    _identity(self.identity) != expected.file_identity or
+                    (expected.sample_rate, expected.channels, expected.sample_width) != (16000, 1, 2)):
+                raise InputChanged("Produced WAV identity or format changed before admission")
             with wave.open(str(path), "rb") as wav:
                 if (wav.getframerate(), wav.getnchannels(), wav.getsampwidth(), wav.getcomptype()) != (16000, 1, 2, "NONE"):
                     raise ValueError("Model input is not normalized PCM16 mono 16 kHz")
                 self.frame_count = wav.getnframes()
+                if expected is not None and (
+                        expected.frame_count != self.frame_count or expected.sample_rate != 16000 or
+                        expected.channels != 1 or expected.sample_width != 2 or
+                        expected.byte_count != self.identity.st_size):
+                    raise InputChanged("Produced WAV shape changed before admission")
                 # Read the declared frames to reject truncated WAV data; chunked.
                 remaining = self.frame_count
                 while remaining:

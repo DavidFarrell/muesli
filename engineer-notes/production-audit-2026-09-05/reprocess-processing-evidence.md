@@ -131,3 +131,37 @@ bounded decoder, lazy enumeration and the total result protocol size gate.
   the approved base and the new bounded local decoder test, using fixtures only.
 - `git diff --check` passed. No native app sources or project membership changed;
   the Swift/native processing verifier is a separate integration/review boundary.
+
+## Producer handoff correction (2026-09-06)
+
+The independent review of `356a051` reproduced a source-derivation gap between
+normalization/recovery output production and the first model-input hash. Both
+handoffs now require immutable `ProducedWAV` evidence. The producer accumulates
+its PCM digest while receiving decoder output or reading the requested recovery
+frames. After `wave` finalizes the header, it verifies that same retained output
+descriptor against the observed PCM, canonical WAV header and exact frame count.
+Only then does it return the canonical digest, format, byte/frame counts and
+original inode/timestamps. No post-return pathname read establishes a new trusted
+baseline.
+
+The reprocess caller opts into the new handoff with `return_evidence=True`;
+existing path-only helper callers retain their return type. `ModelInput` requires
+the producer's digest, physical identity and exact shape before model admission.
+Recovery also checks the requested frame interval's exact length independently.
+A missing handoff, changed sample, identical-byte file replacement, disappearance,
+added hard link or inconsistent count fails as `InputChanged`, including recovery;
+it cannot become successful main output with a best-effort recovery fallback.
+The normalized source stays separately guarded through the decoder/model calls.
+
+Regressions use the real ffmpeg decoder and real slicer on synthetic WAVs. They
+mutate output both immediately after return and immediately before the producer
+finishes; the latter proves the digest came from observed derivation bytes, not a
+fresh hash of a modified output. Positive cases validate exact frames, frozen
+handoff fields and canonical output hashes. The native JSON schema and checked
+producer interoperability fixture are unchanged.
+
+Validation before correction freeze: 176 full backend tests passed in
+`/private/tmp/muesli-processing-derivation-full.log`; all 43 focused processing
+tests passed after the final hard-link/disappearance classification guards in
+`/private/tmp/muesli-processing-handoff-final-focused.log`. The complete frozen
+suite is rerun separately before merge. No native app or permission changes.

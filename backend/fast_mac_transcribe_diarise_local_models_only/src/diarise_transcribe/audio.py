@@ -14,6 +14,8 @@ from typing import Optional, Tuple
 import numpy as np
 import soundfile as sf
 
+from .wav_derivation import ProducedWAV, WAVDerivation
+
 
 def check_ffmpeg() -> bool:
     """Check if ffmpeg is available in PATH."""
@@ -48,7 +50,8 @@ def normalise_audio(
     sample_rate: int = 16000,
     mono: bool = True,
     max_output_bytes: int | None = None,
-) -> str:
+    return_evidence: bool = False,
+) -> str | ProducedWAV:
     """
     Convert any audio file to normalised WAV format using ffmpeg.
 
@@ -59,6 +62,8 @@ def normalise_audio(
         mono: Convert to mono (default True)
         max_output_bytes: Optional exact owned-output cap (mono only). The
             decoder uses a PCM pipe; failure closes and reaps the child.
+        return_evidence: Return an immutable producer digest/frame/identity
+            handoff, rather than only a path (requires max_output_bytes).
 
     Returns:
         Path to the normalised WAV file
@@ -66,6 +71,8 @@ def normalise_audio(
     Raises:
         RuntimeError: If ffmpeg is not available or conversion fails
     """
+    if return_evidence and max_output_bytes is None:
+        raise ValueError("Producer evidence requires bounded normalization")
     if not check_ffmpeg():
         raise RuntimeError(
             "ffmpeg is not installed or not in PATH. "
@@ -103,21 +110,25 @@ def normalise_audio(
         cmd.extend(["-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            with wave.open(str(output_path), "wb") as output:
-                output.setnchannels(1)
-                output.setsampwidth(2)
-                output.setframerate(sample_rate)
-                written = 44
-                while chunk := process.stdout.read(65536):
-                    if written + len(chunk) > max_output_bytes:
-                        raise ValueError("Normalized output exceeds the size limit")
-                    if len(chunk) % 2:
-                        raise ValueError("Unaligned normalized PCM output")
-                    output.writeframesraw(chunk)
-                    written += len(chunk)
-            if process.wait() != 0:
-                raise RuntimeError("ffmpeg conversion failed")
-            return str(output_path)
+            derivation = WAVDerivation(sample_rate, 1, 2)
+            with output_path.open("w+b") as output_file:
+                with wave.open(output_file, "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(sample_rate)
+                    written = 44
+                    while chunk := process.stdout.read(65536):
+                        if written + len(chunk) > max_output_bytes:
+                            raise ValueError("Normalized output exceeds the size limit")
+                        if len(chunk) % 2:
+                            raise ValueError("Unaligned normalized PCM output")
+                        derivation.observe(chunk)
+                        output.writeframesraw(chunk)
+                        written += len(chunk)
+                if process.wait() != 0:
+                    raise RuntimeError("ffmpeg conversion failed")
+                produced = derivation.finish(output_file, str(output_path))
+            return produced if return_evidence else produced.path
         finally:
             process.stdout.close()
             if process.poll() is None:
@@ -149,7 +160,8 @@ def normalise_audio(
     return str(output_path)
 
 
-def slice_wav_to_temp(input_path: str, start: float, end: float) -> str:
+def slice_wav_to_temp(input_path: str, start: float, end: float, *,
+                      return_evidence: bool = False) -> str | ProducedWAV:
     """
     Slice a 16kHz mono PCM WAV file to [start, end) seconds and write the
     slice to a new temp WAV file.
@@ -159,6 +171,7 @@ def slice_wav_to_temp(input_path: str, start: float, end: float) -> str:
             normalise_audio / checked by is_wav_16k_mono).
         start: Slice start in seconds, clamped to the file bounds.
         end: Slice end in seconds, clamped to the file bounds.
+        return_evidence: Return the immutable producer handoff with its path.
 
     Returns:
         Path to the temp WAV file containing the slice. Caller owns
@@ -173,26 +186,29 @@ def slice_wav_to_temp(input_path: str, start: float, end: float) -> str:
         start_frame = max(0, min(n_frames, int(round(start * framerate))))
         end_frame = max(start_frame, min(n_frames, int(round(end * framerate))))
 
+        derivation = WAVDerivation(framerate, n_channels, sample_width)
         fd, output_path = tempfile.mkstemp(suffix=".wav", prefix="recovery_slice_")
-        os.close(fd)
         try:
-            with wave.open(output_path, "wb") as dst:
-                dst.setnchannels(n_channels)
-                dst.setsampwidth(sample_width)
-                dst.setframerate(framerate)
-                src.setpos(start_frame)
-                remaining = end_frame - start_frame
-                while remaining:
-                    frame_data = src.readframes(min(remaining, 32768))
-                    frame_bytes = sample_width * n_channels
-                    if not frame_data or len(frame_data) % frame_bytes:
-                        raise ValueError("Truncated recovery source WAV")
-                    dst.writeframesraw(frame_data)
-                    remaining -= len(frame_data) // frame_bytes
+            with os.fdopen(fd, "w+b") as output_file:
+                with wave.open(output_file, "wb") as dst:
+                    dst.setnchannels(n_channels)
+                    dst.setsampwidth(sample_width)
+                    dst.setframerate(framerate)
+                    src.setpos(start_frame)
+                    remaining = end_frame - start_frame
+                    while remaining:
+                        frame_data = src.readframes(min(remaining, 32768))
+                        frame_bytes = sample_width * n_channels
+                        if not frame_data or len(frame_data) % frame_bytes:
+                            raise ValueError("Truncated recovery source WAV")
+                        derivation.observe(frame_data)
+                        dst.writeframesraw(frame_data)
+                        remaining -= len(frame_data) // frame_bytes
+                produced = derivation.finish(output_file, output_path)
         except BaseException:
             Path(output_path).unlink(missing_ok=True)
             raise
-    return output_path
+    return produced if return_evidence else produced.path
 
 
 def load_audio(path: str) -> Tuple[np.ndarray, int]:

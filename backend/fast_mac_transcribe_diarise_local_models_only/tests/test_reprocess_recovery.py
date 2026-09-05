@@ -8,6 +8,7 @@ existing reprocess tests.
 
 from pathlib import Path
 import wave
+import os
 
 from diarise_transcribe import reprocess
 from diarise_transcribe.asr import TranscriptResult, Word
@@ -29,9 +30,12 @@ class FakeASRModel:
         self.model_id = model_id
         self._transcripts_by_path = transcripts_by_path
         self.calls: list[str] = []
+        self.path_labels: dict[str, str] = {}
 
     def transcribe(self, path: str, language=None) -> TranscriptResult:
-        label = next(key for key in self._transcripts_by_path if Path(key).name == Path(path).name)
+        label = self.path_labels.get(path)
+        if label is None:
+            label = next(key for key in self._transcripts_by_path if Path(key).name == Path(path).name)
         self.calls.append(label)
         value = self._transcripts_by_path[label]
         if isinstance(value, Exception):
@@ -61,12 +65,13 @@ def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.
     for key in transcripts_by_path:
         if Path(key).name == "MAIN.wav":
             write_wav(Path(key))
-    def owned_slice(wav_path, start, end):
-        label = (slice_fn or _default_slice_fn)(wav_path, start, end)
-        path = Path(wav_path).parent / Path(label).name
-        write_wav(path)
-        return str(path)
+    from diarise_transcribe.audio import slice_wav_to_temp as real_slice
     fake_asr = FakeASRModel(reprocess.DEFAULT_MODEL, transcripts_by_path)
+    def owned_slice(wav_path, start, end, **kwargs):
+        label = (slice_fn or _default_slice_fn)(wav_path, start, end)
+        produced = real_slice(wav_path, start, end, **kwargs)
+        fake_asr.path_labels[os.fspath(produced)] = label
+        return produced
 
     monkeypatch.setattr(reprocess, "get_audio_duration", lambda path: file_duration)
     monkeypatch.setattr(reprocess, "ASRModel", lambda model_id: fake_asr)
