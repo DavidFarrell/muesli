@@ -5,7 +5,8 @@ import ScreenCaptureKit
 final class RecordingArtifactTests: XCTestCase {
     func testPersistedDeadlineCannotBecomeSuccessfulWhenStatusClosesConcurrently() throws {
         let status = SessionArtifactStatus(sourceSessionID: "source-a", pendingVideos: 0,
-            finishedVideos: 1, committedScreenshots: 3, error: nil, mediaEndSeconds: 42, closed: true)
+            finishedVideos: 1, committedScreenshots: 3, error: nil, mediaEndSeconds: 42,
+            captureEndSeconds: 42, closed: true)
         let record = MeetingArtifactFinalization(.timedOut(status))
         let saved = try JSONEncoder().encode(record)
         let restored = try JSONDecoder().decode(MeetingArtifactFinalization.self, from: saved)

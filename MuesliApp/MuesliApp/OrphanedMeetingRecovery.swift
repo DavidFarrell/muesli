@@ -32,7 +32,9 @@ nonisolated enum OrphanedMeetingRecovery {
             let offset: Double
             let duration: Double
             if FileManager.default.fileExists(atPath: audio.appendingPathComponent(LocalAudioRecorder.manifestName).path) {
-                let manifest = try validatedManifest(directory: audio)
+                let manifest = try LocalAudioRecorder.withInactiveSource(directory: audio) {
+                    try validatedManifest(directory: audio)
+                }
                 offset = Double(manifest.timeline_offset_us) / 1_000_000
                 duration = Double(manifest.streams.values.map(\.committed_bytes).max() ?? 0) / 32_000
             } else {

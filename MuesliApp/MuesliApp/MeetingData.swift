@@ -53,8 +53,12 @@ nonisolated struct MeetingArtifactFinalization: Codable, Hashable, Sendable {
     let committedScreenshots: Int
     let error: String?
     let mediaEndSeconds: Double?
+    let captureEndSeconds: Double?
     let closed: Bool
-    var isComplete: Bool { outcome == "completed" && closed && pendingVideos == 0 && error == nil }
+    var isComplete: Bool {
+        outcome == "completed" && closed && pendingVideos == 0 && error == nil
+            && captureEndSeconds.map { $0.isFinite && $0 >= 0 } == true
+    }
 
     init(_ result: SessionArtifactFinishResult) {
         switch result {
@@ -69,6 +73,7 @@ nonisolated struct MeetingArtifactFinalization: Codable, Hashable, Sendable {
         committedScreenshots = status.committedScreenshots
         error = status.error
         mediaEndSeconds = status.mediaEndSeconds
+        captureEndSeconds = status.captureEndSeconds
         closed = status.closed
     }
 
@@ -79,6 +84,7 @@ nonisolated struct MeetingArtifactFinalization: Codable, Hashable, Sendable {
         case finishedVideos = "finished_videos"
         case committedScreenshots = "committed_screenshots"
         case mediaEndSeconds = "media_end_seconds"
+        case captureEndSeconds = "capture_end_seconds"
     }
 }
 

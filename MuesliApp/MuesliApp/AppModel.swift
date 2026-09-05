@@ -2641,7 +2641,8 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
         screenshotScheduler.stop()
-        await captureEngine.stopCapture()
+        let systemStopped = await captureEngine.stopCapture()
+        if systemStopped { stoppingArtifacts?.markCaptureStopped(atHostUs: CaptureTimeline.hostNowMicroseconds()) }
 
         enqueueMicLifecycle("start-failure-cleanup") { model in
             if let engine = model.micEngine {
@@ -2776,7 +2777,8 @@ final class AppModel: ObservableObject {
         await micLifecycleTask?.value
 
         screenshotScheduler.stop()
-        await captureEngine.stopCapture()
+        let systemStopped = await captureEngine.stopCapture()
+        if systemStopped { stoppingArtifacts?.markCaptureStopped(atHostUs: CaptureTimeline.hostNowMicroseconds()) }
         if let engine = micEngine {
             _ = await stopNativeMicrophone(engine, ingress: micAudioIngress, preview: false)
         }
@@ -3296,7 +3298,7 @@ final class AppModel: ObservableObject {
                 + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
             } ?? metadata.durationSeconds
             let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration,
-                                      artifacts?.mediaEndSeconds ?? 0)
+                                      artifacts?.mediaEndSeconds ?? 0, artifacts?.captureEndSeconds ?? 0)
 
             metadata.updatedAt = Date()
             metadata.durationSeconds = durationSeconds
@@ -3315,6 +3317,9 @@ final class AppModel: ObservableObject {
                 }
                 if let mediaEnd = artifacts?.mediaEndSeconds, let offset = lastSession.timelineOffsetSeconds {
                     lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, mediaEnd - offset)
+                }
+                if let captureEnd = artifacts?.captureEndSeconds, let offset = lastSession.timelineOffsetSeconds {
+                    lastSession.durationSeconds = max(lastSession.durationSeconds ?? 0, captureEnd - offset)
                 }
                 metadata.sessions[lastIndex] = lastSession
             }

@@ -1,6 +1,36 @@
 import XCTest
 
 final class OrphanedMeetingRecoveryTests: XCTestCase {
+    func testResumeWaitsForOriginalWriterAfterCloseDeadlineThenUsesItsFullExtent() async throws {
+        let root = try folder(), audio = root.appendingPathComponent("audio")
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let writes = ResumeWriteCounter()
+        let recorder = try LocalAudioRecorder(directory: audio, commitInterval: 0.05, beforeIO: { point in
+            if case .write(.mic) = point, writes.next() == 2 {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 5)
+            }
+        })
+        defer { release.signal() }
+        recorder.record(source: .mic, ptsUs: 0, payload: Data(repeating: 0, count: 320_000))
+        for _ in 0..<200 where recorder.status().committedBytes < 320_000 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(recorder.status().committedBytes, 320_000)
+        recorder.record(source: .mic, ptsUs: 10_000_000, payload: Data(repeating: 0, count: 1_600_000))
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let timedOut = await recorder.finish(timeoutSeconds: 0.05)
+        XCTAssertNil(timedOut)
+        XCTAssertThrowsError(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: metadata(status: .degraded))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("still being saved"))
+        }
+        release.signal()
+        let finished = await recorder.finish(timeoutSeconds: 3)
+        XCTAssertNotNil(finished)
+        XCTAssertEqual(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root,
+            metadata: metadata(status: .degraded)), 60, accuracy: 0.0001)
+    }
+
     private func metadata(status: MeetingStatus = .recording, oldDuration: Double = 0) -> MeetingMetadata {
         let created = Date(timeIntervalSince1970: 1_000_000)
         return MeetingMetadata(version: 1, title: "Interrupted session", createdAt: created,
@@ -177,4 +207,10 @@ final class OrphanedMeetingRecoveryTests: XCTestCase {
         XCTAssertEqual(evidence.durationSeconds, 300)
         XCTAssertEqual(evidence.sessions.first?.durationSeconds, 300)
     }
+}
+
+nonisolated private final class ResumeWriteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func next() -> Int { lock.withLock { value += 1; return value } }
 }
