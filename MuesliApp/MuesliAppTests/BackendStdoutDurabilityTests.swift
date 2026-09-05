@@ -92,6 +92,25 @@ final class BackendStdoutDurabilityTests: XCTestCase {
         XCTAssertNotNil(invalid.error)
     }
 
+    func testPublishedDurablePrefixSurvivesNextEventSyncStall() async throws {
+        let url = try journalURL()
+        let barrier = StdoutSyncBarrier()
+        let backend = try BackendProcess(command: ["/usr/bin/python3", "-c",
+            "import json\nfor i in range(602): print(json.dumps({'id':i}), flush=True)"], eventJournalURL: url,
+            beforeEventJournalIO: { checkpoint in barrier.hit(checkpoint) })
+        try backend.start()
+        defer { barrier.release.signal(); backend.forceKill(); backend.cleanup() }
+        XCTAssertEqual(barrier.entered.wait(timeout: .now() + 5), .success)
+        let timed = await backend.finishStdout(timeoutSeconds: 0.02)
+        XCTAssertEqual(timed.status.durableLines, 601)
+        let replay = TranscriptEventJournal.replay(url: url, start: timed.status.journalStartOffset,
+                                                  byteCount: timed.status.durableBytes)
+        XCTAssertEqual(replay.lines.count, 601)
+        XCTAssertNil(replay.error)
+        barrier.release.signal()
+        assertComplete(await backend.finishStdout(timeoutSeconds: 5))
+    }
+
     func testExitDoesNotDiscardTailAndValidFinalObjectWithoutNewline() async throws {
         let url = try journalURL()
         let backend = try python("import sys\nsys.stdout.write('{\"id\":1}\\n{\"id\":2}')", journal: url)
@@ -303,5 +322,17 @@ nonisolated private final class JournalFault: @unchecked Sendable {
     func failAfterFirstWrite() throws {
         let shouldFail = lock.withLock { count += 1; return count > 1 }
         if shouldFail { throw NSError(domain: NSPOSIXErrorDomain, code: 28) }
+    }
+}
+
+nonisolated private final class StdoutSyncBarrier: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var count = 0
+    func hit(_ checkpoint: BackendJournalCheckpoint) {
+        guard case .synchronize = checkpoint else { return }
+        let current = lock.withLock { count += 1; return count }
+        if current == 602 { entered.signal(); _ = release.wait(timeout: .now() + 5) }
     }
 }

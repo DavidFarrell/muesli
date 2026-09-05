@@ -848,10 +848,15 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stdout_writer = StdoutWriter()
+    protocol_stdout = sys.stdout
+    stdout_writer = StdoutWriter(protocol_stdout)
+    # Reserve the original stream for framed JSON events. Third-party model
+    # diagnostics must not corrupt the authoritative protocol journal.
+    sys.stdout = sys.stderr
     try:
         result = _run_backend(args, output_dir, stdout_writer)
     finally:
+        sys.stdout = protocol_stdout
         delivered = stdout_writer.close()
     return result if delivered else 1
 

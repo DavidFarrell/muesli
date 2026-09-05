@@ -388,6 +388,9 @@ nonisolated final class BackendOutputReader: @unchecked Sendable {
                 try journal.synchronize()
                 state.durableBytes = state.journaledBytes
                 state.durableLines = state.journaledLines
+                // The next event may block indefinitely in file IO. Publish
+                // this acknowledged prefix before that can happen.
+                publishSnapshot()
             } catch {
                 journalFailed = true
                 state.rejectedLines += 1

@@ -106,6 +106,31 @@ def test_stdout_close_delivers_all_final_events_without_daemon_tail_loss():
         writer.write("late")
 
 
+def test_main_reserves_stdout_for_json_and_routes_model_diagnostics_to_stderr(tmp_path, monkeypatch):
+    from diarise_transcribe import muesli_backend as backend
+    import io
+
+    protocol, diagnostics = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(backend.sys, "argv", ["muesli-backend", "--output-dir", str(tmp_path)])
+    monkeypatch.setattr(backend.sys, "stdout", protocol)
+    monkeypatch.setattr(backend.sys, "stderr", diagnostics)
+    # Presence is optional so the protocol regression also covers the frozen
+    # capture implementation before the separate offline preflight change.
+    monkeypatch.setattr(backend, "preflight", lambda *a, **kw: None, raising=False)
+
+    def run(args, directory, writer):
+        print("model library diagnostic")
+        backend.emit_jsonl({"type": "status", "message": "meeting_stopped"}, writer)
+        return 0
+
+    monkeypatch.setattr(backend, "_run_backend", run)
+    assert backend.main() == 0
+    assert [json.loads(line) for line in protocol.getvalue().splitlines()] == [
+        {"type": "status", "message": "meeting_stopped"}]
+    assert diagnostics.getvalue() == "model library diagnostic\n"
+    assert backend.sys.stdout is protocol
+
+
 def test_stdout_stall_has_bounded_queue_and_truthful_close_deadline():
     from diarise_transcribe.muesli_backend import StdoutWriter
     import threading
