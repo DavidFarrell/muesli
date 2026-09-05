@@ -215,4 +215,61 @@ final class SessionArtifactStoreTests: XCTestCase {
             XCTAssertTrue(try ledger(store).contains { $0["kind"] as? String == "screenshot_unavailable" })
         }
     }
+
+    func testBlockedNativeInvocationCannotBlockDeadlineOrAdmitAnotherRequest() async throws {
+        try await assertBlockedInvocationIsReported(callbackBeforeBlocking: false)
+    }
+
+    func testEarlyCallbackCannotReleaseAnInvocationThatStillBlocks() async throws {
+        try await assertBlockedInvocationIsReported(callbackBeforeBlocking: true)
+    }
+
+    private func assertBlockedInvocationIsReported(callbackBeforeBlocking: Bool) async throws {
+        nonisolated final class Invocation: @unchecked Sendable {
+            let entered = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let returned = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var count = 0
+            func invoke(_ reply: @escaping @Sendable (ScreenshotScheduler.Image?) -> Void, early: Bool) {
+                lock.withLock { count += 1 }
+                if early { reply(nil) }
+                entered.signal()
+                // Fail-safe release: a regression cannot leave a blocked test
+                // worker or suspend XCTest indefinitely.
+                _ = release.wait(timeout: .now() + 5)
+                if !early { reply(nil) }
+                returned.signal()
+            }
+            var invocationCount: Int { lock.withLock { count } }
+        }
+        let invocation = Invocation(), root = try folder()
+        defer { invocation.release.signal() }
+        let scheduler = ScreenshotScheduler(requestTimeoutSeconds: 0.05)
+        let first = try store(root)
+        let request: ScreenshotScheduler.Request = { reply in invocation.invoke(reply, early: callbackBeforeBlocking) }
+        scheduler.start(every: 60, store: first, request: request) { _ in XCTFail("unexpected image") }
+        scheduler.requestNow()
+        XCTAssertEqual(invocation.entered.wait(timeout: .now() + 2), .success)
+        // Only the independent deadline can report this: no scheduler tick is
+        // manually requested after the invocation blocks.
+        try await Task.sleep(for: .milliseconds(150))
+        let firstResult = await first.finish(timeoutSeconds: 1)
+        XCTAssertFalse(firstResult.status.isComplete)
+        XCTAssertTrue(try ledger(first).contains { $0["kind"] as? String == "screenshot_unavailable" })
+        XCTAssertEqual(invocation.returned.wait(timeout: .now()), .timedOut,
+                       "the failure must be durable while native invocation is still blocked")
+
+        scheduler.stop()
+        let second = try store(root)
+        scheduler.start(every: 60, store: second, request: request) { _ in XCTFail("unexpected image") }
+        for _ in 0..<20 { scheduler.requestNow() }
+        let secondResult = await second.finish(timeoutSeconds: 1)
+        XCTAssertFalse(secondResult.status.isComplete)
+        XCTAssertTrue(try ledger(second).contains { $0["kind"] as? String == "screenshot_unavailable" })
+        XCTAssertEqual(invocation.invocationCount, 1)
+        scheduler.stop()
+        invocation.release.signal()
+        XCTAssertEqual(invocation.returned.wait(timeout: .now() + 2), .success)
+    }
 }

@@ -78,3 +78,21 @@ Swift 6/default-MainActor artifact check pass. Logs:
 /private/tmp/muesli-f9-corrections-tests.log,
 /private/tmp/muesli-f9-corrections-release.log,
 /private/tmp/muesli-artifacts-strict.log.
+
+## Independent native request invocation
+
+The native screenshot function is invoked on a separate serial request queue.
+The scheduler and its deadline never execute that potentially blocking call.
+One slot remains owned until both the invocation returns and its actual callback
+arrives, so even an early callback followed by a blocked invocation cannot admit
+unbounded jobs behind the blocked native lane. Expiry keeps reporting unavailable
+ownership to later sessions without pretending to cancel the operation.
+
+Two additional regressions block the invocation itself, before and after its
+callback respectively. They assert durable deadline events in the original and
+resumed stores while the invocation is still blocked, with exactly one native
+invocation. A five-second fail-safe prevents stranded test workers. All eleven
+artifact tests pass; strict Swift 6/default-MainActor checks and Release pass.
+Logs: /private/tmp/muesli-screenshot-request-lane-tests.log,
+/private/tmp/muesli-screenshot-request-lane-strict.log,
+/private/tmp/muesli-screenshot-request-lane-release.log.

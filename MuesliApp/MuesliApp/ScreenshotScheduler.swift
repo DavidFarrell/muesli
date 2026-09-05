@@ -4,8 +4,8 @@ import CoreImage
 import CoreMedia
 
 /// One request remains outstanding across stop/start. The OS callback has no
-/// deadline/cancellation guarantee; a late reply only releases that request's
-/// slot and cannot adopt the current session's destination or event sink.
+/// deadline/cancellation guarantee. The slot requires both invocation return
+/// and callback receipt; neither can adopt a new session's destination or sink.
 nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     struct Image: @unchecked Sendable {
         let image: CGImage
@@ -19,6 +19,10 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
         let onCommitted: @Sendable (ScreenshotArtifact) -> Void
     }
     private let queue = DispatchQueue(label: "muesli.screenshots", qos: .utility)
+    // Framework invocation itself can block before returning, independently
+    // of whether its completion callback eventually fires. Keep it off the
+    // scheduler/deadline lane, with only one admitted invocation at a time.
+    private let requestQueue = DispatchQueue(label: "muesli.screenshot-request", qos: .utility)
     private let lock = NSLock()
     private let requestTimeoutSeconds: Double
     private let now: @Sendable () -> Double
@@ -28,6 +32,8 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     private var requestDeadlineTimer: DispatchSourceTimer?
     private var run: Run?
     private var outstanding: UUID?
+    private var invocationReturned = false
+    private var callbackReceived = false
     private var unavailableReportedForRun: UUID?
 
     init(requestTimeoutSeconds: Double = 10,
@@ -79,25 +85,40 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
         }
         let requestID = UUID()
         outstanding = requestID
+        invocationReturned = false
+        callbackReceived = false
         lock.withLock { pendingSince = now() }
         let deadline = DispatchSource.makeTimerSource(queue: queue)
         deadline.schedule(deadline: .now() + requestTimeoutSeconds)
         deadline.setEventHandler { [weak self] in self?.tick() }
         requestDeadlineTimer = deadline
         deadline.resume()
-        run.request { [weak self] image in
-            guard let self else { return }
-            self.queue.async { [self] in
-                guard self.outstanding == requestID else { return }
-                self.outstanding = nil
-                self.requestDeadlineTimer?.cancel()
-                self.requestDeadlineTimer = nil
-                self.lock.withLock { self.pendingSince = nil }
-                guard self.run?.id == run.id else { return }
-                guard let image else { run.store.recordScreenshotFailure(); return }
-                run.store.submitScreenshot(image.image, captureTimeUs: image.captureTimeUs, onCommitted: run.onCommitted)
+        requestQueue.async { [weak self] in
+            run.request { [weak self] image in
+                guard let self else { return }
+                self.queue.async { [self] in
+                    guard self.outstanding == requestID, !self.callbackReceived else { return }
+                    self.callbackReceived = true
+                    self.releaseResolvedRequest(requestID)
+                    guard self.run?.id == run.id else { return }
+                    guard let image else { run.store.recordScreenshotFailure(); return }
+                    run.store.submitScreenshot(image.image, captureTimeUs: image.captureTimeUs, onCommitted: run.onCommitted)
+                }
+            }
+            self?.queue.async { [weak self] in
+                guard let self, self.outstanding == requestID else { return }
+                self.invocationReturned = true
+                self.releaseResolvedRequest(requestID)
             }
         }
+    }
+
+    private func releaseResolvedRequest(_ requestID: UUID) {
+        guard outstanding == requestID, invocationReturned, callbackReceived else { return }
+        outstanding = nil
+        requestDeadlineTimer?.cancel()
+        requestDeadlineTimer = nil
+        lock.withLock { pendingSince = nil }
     }
 
     /// ScreenCaptureKit objects are immutable after setup and used by this
