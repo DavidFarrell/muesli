@@ -65,7 +65,7 @@ def identity(root, environment):
         names = {os.fsencode(path) for path in INPUTS.values()}
         for relative in SOURCE_ROOTS:
             for path in (root / relative).rglob("*"):
-                if "__pycache__" in path.parts or path.name == ".DS_Store":
+                if (relative == BACKEND + "/src" and path.parent.name == "__pycache__" and path.suffix == ".pyc") or path.name == ".DS_Store":
                     continue
                 if path.is_file() or path.is_symlink():
                     raw = os.fsencode(str(path.relative_to(root)))

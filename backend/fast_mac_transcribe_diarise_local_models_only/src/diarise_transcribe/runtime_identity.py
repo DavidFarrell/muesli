@@ -72,10 +72,12 @@ def observe_runtime(selected: dict | None) -> dict:
             # clustering configuration and native shims. No private path is an
             # output or part of the digest, so relocation preserves identity.
             extra = [entry for entry in selected["files"]
-                     if Path(entry["path"]).parent != directory]
+                     if entry.get("logical_name", "").startswith("senko/")]
             if extra:
-                hashes = sorted(file_hash(Path(entry["path"])) for entry in extra)
-                assets["senko_assets"] = hashlib.sha256("\n".join(hashes).encode()).hexdigest()
+                # Bind bytes to their role: swapping two valid clustering
+                # configs changes behavior even when the byte multiset is equal.
+                hashes = sorted((entry["logical_name"], file_hash(Path(entry["path"]))) for entry in extra)
+                assets["senko_assets"] = hashlib.sha256(json.dumps(hashes, separators=(",", ":")).encode()).hexdigest()
     except (OSError, KeyError, TypeError):
         assets = {}
     return {"schema_version": 1, "observation": "process_preflight",

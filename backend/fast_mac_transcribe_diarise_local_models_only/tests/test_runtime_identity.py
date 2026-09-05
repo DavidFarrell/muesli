@@ -53,3 +53,21 @@ def test_vcs_and_selected_native_tools_are_observed_without_direct_urls(tmp_path
     assert value['package_source_commits']['senko'] == 'a' * 40
     assert value['selected_tools_sha256']['ffmpeg'] == hashlib.sha256(executable.read_bytes()).hexdigest()
     assert 'Private checkout' not in json.dumps(value) and str(tmp_path) not in json.dumps(value)
+
+
+def test_senko_roles_survive_relocation_and_detect_swapped_configuration(tmp_path):
+    import shutil
+    root = tmp_path / 'private-original'; root.mkdir()
+    asr = root / 'asr'; asr.mkdir()
+    (asr / 'config.json').write_text('{}'); (asr / 'model.safetensors').write_bytes(b'weights')
+    spectral = root / 'spectral.yaml'; spectral.write_text('spectral settings')
+    umap = root / 'umap_hdbscan.yaml'; umap.write_text('umap settings')
+    def selected(base):
+        return {'asr_directory': str(base / 'asr'), 'files': [
+            {'path': str(base / 'spectral.yaml'), 'logical_name': 'senko/spectral.yaml'},
+            {'path': str(base / 'umap_hdbscan.yaml'), 'logical_name': 'senko/umap_hdbscan.yaml'}]}
+    first = runtime_identity.observe_runtime(selected(root))['model_assets_sha256']
+    relocated = tmp_path / 'relocated'; shutil.copytree(root, relocated)
+    assert runtime_identity.observe_runtime(selected(relocated))['model_assets_sha256'] == first
+    spectral.write_text('umap settings'); umap.write_text('spectral settings')
+    assert runtime_identity.observe_runtime(selected(root))['model_assets_sha256'] != first

@@ -97,3 +97,17 @@ def test_effective_compiler_flags_change_identity_without_disclosing_paths(tmp_p
     second = build.identity(tmp_path, {'OTHER_SWIFT_FLAGS': '-I /Users/private/include'})
     assert first['build_id'] != second['build_id']
     assert '/Users/' not in json.dumps(second)
+
+
+def test_cache_named_swift_directory_cannot_hide_ignored_compiler_input(tmp_path):
+    fixture(tmp_path)
+    (tmp_path / '.gitignore').write_text('__pycache__/\n')
+    git(tmp_path, 'init'); git(tmp_path, 'add', '.'); git(tmp_path, 'commit', '-m', 'Fixture')
+    before = build.identity(tmp_path, {})
+    code = tmp_path / 'MuesliApp/MuesliApp/__pycache__/Injected.swift'
+    code.parent.mkdir(); code.write_text('let injected = true')
+    assert not git(tmp_path, 'status', '--porcelain').strip()
+    after = build.identity(tmp_path, {})
+    assert after['source_dirty'] is True and after['build_id'] != before['build_id']
+    with pytest.raises(ValueError):
+        build.identity(tmp_path, {'ACTION': 'install'})
