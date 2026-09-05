@@ -9,8 +9,14 @@ import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from parakeet_mlx import from_pretrained
 from .local_assets import local_asr_directory
+
+
+def from_pretrained(directory: str):
+    # Hardware initialization belongs to model loading, after local preflight.
+    # Protocol/recovery commands and model-free tests must not require Metal.
+    from parakeet_mlx import from_pretrained as load_model
+    return load_model(directory)
 
 
 # Cache of loaded parakeet-mlx models keyed by model_id, so repeated

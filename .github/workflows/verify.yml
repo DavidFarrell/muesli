@@ -1,0 +1,38 @@
+name: Verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.11.3'
+          python-version: '3.12.13'
+          enable-cache: true
+          cache-dependency-glob: backend/fast_mac_transcribe_diarise_local_models_only/uv.lock
+      - name: Locked bootstrap, tests and Release compilation
+        run: bash scripts/verify.sh "$RUNNER_TEMP/muesli-verification"
+      - name: Retain verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verification-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/muesli-verification/*.log
+            ${{ runner.temp }}/muesli-verification/*.txt
+            ${{ runner.temp }}/muesli-verification/runtime-manifest.json
+            ${{ runner.temp }}/muesli-verification/DerivedData/Logs/Test/*.xcresult
+          retention-days: 14
