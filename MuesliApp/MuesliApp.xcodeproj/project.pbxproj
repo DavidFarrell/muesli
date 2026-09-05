@@ -35,6 +35,7 @@
 			membershipExceptions = (
 				AECMode.swift,
 				ArchiveReceipt.swift,
+				ArchiveProcessingEvidence.swift,
 				ArchiveSourceInventory.swift,
 				ArchiveSourceEligibility.swift,
 				ArchiveSourceReader.swift,
