@@ -528,3 +528,61 @@ def test_actual_producer_handoff_is_frozen_and_matches_canonical_output(tmp_path
             assert admitted.frame_count == 28000
     finally:
         Path(result).unlink()
+
+
+@pytest.mark.parametrize("producer", ["recovery", "normalization"])
+@pytest.mark.parametrize("mutation", ["missing", "header"])
+def test_format_read_race_after_producer_identity_check_is_fatal(tmp_path, monkeypatch, producer, mutation):
+    if producer == "normalization" and not reprocess.check_ffmpeg():
+        pytest.skip("local decoder unavailable")
+    wav(tmp_path / "audio/mic.wav", frames=16000 * 5, width=3 if producer == "normalization" else 2)
+    original_open = evidence.wave.open
+    changed = []
+    def mutate_at_format_read(file, mode=None):
+        if isinstance(file, str) and mode == "rb" and (
+                Path(file).name.startswith("recovery_slice_") if producer == "recovery"
+                else isinstance(file, str) and mode == "rb" and Path(file).name == "normalized.wav"):
+            changed.append(Path(file))
+            if mutation == "missing":
+                Path(file).unlink()
+            else:
+                with Path(file).open("r+b") as output:
+                    output.write(b"BAD!")
+        return original_open(file, mode)
+    monkeypatch.setattr(evidence.wave, "open", mutate_at_format_read)
+    seen = models(monkeypatch, words=[Word("word", .2, .4)], segments=[DiarSegment(1, 4, "speaker")])
+    rc, event = run(monkeypatch, tmp_path, "mic", recovery=producer == "recovery")
+    assert changed and rc == 1 and event["type"] == "error"
+    assert not event["processing"]["complete"]
+    entry = event["processing"]["entries"][1]
+    assert entry["failure_code"] == "InputChanged"
+    if producer == "recovery":
+        assert entry["recovery"]["outcome"] == "failed"
+        assert entry["recovery"]["windows"][0]["failure_code"] == "InputChanged"
+    assert len(seen) == (2 if producer == "recovery" else 0)
+    assert all(not path.exists() for path in changed)
+
+
+@pytest.mark.parametrize("cancellation", [KeyboardInterrupt, __import__("asyncio").CancelledError])
+def test_format_admission_preserves_cancellation_and_closes_original_descriptor(tmp_path, monkeypatch, cancellation):
+    from diarise_transcribe.audio import slice_wav_to_temp
+    wav(tmp_path / "input.wav")
+    produced = slice_wav_to_temp(str(tmp_path / "input.wav"), 0, 1, return_evidence=True)
+    opened = []
+    real_open = evidence.os.open
+    def capture_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if os.fspath(path) == os.fspath(produced): opened.append(fd)
+        return fd
+    def cancel_format(*_args, **_kwargs):
+        raise cancellation()
+    monkeypatch.setattr(evidence.os, "open", capture_open)
+    monkeypatch.setattr(evidence.wave, "open", cancel_format)
+    try:
+        with pytest.raises(cancellation):
+            evidence.ModelInput(Path(produced), expected=produced)
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
+    finally:
+        Path(produced).unlink(missing_ok=True)

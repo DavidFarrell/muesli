@@ -333,8 +333,10 @@ class ModelInput(OwnedFile):
                         raise ValueError("Truncated normalized model input")
                     remaining -= len(data) // 2
             self.verify()
-        except BaseException:
+        except BaseException as error:
             os.close(self.fd)
+            if expected is not None and isinstance(error, Exception) and not isinstance(error, InputChanged):
+                raise InputChanged("Produced WAV changed during format admission") from error
             raise
 
     def payload(self) -> ModelInputRecord:
