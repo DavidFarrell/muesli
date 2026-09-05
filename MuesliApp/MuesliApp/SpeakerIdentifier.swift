@@ -465,6 +465,7 @@ actor SpeakerIdentifier {
     }
 
     private func mappingTargetSpeakerIds(from speakerIds: [String]) -> [String] {
+        if speakerIds.contains(where: { TranscriptSpeakerIdentity(storageKey: $0) != nil }) { return speakerIds }
         let hasSystem = speakerIds.contains { $0.lowercased().hasPrefix("system:") }
         let hasMic = speakerIds.contains { $0.lowercased().hasPrefix("mic:") }
         if hasSystem && hasMic {
@@ -518,6 +519,9 @@ actor SpeakerIdentifier {
         if targetSpeakerIds.contains(compactRaw) {
             return compactRaw
         }
+        // Encoded identities are case-sensitive and must never be inferred
+        // from a numeric suffix or another source's diarizer label.
+        if targetSpeakerIds.contains(where: { TranscriptSpeakerIdentity(storageKey: $0) != nil }) { return nil }
         if let caseInsensitive = targetSpeakerIds.first(where: { $0.caseInsensitiveCompare(compactRaw) == .orderedSame }) {
             return caseInsensitive
         }
@@ -592,6 +596,12 @@ actor SpeakerIdentifier {
                 return mapping
             }
             return SpeakerMapping(speakerId: speakerId, name: "Unknown", confidence: 0.0)
+        }
+
+        if targetSpeakerIds.contains(where: { TranscriptSpeakerIdentity(storageKey: $0) != nil }) {
+            // Independent sessions may have the same real person or permuted
+            // labels. Neither stream nor name uniqueness establishes identity.
+            return normalizedMappings
         }
 
         let recorderNames = recorderNameCandidates(from: userHint)
@@ -910,6 +920,27 @@ actor SpeakerIdentifier {
     }
 
     private func buildPrompt(transcript: String, speakerIds: [String], userHint: String?) -> String {
+        if speakerIds.contains(where: { TranscriptSpeakerIdentity(storageKey: $0) != nil }) {
+            let identities = speakerIds.map { key in
+                "\(key) = \(TranscriptSpeakerIdentity(storageKey: key)?.description ?? key)"
+            }.joined(separator: "\n")
+            return """
+            Suggest speaker names only where evidence identifies the exact source, stream and original label below.
+            Each opaque speaker_id belongs to one source/session and stream. Labels may be permuted between sessions.
+            Do not transfer a name across sessions, merge equal labels, or assume microphone audio identifies the recorder.
+            A name visible in a screenshot proves presence, not who spoke. These images have no verified source/time binding;
+            do not use them alone to assign a name to any transcript turn. Keep unsupported or conflicting identities Unknown.
+            A user hint is a clue requiring evidence, not a mapping to apply to every source.
+            Return the EXACT opaque speaker_id, preserving case. The same real name may occur in independently evidenced sources.
+            User hint: \(userHint ?? "none")
+            Identities:
+            \(identities)
+            Transcript excerpt:
+            \(sampleTranscript(transcript, speakerIds: speakerIds))
+            Return JSON array: [{"speaker_id": "exact ID", "name": "Full Name or Unknown", "confidence": 0.0}].
+            Use Unknown with confidence 0.0 when evidence is insufficient. All proposals will be reviewed by the user.
+            """
+        }
         let trimmedHint = userHint?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hintBlock: String
         if let trimmedHint, !trimmedHint.isEmpty {
@@ -1230,7 +1261,8 @@ actor SpeakerIdentifier {
             return []
         }
 
-        if let names = json as? [String],
+        if !targetSpeakerIds.contains(where: { TranscriptSpeakerIdentity(storageKey: $0) != nil }),
+           let names = json as? [String],
            names.count == targetSpeakerIds.count,
            !names.isEmpty {
             var mappings: [SpeakerMapping] = []

@@ -1807,23 +1807,13 @@ final class AppModel: ObservableObject {
     }
 
     private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
-        segments
-            .filter { !$0.isPartial }
-            .compactMap { seg -> String? in
-                let payload: [String: Any] = [
-                    "speaker_id": seg.speakerID,
-                    "stream": seg.stream,
-                    "t0": seg.t0,
-                    "t1": seg.t1 ?? seg.t0,
-                    "text": seg.text
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: payload),
-                   let line = String(data: data, encoding: .utf8) {
-                    return line
-                }
-                return nil
-            }
-            .joined(separator: "\n")
+        // Legacy export wrapper. Authoritative saves use the throwing encoder
+        // through TranscriptReplacement and TranscriptPersistenceStore.
+        do { return try TranscriptModel.jsonLines(from: segments) }
+        catch {
+            appendBackendLog("Failed to encode transcript JSONL: \(error.localizedDescription)", toTail: true)
+            return ""
+        }
     }
 
     private func writeTranscriptData(
@@ -3187,6 +3177,7 @@ final class AppModel: ObservableObject {
     }
 
     private func readMeetingMetadata(from folderURL: URL) throws -> MeetingMetadata {
+        try TranscriptPersistenceStore.shared.recover(in: folderURL)
         let data = try Data(contentsOf: meetingMetadataURL(for: folderURL))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -3479,51 +3470,13 @@ final class AppModel: ObservableObject {
 
     func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
         var didUpdate = false
-        let segmentIds = Set(transcriptModel.segments.map { $0.speakerID })
-        let hasSystemSegments = segmentIds.contains { $0.lowercased().hasPrefix("system:") }
-        let hasMicSegments = segmentIds.contains { $0.lowercased().hasPrefix("mic:") }
         for mapping in mappings {
-            let rawId = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmed = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !rawId.isEmpty, !trimmed.isEmpty else { continue }
-
-            let suffix = ":\(rawId)"
-            var targets = Set<String>()
-            for key in transcriptModel.speakerNames.keys where key.hasSuffix(suffix) || key == rawId {
-                targets.insert(key)
-            }
-            for id in segmentIds where id.hasSuffix(suffix) || id == rawId {
-                targets.insert(id)
-            }
-            if transcriptModel.speakerNames[rawId] != nil {
-                targets.insert(rawId)
-            }
-            if targets.isEmpty {
-                let parts = rawId.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-                if parts.count == 2 {
-                    let prefix = String(parts[0]).lowercased()
-                    let base = String(parts[1])
-                    if prefix == "system", !hasSystemSegments, hasMicSegments {
-                        let alt = "mic:\(base)"
-                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
-                            targets.insert(alt)
-                        }
-                    } else if prefix == "mic", !hasMicSegments, hasSystemSegments {
-                        let alt = "system:\(base)"
-                        if segmentIds.contains(alt) || transcriptModel.speakerNames[alt] != nil {
-                            targets.insert(alt)
-                        }
-                    }
-                }
-            }
-            guard !targets.isEmpty else { continue }
-            for target in targets {
-                transcriptModel.renameSpeaker(id: target, to: trimmed)
-                didUpdate = true
-            }
+            let id = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = mapping.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !name.isEmpty else { continue }
+            if transcriptModel.applySpeakerName(id: id, name: name) { didUpdate = true }
         }
-        guard didUpdate else { return }
-        persistSpeakerNames(to: meeting.folderURL)
+        if didUpdate { persistSpeakerNames(to: meeting.folderURL) }
     }
 
     func runBatchRediarization(
@@ -3566,34 +3519,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applyBatchRediarization(_ result: BatchRediarizer.Result, for meeting: MeetingHistoryItem) {
-        let segments = result.turns.map { turn in
-            TranscriptSegment(
-                speakerID: turn.speakerId,
-                stream: turn.stream,
-                t0: turn.t0,
-                t1: turn.t1,
-                text: turn.text,
-                isPartial: false
-            )
-        }
-        let sorted = segments.sorted { $0.t0 < $1.t0 }
-
-        transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        transcriptModel.segments = sorted
-        transcriptModel.speakerNames = [:]
-        if let last = sorted.last, !last.text.isEmpty {
-            transcriptModel.lastTranscriptText = last.text
-            transcriptModel.lastTranscriptAt = Date()
-        }
-
-        writeTranscriptFiles(for: meeting.folderURL, segments: sorted)
-        updateMeetingMetadataAfterRediarization(
-            folderURL: meeting.folderURL,
-            segmentCount: sorted.count,
-            lastTimestamp: sorted.map { $0.t1 ?? $0.t0 }.max() ?? 0,
-            durationSeconds: result.duration
-        )
+    func applyBatchRediarization(_ result: BatchRediarizer.Result, for meeting: MeetingHistoryItem) throws {
+        let metadata = try readMeetingMetadata(from: meeting.folderURL)
+        let replacement = try TranscriptReplacement(result: result, metadata: metadata)
+        try transcriptModel.applyReplacement(replacement, in: meeting.folderURL)
 
         if let updatedItem = buildMeetingHistoryItem(for: meeting.folderURL) {
             if let idx = meetingHistory.firstIndex(where: { $0.id == meeting.id }) {
@@ -3667,50 +3596,6 @@ final class AppModel: ObservableObject {
             try writeMeetingMetadata(metadata, to: folderURL)
         } catch {
             appendBackendLog("Failed to persist speaker names: \(error.localizedDescription)", toTail: true)
-        }
-    }
-
-    private func writeTranscriptFiles(for folderURL: URL, segments: [TranscriptSegment]) {
-        let jsonlURL = folderURL.appendingPathComponent("transcript.jsonl")
-        let txtURL = folderURL.appendingPathComponent("transcript.txt")
-
-        let jsonlString = buildTranscriptJSONL(from: segments)
-        let textString = transcriptModel.asPlainText()
-        let jsonlData = jsonlString.data(using: .utf8)
-        let textData = textString.data(using: .utf8)
-
-        writeTranscriptData(
-            jsonlData,
-            to: jsonlURL,
-            encodeFailure: "Failed to encode transcript JSONL.",
-            writeFailure: "Failed to write transcript JSONL"
-        )
-        writeTranscriptData(
-            textData,
-            to: txtURL,
-            encodeFailure: "Failed to encode transcript text.",
-            writeFailure: "Failed to write transcript text"
-        )
-    }
-
-    private func updateMeetingMetadataAfterRediarization(
-        folderURL: URL,
-        segmentCount: Int,
-        lastTimestamp: Double,
-        durationSeconds: Double
-    ) {
-        do {
-            var metadata = try readMeetingMetadata(from: folderURL)
-            metadata.updatedAt = Date()
-            metadata.segmentCount = segmentCount
-            metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
-            metadata.durationSeconds = max(metadata.durationSeconds, durationSeconds, lastTimestamp)
-            metadata.speakerNames = [:]
-            // Reprocessing cannot certify or repair capture integrity.
-
-            try writeMeetingMetadata(metadata, to: folderURL)
-        } catch {
-            appendBackendLog("Failed to update meeting.json after reprocess: \(error.localizedDescription)", toTail: true)
         }
     }
 
@@ -3970,7 +3855,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published var transcriptLoadError: String?
+
     private func loadTranscriptForViewer(from folderURL: URL) {
+        transcriptLoadError = nil
+        do { try TranscriptPersistenceStore.shared.recover(in: folderURL) }
+        catch {
+            transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
+            appendBackendLog("Transcript recovery required: \(error.localizedDescription)", toTail: true)
+            transcriptLoadError = "Transcript needs recovery: \(error.localizedDescription)"
+            return
+        }
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
         let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
         if FileManager.default.fileExists(atPath: transcriptURL.path) {
@@ -4128,7 +4023,10 @@ final class AppModel: ObservableObject {
                     for entry in known {
                         if let speakerID = entry["speaker_id"] as? String {
                             let name = (entry["name"] as? String) ?? speakerID
-                            speakerNames[speakerID] = name
+                            let source = entry["source_session_id"] as? String ?? obj["source_session_id"] as? String
+                            let stream = entry["stream"] as? String ?? obj["stream"] as? String ?? "unknown"
+                            let identity = TranscriptSpeakerIdentity(sourceSessionID: source, stream: stream, speakerID: speakerID)
+                            speakerNames[source == nil && stream == "unknown" ? speakerID : identity.storageKey] = name
                         }
                     }
                 }

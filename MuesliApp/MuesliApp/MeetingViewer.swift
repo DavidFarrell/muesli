@@ -29,6 +29,9 @@ struct MeetingViewer: View {
     var body: some View {
         VStack(spacing: 12) {
             header
+            if let error = model.transcriptLoadError {
+                Text(error).foregroundStyle(.red).textSelection(.enabled)
+            }
 
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 12) {
@@ -76,6 +79,10 @@ struct MeetingViewer: View {
                                     cancelRediarization()
                                 }
                                 .buttonStyle(.bordered)
+                            }
+
+                            if pendingRediarizeResult != nil && rediarizeError != nil {
+                                Button("Retry saving transcript") { showRediarizeConfirm = true }
                             }
 
                             if let rediarizeError {
@@ -176,9 +183,14 @@ struct MeetingViewer: View {
         .alert("Replace transcript?", isPresented: $showRediarizeConfirm) {
             Button("Replace", role: .destructive) {
                 if let result = pendingRediarizeResult {
-                    model.applyBatchRediarization(result, for: meeting)
+                    do {
+                        try model.applyBatchRediarization(result, for: meeting)
+                        pendingRediarizeResult = nil
+                        rediarizeError = nil
+                    } catch {
+                        rediarizeError = "Transcript was not replaced: \(error.localizedDescription)"
+                    }
                 }
-                pendingRediarizeResult = nil
                 showRediarizeConfirm = false
             }
             Button("Cancel", role: .cancel) {
@@ -272,8 +284,8 @@ struct MeetingViewer: View {
                     ForEach(transcript.segments.filter { !$0.isPartial }) { segment in
                         TranscriptRow(
                             segment: segment,
-                            displayName: transcript.displayName(for: segment.speakerID),
-                            onRename: { model.renameSpeaker(id: segment.speakerID, to: $0) }
+                            displayName: transcript.displayName(for: segment),
+                            onRename: { model.renameSpeaker(id: segment.speakerKey, to: $0) }
                         )
                         .id(segment.id)
                     }
@@ -502,7 +514,7 @@ struct MeetingViewer: View {
     private func speakerIdsForIdentification() -> [String] {
         var ids = Set<String>()
         for segment in transcript.segments where !segment.isPartial {
-            ids.insert(segment.speakerID)
+            ids.insert(segment.speakerKey)
         }
         return ids.sorted()
     }
@@ -512,7 +524,7 @@ struct MeetingViewer: View {
             .filter { !$0.isPartial }
             .map { segment in
                 let stream = segment.stream == "unknown" ? "" : "[\(segment.stream)] "
-                return "\(stream)t=\(String(format: "%.2f", segment.t0))s \(segment.speakerID): \(segment.text)"
+                return "[source \(segment.sourceSessionID ?? "legacy/unknown")] \(stream)t=\(String(format: "%.2f", segment.t0))s \(segment.speakerKey) (raw label \(segment.speakerID)): \(segment.text)"
             }
             .joined(separator: "\n")
     }
@@ -550,10 +562,10 @@ struct SpeakerMappingSheet: View {
             List {
                 ForEach(workingMappings.indices, id: \.self) { index in
                     HStack(spacing: 12) {
-                        Text(workingMappings[index].speakerId)
+                        Text(TranscriptSpeakerIdentity(storageKey: workingMappings[index].speakerId)?.description ?? workingMappings[index].speakerId)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .frame(width: 90, alignment: .leading)
+                            .frame(width: 200, alignment: .leading)
 
                         TextField("Name", text: Binding(
                             get: { workingMappings[index].name },

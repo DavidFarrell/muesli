@@ -14,16 +14,16 @@ struct SpeakersSheet: View {
             Text("Speakers")
                 .font(.title2).bold()
 
-            Text("Renaming here updates all transcript lines immediately.")
+            Text("Names apply to this speaker in this source and stream.")
                 .foregroundStyle(.secondary)
 
             List {
                 ForEach(speakerIDs, id: \.self) { id in
                     HStack {
-                        Text(id)
+                        Text(transcript.speakerLabel(for: id))
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .frame(width: 80, alignment: .leading)
+                            .frame(width: 210, alignment: .leading)
 
                         TextField("Name", text: Binding(
                             get: { transcript.displayName(for: id) },
@@ -61,10 +61,7 @@ struct SpeakersSheet: View {
     }
 
     private func allSpeakerIDs() -> [String] {
-        var ids = Set(transcript.speakerNames.keys)
-        for s in transcript.segments {
-            ids.insert(s.speakerID)
-        }
+        let ids = Set(transcript.segments.map(\.speakerKey))
         return ids.sorted()
     }
 }

@@ -32,6 +32,16 @@ struct TranscriptRow: View {
                             .cornerRadius(6)
                     }
 
+                    if let source = segment.sourceSessionID {
+                        Text("Source \(source)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 160)
+                            .help("Source/session: \(source)")
+                    }
+
                     Text(String(format: "t=%.2fs", segment.t0))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -51,7 +61,7 @@ struct TranscriptRow: View {
                     Text("Rename speaker")
                         .font(.headline)
 
-                    Text("Speaker ID: \(segment.speakerID)")
+                    Text(segment.speakerIdentity.description)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 

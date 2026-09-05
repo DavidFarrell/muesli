@@ -62,6 +62,8 @@
 				TempTranscriptCleanup.swift,
 				TaskCompletion.swift,
 				TranscriptModel.swift,
+				TranscriptPersistenceStore.swift,
+				TranscriptReplacement.swift,
 				WriteBacklogTracker.swift,
 			);
 			target = AA0000010000000000000005 /* MuesliAppTests */;
