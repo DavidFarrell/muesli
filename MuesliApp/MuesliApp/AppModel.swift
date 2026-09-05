@@ -3407,9 +3407,7 @@ final class AppModel: ObservableObject {
 
     private func canEditTranscript(in folder: URL) -> Bool {
         do {
-            guard transcriptModel.pendingReplacement?.folder != folder else {
-                throw TranscriptPersistenceStore.Failure.busy
-            }
+            try transcriptModel.assertNoPendingReplacement(in: folder)
             try TranscriptPersistenceStore.shared.assertReadable(in: folder)
             return true
         } catch {
@@ -3501,6 +3499,7 @@ final class AppModel: ObservableObject {
     func renameMeeting(folderURL: URL, to newTitle: String) throws -> String {
         let trimmed: String
         do {
+            try transcriptModel.assertNoPendingReplacement(in: folderURL)
             try TranscriptPersistenceStore.shared.assertReadable(in: folderURL)
             trimmed = try MeetingRenamer.rename(folderURL: folderURL, to: newTitle)
         } catch {

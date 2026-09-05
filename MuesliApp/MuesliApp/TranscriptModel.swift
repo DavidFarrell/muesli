@@ -154,6 +154,10 @@ final class TranscriptModel: ObservableObject {
         return !matches.isEmpty
     }
 
+    func assertNoPendingReplacement(in folder: URL) throws {
+        guard pendingReplacement?.folder != folder else { throw TranscriptPersistenceStore.Failure.busy }
+    }
+
     func renameSpeaker(id: String, to name: String) {
         speakerNames[id] = name
     }

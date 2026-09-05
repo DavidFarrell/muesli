@@ -178,9 +178,11 @@ extension TranscriptPersistenceStoreTests {
         stall.release.signal()
         _ = try await original.value(timeoutSeconds: 1)
         XCTAssertEqual(model.lastTranscriptText, "Previous", "late disk completion is not optimistic UI completion")
+        XCTAssertThrowsError(try model.assertNoPendingReplacement(in: folder), "title/name edits wait for observed completion even after disk ownership ends")
         try await model.applyReplacement(replacement, in: folder, store: store, timeoutSeconds: 1)
         XCTAssertEqual(model.segments.map(\.sourceSessionID), ["A", "B"])
         XCTAssertEqual(stall.count, 1, "retry must observe the original completed owner rather than write again")
+        XCTAssertNoThrow(try model.assertNoPendingReplacement(in: folder))
     }
 
     func testViewerChangeFencesLateSavePublication() async throws {
