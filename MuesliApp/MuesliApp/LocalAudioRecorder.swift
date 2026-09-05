@@ -9,7 +9,7 @@ import Darwin
 /// Synchronization: admission/status use `lock`; files and manifest use `queue`.
 /// No file operation runs under the admission lock or on MainActor. At most
 /// maxPendingBytes of audio and one drain work item can be pending at a time.
-nonisolated final class LocalAudioRecorder: @unchecked Sendable {
+nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     enum Source: String, Codable, CaseIterable, Sendable { case system, mic }
 
     struct StreamState: Codable, Sendable {
@@ -185,6 +185,30 @@ nonisolated final class LocalAudioRecorder: @unchecked Sendable {
         lock.unlock()
         if schedule { queue.async { [self] in drain() } }
         return true
+    }
+
+    func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data) {
+        guard type == .audio else { return }
+        record(source: stream == .mic ? .mic : .system, ptsUs: ptsUs, payload: payload)
+    }
+
+    func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {
+        noteLoss(source: stream == .mic ? .mic : .system, ptsUs: ptsUs, frames: frames, reason: reason)
+    }
+
+    /// Upstream bounded ingress reports rejected converted samples here.
+    /// No payload is retained and the same queue commits this loss ledger.
+    func noteLoss(source: Source, ptsUs: Int64, frames: Int64, reason: String) {
+        guard frames > 0, frames <= maximumDurationUs * 16_000 / 1_000_000 else { return }
+        lock.lock()
+        rejectedFrames[source, default: 0] += frames
+        let start: Int64? = ptsUs >= 0 && ptsUs <= maximumDurationUs
+            ? (ptsUs * 16_000 + 500_000) / 1_000_000 : nil
+        Self.addLoss(Loss(source: source.rawValue, reason: String(reason.prefix(128)),
+                          start_frame: start, end_frame: start.map { $0 + frames }, frames: frames),
+                     to: &rejectedLosses, omitted: &omittedLosses)
+        latestError = "Audio was lost before reaching the source recorder (" + String(reason.prefix(128)) + ")."
+        lock.unlock()
     }
 
     func status() -> Status {

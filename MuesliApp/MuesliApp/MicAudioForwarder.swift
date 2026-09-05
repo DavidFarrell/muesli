@@ -7,6 +7,11 @@ import Foundation
 /// restructuring `FramedWriter`. `FramedWriter` conforms in `BackendProcess.swift`.
 nonisolated protocol FrameSending: AnyObject, Sendable {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
+    func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String)
+}
+
+extension FrameSending {
+    nonisolated func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {}
 }
 
 /// Abstraction over a monotonic time source, used for the forwarder's
@@ -178,10 +183,10 @@ actor MicAudioForwarder {
     /// per-generation liveness state (frame count, first-frame flag, the
     /// generation's own `startedAt`) but deliberately does NOT touch
     /// `meetingEpochUs` - see `beginMeeting`.
-    func beginGeneration(_ generation: Int, writer: FrameSending?) {
+    func beginGeneration(_ generation: Int, writer: FrameSending?, outputEnabled: Bool = false) {
         self.generation = generation
         self.writer = writer
-        micOutputEnabled = false
+        micOutputEnabled = outputEnabled
         frameCount = 0
         lastFrameAt = nil
         hadFirstFrameThisGeneration = false

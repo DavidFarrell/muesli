@@ -5,6 +5,8 @@ import Foundation
 enum MeetingStatus: String, Codable {
     case recording
     case completed
+    case degraded
+    case interrupted
 }
 
 struct MeetingStreamInfo: Codable, Hashable {

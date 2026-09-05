@@ -35,6 +35,48 @@ final class LocalAudioRecorderTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testProductionIngressPersistsWhileUIBlockedAndInferenceIsKilled() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url, commitInterval: 0.05)
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        await forwarder.beginMeeting(epoch: CaptureTimeline(epochMicroseconds: 0))
+        await forwarder.beginGeneration(1, writer: recorder, outputEnabled: true)
+        let display = MicDeliveryDisplayMailbox { _ in }
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display)
+        let callback = ingress.callback()
+        // This deliberately unresponsive child stands in for inference. It
+        // never reads audio: the production sink now owns PCM independently.
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        defer { if child.isRunning { child.terminate() } }
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            for index in 0..<200 {
+                if index == 100 { child.terminate() }
+                let pcm = Data(repeating: 7, count: 320)
+                callback(CapturedMicAudio(data: pcm, captureTimeUs: Int64(index * 10_000), generation: 1,
+                    nativeSampleRate: 16000, nativeChannels: 1, nativeFrameCount: 160, formatEpoch: 1, outputSampleRate: 16000))
+                recorder.send(type: .audio, stream: .system, ptsUs: Int64(index * 10_000), payload: pcm)
+            }
+            let deadline = ProcessInfo.processInfo.systemUptime + 4
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if recorder.status().committedBytes == 128_000 { done.signal(); return }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+        await ingress.finish()
+        let result = await recorder.finish()
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.streams["mic"]?.committed_bytes, 64_000)
+        XCTAssertEqual(result.streams["system"]?.committed_bytes, 64_000)
+        XCTAssertEqual(result.streams["mic"]?.gap_frames, 0)
+        XCTAssertEqual(result.streams["mic"]?.overlap_frames, 0)
+    }
+
     func testDrainRetainsAcceptedPacketsAcrossFinishAndRepeatedFinish() async throws {
         let recorder = try LocalAudioRecorder(directory: folder())
         for i in 0..<200 {
