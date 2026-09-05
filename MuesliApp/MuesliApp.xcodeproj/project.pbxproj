@@ -40,6 +40,7 @@
 				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
+				BackendAdmissionOwner.swift,
 				BuildIdentity.swift,
 				BatchRediarizer.swift,
 				BackendLogWriter.swift,

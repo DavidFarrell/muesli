@@ -35,25 +35,6 @@ struct MeetingSession {
     let startedAt: Date
 }
 
-enum BackendPythonError: Error {
-    case venvOutside
-    case venvMissing
-    case venvNotExecutable
-
-    var message: String {
-        switch self {
-        case .venvOutside:
-            return "Backend venv points outside the backend folder. Recreate it with " +
-                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        case .venvMissing:
-            return "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        case .venvNotExecutable:
-            return "Backend venv python exists but is not executable. Recreate it with " +
-                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        }
-    }
-}
-
 enum SpeakerIdStatus: Equatable {
     case unknown
     case ready
@@ -298,6 +279,8 @@ final class AppModel: ObservableObject {
     // (mic buffers in MicAudioForwarder's pending ring, system audio in
     // CaptureEngine's) and the meeting is not presented as recording.
     private let backendStartupGate = BackendStartupGate()
+    private let backendAdmission = BackendAdmissionOwner()
+    private let batchRediarizer = BatchRediarizer()
     // 10s: the pre-read-loop cost is the module import chain (numpy/
     // soundfile/parakeet_mlx pulling in MLX/Metal), a few seconds on a cold
     // start - and most of it overlaps the capture/mic startup that runs
@@ -315,7 +298,6 @@ final class AppModel: ObservableObject {
     private var backendLogURL: URL?
     private var transcriptEventsURL: URL?
     private var currentTranscriptEventsStartOffset: UInt64 = 0
-    private var backendAccessURL: URL?
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let aecModeKey = "aecMode"
@@ -494,21 +476,6 @@ final class AppModel: ObservableObject {
         ], sandboxed: isSandboxed)
     }
 
-    private func resolveBackendPython(for root: URL) -> Result<String, BackendPythonError> {
-        let venvPythonURL = root.appendingPathComponent(".venv/bin/python")
-        if FileManager.default.fileExists(atPath: venvPythonURL.path) {
-            #if DEBUG
-            return .success(venvPythonURL.path)
-            #else
-            if Self.hasExecutePermissionBits(atPath: venvPythonURL.path) {
-                return .success(venvPythonURL.path)
-            }
-            return .failure(.venvNotExecutable)
-            #endif
-        }
-        return .failure(.venvMissing)
-    }
-
     /// Checks the file's POSIX mode bits directly. `FileManager.isExecutableFile`
     /// (access(2) with X_OK) is sandbox-filtered and returns false for files under a
     /// security-scoped user-selected folder even though spawning them works fine.
@@ -587,26 +554,6 @@ final class AppModel: ObservableObject {
                 backendFolderError = "Failed to save backend folder bookmark: \(error)"
             }
         }
-    }
-
-    private func startBackendAccess(for url: URL) -> Bool {
-        guard backendAccessURL == nil else { return true }
-        if url.startAccessingSecurityScopedResource() {
-            backendAccessURL = url
-            return true
-        }
-        return false
-    }
-
-    private func stopBackendAccess() {
-        if let url = backendAccessURL {
-            url.stopAccessingSecurityScopedResource()
-        }
-        backendAccessURL = nil
-    }
-
-    private func stopBackendAccess(for url: URL?) {
-        url?.stopAccessingSecurityScopedResource()
     }
 
     private func closeBackendLog() {
@@ -2278,6 +2225,11 @@ final class AppModel: ObservableObject {
             catch { appendBackendLog("Failed to decode saved attachments: \(error.localizedDescription)", toTail: true) }
         }
         transcriptModel.timestampOffset = timestampOffset
+        // The source and session now exist. Stop must be available during
+        // native setup and the bounded inference admission that follows.
+        isCapturing = true
+        activeScreen = .session
+        let sessionEventsURL = prepared.eventsURL
 
         do {
             try Task.checkCancellation()
@@ -2298,6 +2250,7 @@ final class AppModel: ObservableObject {
 
             sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
             try await captureEngine.startCapture(
                 contentFilter: audioFilter,
                 writer: recorder,
@@ -2305,12 +2258,15 @@ final class AppModel: ObservableObject {
                 timeline: captureTimeline,
                 audioOutputEnabled: true
             )
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
 
             resetMicDebugState()
             micStartTime = Date()
             await startMeetingMicEngine()
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
             let systemSampleRate = 16_000
             let systemChannels = 1
             let micSampleRate = micOutputSampleRate
@@ -2324,13 +2280,16 @@ final class AppModel: ObservableObject {
 
             if let backendProjectRoot {
                 do {
-                    _ = try launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir, folderURL: folderURL)
+                    try await launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir,
+                                                  folderURL: folderURL, recorder: recorder, eventsURL: sessionEventsURL)
                 } catch {
+                    guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
                     reportInferenceFailure(error.localizedDescription)
                 }
             } else {
                 reportInferenceFailure("No local transcription backend is configured.")
             }
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
 
             let meta: [String: Any] = [
                 "protocol_version": 1,
@@ -2377,141 +2336,94 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            isCapturing = true
-            activeScreen = .session
             scheduleMicStartupHealthCheck()
             startMicFramesWatchdog()
         } catch {
+            // Stop owns teardown once it retires this source. A late startup
+            // continuation must not touch its files or a subsequent meeting.
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            isFinalizing = true
+            defer { isFinalizing = false; isCapturing = false; activeScreen = .start }
             let pythonPath = backendPythonCandidatePath ?? "(unknown)"
             let nsError = error as NSError
             let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
-            shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
+            shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) sandboxed=\(isSandboxed) \(details)"
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
     }
 
-    /// Live inference may be absent or fail; source recording has a separate owner.
-    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL) throws -> FramedWriter {
-    guard startBackendAccess(for: backendProjectRoot) else {
-        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied."])
+    private func isCurrentSource(_ recorder: LocalAudioRecorder, eventsURL: URL) -> Bool {
+        isCapturing && !isFinalizing && sourceRecorder === recorder && transcriptEventsURL == eventsURL
     }
 
-    switch resolveBackendPython(for: backendProjectRoot) {
-    case .success(let backendPython):
-        if !FileManager.default.fileExists(atPath: backendPython) {
-            let message = "Backend python not found at \(backendPython)."
-            throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-        }
-        let transcribeStream: String
-        if transcribeSystem && transcribeMic {
-            transcribeStream = "both"
-        } else if transcribeSystem {
-            transcribeStream = "system"
-        } else {
-            transcribeStream = "mic"
-        }
-
-        var command = [
-            backendPython,
-            "-m",
-            "diarise_transcribe.muesli_backend",
-            "--emit-meters",
-            "--transcribe-stream",
-            transcribeStream,
-            "--output-dir",
-            audioDir.path
-        ]
-        command.append("--keep-wav")
-        command.append("--source-recording")
-        command.append("--live-asr-only")
-        #if DEBUG
-        command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
-        #endif
-        let baseEnv = ProcessInfo.processInfo.environment
-        let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        let mergedPath: String
-        if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
-            mergedPath = "\(defaultPath):\(existingPath)"
-        } else {
-            mergedPath = defaultPath
-        }
-        let backendEnv = [
-            "MUESLI_ALLOW_MODEL_DOWNLOADS": "0",
-            "HF_HUB_OFFLINE": "1",
-            "HF_HUB_DISABLE_TELEMETRY": "1",
-            "PYTHONPATH": backendProjectRoot.appendingPathComponent("src").path,
-            "PATH": mergedPath
-        ]
-        let backend = try BackendProcess(
-            command: command,
-            workingDirectory: backendProjectRoot,
-            environment: backendEnv,
-            eventJournalURL: transcriptEventsURL
-        )
-        let sessionFolderURL = folderURL
-        let sessionEventsURL = transcriptEventsURL
+    /// Live inference may be absent or fail; source recording has a separate owner.
+    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL,
+                                     recorder: LocalAudioRecorder, eventsURL: URL) async throws {
+        let transcribeStream = transcribeSystem && transcribeMic ? "both" : (transcribeSystem ? "system" : "mic")
         let sessionLogHandle = backendLogHandle
-        appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
-        appendBackendLog("PATH: \(mergedPath)", toTail: true)
-        appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
-        backend.onExit = { [weak self] status in
+        let onExit: @Sendable (Int32) -> Void = { [weak self] status in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                if isActiveSession && !self.isFinalizing {
-                    self.reportInferenceFailure("The transcription process exited (status \(status)).")
-                }
-                self.appendBackendLog(
-                    "Backend exited with status \(status)",
-                    toTail: isActiveSession,
-                    handle: sessionLogHandle
-                )
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                let active = self.isCurrentSource(recorder, eventsURL: eventsURL)
+                if active { self.reportInferenceFailure("The transcription process exited (status \(status)).") }
+                self.appendBackendLog("Backend exited with status \(status)", toTail: active, handle: sessionLogHandle)
             }
         }
-        backend.onStderrLine = { [weak self] line in
+        let onStderr: @Sendable (String) -> Void = { [weak self] line in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                self.appendBackendLog(
-                    "[stderr] \(line)",
-                    toTail: isActiveSession,
-                    handle: sessionLogHandle
-                )
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                self.appendBackendLog("[stderr] \(line)",
+                    toTail: self.isCurrentSource(recorder, eventsURL: eventsURL), handle: sessionLogHandle)
             }
         }
-        try backend.start()
+        let attempt = try backendAdmission.start(timeoutSeconds: 8) {
+            try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
+                var command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
+                    "--transcribe-stream", transcribeStream, "--output-dir", audioDir.path,
+                    "--keep-wav", "--source-recording", "--live-asr-only"]
+                #if DEBUG
+                command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
+                #endif
+                let backend = try BackendProcess(command: command, workingDirectory: backendProjectRoot,
+                    environment: BatchRediarizer.backendEnvironment(root: backendProjectRoot), eventJournalURL: eventsURL)
+                backend.onExit = onExit
+                backend.onStderrLine = onStderr
+                return backend
+            }
+        }
+        let outcome = await attempt.waitUntilReady()
+        guard isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
+            attempt.cancel()
+            throw CancellationError()
+        }
+        switch outcome {
+        case .ready: break
+        case .failed(let message): throw BackendAdmissionOwner.Failure(message: message)
+        case .timedOut, .cancelled: throw BackendAdmissionOwner.Failure.retired
+        }
+        // No await between the current-source fence, claim and UI publication.
+        let resources = try attempt.claim()
+        let backend = resources.backend
+        let createdWriter = resources.writer
         self.backend = backend
+        self.writer = createdWriter
+        currentTranscriptEventsStartOffset = backend.stdoutStatus().journalStartOffset
+        createdWriter.onWriteError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                self.handleBackendWriteError(error)
+            }
+        }
         stdoutTask?.cancel()
         stdoutTask = Task { @MainActor in
             for await line in backend.stdoutLines {
                 guard !Task.isCancelled else { break }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                self.handleBackendJSONLine(
-                    line,
-                    backendLogHandle: sessionLogHandle,
-                    ingestIntoLiveTranscript: isActiveSession,
-                    sessionFolderURL: sessionFolderURL
-                )
+                self.handleBackendJSONLine(line, backendLogHandle: sessionLogHandle,
+                    ingestIntoLiveTranscript: self.isCurrentSource(recorder, eventsURL: eventsURL),
+                    sessionFolderURL: folderURL)
             }
         }
-        let createdWriter = FramedWriter(stdinHandle: backend.stdin)
-        createdWriter.onWriteError = { [weak self] error in
-            Task { @MainActor [weak self] in
-                guard let self, self.transcriptEventsURL == sessionEventsURL else { return }
-                self.handleBackendWriteError(error)
-            }
-        }
-        self.writer = createdWriter
-        return createdWriter
-
-    case .failure(let error):
-        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: error.message])
-    }
-
     }
 
     /// Explicit teardown for a startMeeting() attempt that threw partway
@@ -2597,7 +2509,6 @@ final class AppModel: ObservableObject {
 
         closeBackendLog()
         closeTranscriptEventsLog()
-        stopBackendAccess()
 
         if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
@@ -2694,7 +2605,6 @@ final class AppModel: ObservableObject {
         let stoppingWriter = writer
         let stoppingStdoutTask = stdoutTask
         let stoppingBackendLogHandle = backendLogHandle
-        let stoppingBackendAccessURL = backendAccessURL
         let stoppingTranscriptEventsStartOffset = currentTranscriptEventsStartOffset
         let stoppingTranscriptEventsURL = transcriptEventsURL
         let stoppingTranscriptSegments = transcriptModel.segments.filter { !$0.isPartial }
@@ -2708,7 +2618,6 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
         backendLogURL = nil
         transcriptEventsURL = nil
-        backendAccessURL = nil
         currentTranscriptEventsStartOffset = 0
         clearAttachments()
 
@@ -2718,7 +2627,6 @@ final class AppModel: ObservableObject {
 
         guard let stoppingSession else {
             closeHandle(stoppingBackendLogHandle)
-            stopBackendAccess(for: stoppingBackendAccessURL)
             isFinalizing = false
             return
         }
@@ -2730,7 +2638,6 @@ final class AppModel: ObservableObject {
                 backend: stoppingBackend,
                 stdoutTask: stoppingStdoutTask,
                 backendLogHandle: stoppingBackendLogHandle,
-                backendAccessURL: stoppingBackendAccessURL,
                 transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
                 transcriptEventsURL: stoppingTranscriptEventsURL,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
@@ -2750,7 +2657,6 @@ final class AppModel: ObservableObject {
         backend: BackendProcess?,
         stdoutTask: Task<Void, Never>?,
         backendLogHandle: FileHandle?,
-        backendAccessURL: URL?,
         transcriptEventsStartOffset: UInt64,
         transcriptEventsURL: URL?,
         transcriptSegmentsSnapshot: [TranscriptSegment],
@@ -2767,7 +2673,6 @@ final class AppModel: ObservableObject {
             // serial queue - see BackendLogWriter.close's doc comment for
             // why this must not be a bare `handle.close()` here.
             backendLogWriter.close()
-            stopBackendAccess(for: backendAccessURL)
             isFinalizing = false
             // The home-level preview was blocked from (re)starting while
             // isFinalizing (see startHomeLevelPreviewNow's guard, item 4) -
@@ -3023,6 +2928,7 @@ final class AppModel: ObservableObject {
     /// native stop. Taking it closes screenshot admission immediately; pending
     /// SDK video callbacks continue to address this original session's ledger.
     private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        backendAdmission.retireAdmission()
         captureEngine.retireCaptureIntent()
         screenshotScheduler.stop()
         let store = sessionArtifactStore
@@ -3251,32 +3157,8 @@ final class AppModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Select the backend folder before reprocessing."]
             )
         }
-        guard startBackendAccess(for: backendProjectRoot) else {
-            throw NSError(
-                domain: "Muesli",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied. Re-select the folder."]
-            )
-        }
-        defer { stopBackendAccess() }
-
-        switch resolveBackendPython(for: backendProjectRoot) {
-        case .failure(let error):
-            throw NSError(
-                domain: "Muesli",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: error.message]
-            )
-        case .success(let backendPython):
-            let rediarizer = BatchRediarizer()
-            return try await rediarizer.run(
-                meetingDirectory: meeting.folderURL,
-                backendPython: backendPython,
-                backendRoot: backendProjectRoot,
-                stream: stream,
-                progressHandler: progressHandler
-            )
-        }
+        return try await batchRediarizer.run(meetingDirectory: meeting.folderURL,
+            backendRoot: backendProjectRoot, stream: stream, progressHandler: progressHandler)
     }
 
     func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {

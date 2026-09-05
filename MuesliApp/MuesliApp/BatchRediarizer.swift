@@ -85,23 +85,6 @@ actor BatchRediarizer {
         }
     }
 
-    nonisolated private final class ProcessStore: @unchecked Sendable {
-        private let lock = NSLock()
-        private var process: BackendProcess?
-        private var cancelled = false
-        func set(_ process: BackendProcess) throws {
-            try lock.withLock {
-                guard !cancelled else { throw CancellationError() }
-                self.process = process
-            }
-        }
-        func clear() { lock.withLock { process = nil } }
-        func cancel() {
-            let current = lock.withLock { cancelled = true; return process }
-            current?.terminate()
-        }
-    }
-
     /// Reader callbacks and the caller share only this bounded lock-owned state.
     /// Results are accepted directly from the reader, before its lossy UI view.
     nonisolated private final class Accumulator: @unchecked Sendable {
@@ -147,40 +130,62 @@ actor BatchRediarizer {
     }
 
     private let timeoutSeconds: Double
+    private let admission = BackendAdmissionOwner()
     init(timeoutSeconds: Double = 60 * 60) { self.timeoutSeconds = timeoutSeconds }
 
     func run(
         meetingDirectory: URL,
-        backendPython: String,
+        backendPython: String? = nil,
         backendRoot: URL,
         stream: Stream,
         progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
     ) async throws -> Result {
-        let command = [backendPython, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue]
-        return try await runCommand(command, backendRoot: backendRoot, progressHandler: progressHandler)
+        let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
+        return try await execute(progressHandler: progressHandler) { accumulator in
+            let build: (String) throws -> BackendProcess = { python in
+                let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue]
+                let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
+                Self.attach(backend, accumulator: accumulator, progressHandler: progressHandler)
+                return backend
+            }
+            if let backendPython { return BackendAdmissionOwner.Resources(backend: try build(backendPython)) }
+            return try BackendLaunchConfiguration.scoped(root: backendRoot, build: build)
+        }
     }
 
-    /// Internal command seam allows subprocess completion tests without models.
+    /// Runs the same production admission path with model-free child/IO seams.
     func runCommand(_ command: [String], backendRoot: URL,
+                    eventJournalURL: URL? = nil,
+                    beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
+                    launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil,
                     progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil) async throws -> Result {
-        let processStore = ProcessStore()
-        return try await withTaskCancellationHandler(operation: {
+        try await execute(progressHandler: progressHandler) { accumulator in
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot,
-                                             environment: backendEnvironment(root: backendRoot))
+                environment: Self.backendEnvironment(root: backendRoot), eventJournalURL: eventJournalURL,
+                beforeEventJournalIO: beforeEventJournalIO, launchCheckpoint: launchCheckpoint)
+            Self.attach(backend, accumulator: accumulator, progressHandler: progressHandler)
+            return BackendAdmissionOwner.Resources(backend: backend)
+        }
+    }
+
+    private func execute(progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+                         factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
+        let accumulator = Accumulator()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+        let attempt = try admission.start(timeoutSeconds: min(8, timeoutSeconds)) { try factory(accumulator) }
+        return try await withTaskCancellationHandler(operation: {
             do {
-                try processStore.set(backend)
-                try Task.checkCancellation()
-                let accumulator = Accumulator()
-                backend.onJSONLine = { line in
-                    if let progress = accumulator.receive(line), let progressHandler {
-                        // At most the finite set of named progress stages.
-                        Task { @MainActor in progressHandler(progress) }
-                    }
+                switch await attempt.waitUntilReady() {
+                case .ready: break
+                case .failed(let message): throw Self.failure(1, message)
+                case .timedOut: throw Self.failure(1, "Batch startup timed out; its original operation is still closing.")
+                case .cancelled: throw CancellationError()
                 }
-                backend.onStderrLine = { accumulator.receiveStderr($0) }
-                try backend.start()
                 try Task.checkCancellation()
-                let exitStatus = await backend.waitForExit(timeoutSeconds: timeoutSeconds)
+                let backend = try attempt.claim().backend
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                let seconds = max(0, Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18)
+                let exitStatus = await backend.waitForExit(timeoutSeconds: seconds)
                 try Task.checkCancellation()
                 guard let exitStatus else { throw Self.failure(1, "Batch reprocess timed out.") }
                 let drain = await backend.finishStdout(timeoutSeconds: 5)
@@ -195,34 +200,37 @@ actor BatchRediarizer {
                 }
                 guard let result else { throw Self.failure(3, "No batch reprocess output received.") }
                 backend.cleanup()
-                processStore.clear()
+                _ = await attempt.waitUntilClosed(timeoutSeconds: 2)
+                try Task.checkCancellation()
                 if let progressHandler { await progressHandler(.complete) }
                 return result
             } catch {
-                // A cancelled task cannot meaningfully wait on a completion
-                // gate. One finite cleanup task owns SIGTERM -> SIGKILL and EOF.
-                await Task.detached { await Self.shutdown(backend) }.value
-                processStore.clear()
+                // Cancelling the wait neither closes the journal nor releases
+                // the original child/scope. Admission stays busy until real cleanup.
+                attempt.cancel()
+                // Preserve the prompt native-exit barrier when it can finish,
+                // but a blocked setup/close cannot hold a cancelled UI caller.
+                _ = await Task.detached { await attempt.waitUntilClosed(timeoutSeconds: 2) }.value
                 throw error
             }
-        }, onCancel: { processStore.cancel() })
+        }, onCancel: { attempt.cancel() })
+    }
+
+    nonisolated private static func attach(_ backend: BackendProcess, accumulator: Accumulator,
+                                          progressHandler: (@MainActor @Sendable (Progress) -> Void)?) {
+        backend.onJSONLine = { line in
+            if let progress = accumulator.receive(line), let progressHandler {
+                Task { @MainActor in progressHandler(progress) }
+            }
+        }
+        backend.onStderrLine = { accumulator.receiveStderr($0) }
     }
 
     nonisolated private static func failure(_ code: Int, _ message: String) -> NSError {
         NSError(domain: "BatchRediarizer", code: code, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
-    @concurrent private static func shutdown(_ backend: BackendProcess) async {
-        backend.terminate()
-        if await backend.waitForExit(timeoutSeconds: 0.5) == nil {
-            backend.forceKill()
-            _ = await backend.waitForExit(timeoutSeconds: 1)
-        }
-        _ = await backend.finishStdout(timeoutSeconds: 1)
-        backend.cleanup()
-    }
-
-    private func backendEnvironment(root: URL) -> [String: String] {
+    nonisolated static func backendEnvironment(root: URL) -> [String: String] {
         let baseEnv = ProcessInfo.processInfo.environment
         let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         let numbaCacheDir = FileManager.default.temporaryDirectory

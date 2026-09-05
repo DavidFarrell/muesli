@@ -79,7 +79,7 @@ nonisolated struct BackendStdoutStatus: Sendable {
     var isComplete: Bool { reachedEOF && closed && firstError == nil }
 }
 
-nonisolated enum BackendJournalCheckpoint: Sendable { case write, synchronize, finalSynchronize }
+nonisolated enum BackendJournalCheckpoint: Sendable { case prepare, write, synchronize, finalSynchronize }
 
 nonisolated enum BackendStdoutDrainResult: Sendable {
     /// Reader resources closed; inspect isComplete. Explicit cleanup without
@@ -184,6 +184,7 @@ nonisolated final class BackendOutputReader: @unchecked Sendable {
                     guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
                         throw failure("Another reader still owns this event journal.")
                     }
+                    try beforeJournalIO?(.prepare)
                     let offset = try handle.seekToEnd()
                     if offset > 0 {
                         try handle.seek(toOffset: offset - 1)
