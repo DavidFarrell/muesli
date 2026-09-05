@@ -25,7 +25,7 @@ import Foundation
 /// Mutated only under `FramedWriter`'s state lock; takes explicit `now:`
 /// dates rather than reading the clock so tests control time (same pattern
 /// as `MeterPublishGate`).
-struct WriteBacklogTracker {
+nonisolated struct WriteBacklogTracker {
     /// Default cap ≈ 32s of two-stream 16kHz mono int16 audio (64KB/s).
     /// Deliberately generous: a healthy backend keeps the backlog near zero,
     /// and a transient consumer pause (disk hiccup mid `write_aligned_audio`)

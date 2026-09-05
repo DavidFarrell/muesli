@@ -815,7 +815,7 @@ enum AudioDeviceManager {
     }
 
     /// Stable device UID (`kAudioDevicePropertyDeviceUID`).
-    static func deviceUID(_ id: AudioObjectID) -> String? {
+    nonisolated static func deviceUID(_ id: AudioObjectID) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,
             mScope: kAudioObjectPropertyScopeGlobal,

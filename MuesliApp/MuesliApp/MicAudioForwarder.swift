@@ -5,7 +5,7 @@ import Foundation
 /// and can't be constructed in a unit test, so `MicAudioForwarderTests` uses
 /// a fake conforming to this protocol to capture sent frames instead of
 /// restructuring `FramedWriter`. `FramedWriter` conforms in `BackendProcess.swift`.
-protocol FrameSending: AnyObject {
+nonisolated protocol FrameSending: AnyObject, Sendable {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
 }
 
@@ -17,25 +17,18 @@ protocol FrameSending: AnyObject {
 /// rules `Date` out for this purpose: an NTP step mid-meeting would corrupt
 /// the PTS timeline the backend's `write_aligned_audio` aligns writes
 /// against. Production uses `SystemMicMonotonicClock`.
-protocol MicMonotonicClock: Sendable {
+nonisolated protocol MicMonotonicClock: Sendable {
     /// Monotonically non-decreasing microseconds. Only differences between
     /// two calls carry meaning - the absolute value has no defined epoch.
     func nowMicroseconds() -> Int64
 }
 
-/// Production clock: wraps `ContinuousClock`, which - unlike `SuspendingClock`
-/// - keeps advancing across machine sleep, so a sleep/wake cycle mid-meeting
-/// still produces a PTS gap the backend pads with silence rather than a
-/// clock that silently stops (and unlike `Date`, is immune to NTP steps).
-struct SystemMicMonotonicClock: MicMonotonicClock {
-    private static let clock = ContinuousClock()
-    private static let referenceInstant = clock.now
+/// Host-clock epoch factory for compatibility with injected test clocks.
+/// Packet timestamps always come from native capture, never this clock at
+/// delivery. Sleep policy and cross-source calibration live in CaptureTimeline.
+nonisolated struct SystemMicMonotonicClock: MicMonotonicClock {
+    func nowMicroseconds() -> Int64 { CaptureTimeline.hostNowMicroseconds() }
 
-    func nowMicroseconds() -> Int64 {
-        let elapsed = Self.clock.now - Self.referenceInstant
-        let components = elapsed.components
-        return components.seconds * 1_000_000 + components.attoseconds / 1_000_000_000_000
-    }
 }
 
 /// Confines the mic-audio hot path (level compute + `FramedWriter` delivery)
@@ -57,13 +50,8 @@ struct SystemMicMonotonicClock: MicMonotonicClock {
 /// touching per-buffer state on MainActor - critical so the watchdog's stall
 /// detection stays correct even when MainActor itself is temporarily busy
 /// (a delayed MainActor mirror must never be misread as "mic stopped").
-/// Mic-side pending buffer entry, queued between tap install and
-/// `setOutputEnabled(true)`. Deliberately NOT shared with the system-audio
-/// side's pending-buffer type (`PendingAudioGate.Item`) - keeping the two
-/// independent means this file has no dependency on the capture-side
-/// machinery, which is out of scope for the 2026-07-08 mic-stall fix (see
-/// that RCA) and unnecessary weight for `MicAudioForwarderTests` to compile
-/// against.
+/// Separate forwarder instances own microphone and system state. Sharing this
+/// implementation does not couple source generations, readiness or shutdown.
 private struct MicPendingAudio {
     let ptsUs: Int64
     let payload: Data
@@ -117,15 +105,18 @@ actor MicAudioForwarder {
     // re-detect the same stall.
     private let resumptionGapThresholdSeconds: TimeInterval = 2.0
 
+    private let stream: StreamID
     private let sampleRate: Int
     private let channels: Int
 
     init(
         sampleRate: Int,
         channels: Int,
+        stream: StreamID = .mic,
         clock: MicMonotonicClock = SystemMicMonotonicClock(),
         maxPendingBytes: Int = 2 * 1024 * 1024
     ) {
+        self.stream = stream
         self.sampleRate = sampleRate
         self.channels = channels
         self.clock = clock
@@ -143,8 +134,8 @@ actor MicAudioForwarder {
     /// output file position keeps advancing, and the backend would silently
     /// drop every mic frame until the new PTS clock caught back up (see
     /// `engineer-notes/bug-2026-07-08-mic-stall/RCA-2026-07-08.md`).
-    func beginMeeting() {
-        meetingEpochUs = clock.nowMicroseconds()
+    func beginMeeting(epoch: CaptureTimeline? = nil) {
+        meetingEpochUs = epoch?.epochMicroseconds ?? clock.nowMicroseconds()
     }
 
     /// Clears the meeting epoch at true meeting end. Deliberately separate
@@ -160,7 +151,7 @@ actor MicAudioForwarder {
     /// Ground-truth liveness data, cheap enough to poll from a background
     /// watchdog or hop to MainActor periodically - never the per-buffer
     /// values themselves.
-    struct Snapshot {
+    nonisolated struct Snapshot: Sendable {
         let frameCount: Int
         let lastFrameAt: Date?
         let startedAt: Date?
@@ -216,7 +207,7 @@ actor MicAudioForwarder {
         pendingMicAudio.removeAll()
         pendingMicBytes = 0
         for item in pending {
-            writer?.send(type: .audio, stream: .mic, ptsUs: item.ptsUs, payload: item.payload)
+            writer?.send(type: .audio, stream: stream, ptsUs: item.ptsUs, payload: item.payload)
         }
     }
 
@@ -234,9 +225,10 @@ actor MicAudioForwarder {
 
     /// Everything a caller needs to update MainActor-side bookkeeping after a
     /// delivery that was worth surfacing (see `deliver`'s gating below).
-    struct DeliveryResult {
+    nonisolated struct DeliveryResult: Sendable {
         let level: Float
         let frameSampleCount: Int
+        let totalFrameCount: Int
         /// Seconds since the MEETING epoch (`beginMeeting`), not since this
         /// generation started - restores the pre-2026-07-06 meaning of the
         /// old `debugMicPTS` display value. See `MicAudioForwarder`'s and
@@ -251,8 +243,16 @@ actor MicAudioForwarder {
         /// logging; `AppModel` doesn't need to branch on it for correctness
         /// since it resets the recovery ladder on attempts/parked state too.
         let isResumptionAfterGap: Bool
+
+        func mergingRecoveryFlags(from previous: DeliveryResult?) -> DeliveryResult {
+            DeliveryResult(level: level, frameSampleCount: frameSampleCount, totalFrameCount: totalFrameCount,
+                           elapsedSeconds: elapsedSeconds,
+                           isFirstFrame: isFirstFrame || previous?.isFirstFrame == true,
+                           isResumptionAfterGap: isResumptionAfterGap || previous?.isResumptionAfterGap == true)
+        }
     }
 
+    // Recovery flags survive latest-only UI coalescing.
     /// The hot path: always computes level and forwards/queues the buffer
     /// (audio delivery must never depend on whether MainActor is free to
     /// receive a notification about it). Returns `nil` when there is nothing
@@ -265,23 +265,12 @@ actor MicAudioForwarder {
     /// (which gives up without rebuilding the engine, so no new generation
     /// ever starts) un-park on a silent resumption instead of staying parked
     /// forever (see that type's doc comment).
-    func deliver(_ data: Data, generation callerGeneration: Int) -> DeliveryResult? {
-        guard callerGeneration == generation else { return nil }
+    func deliver(_ packet: CapturedMicAudio) -> DeliveryResult? {
+        guard packet.generation == generation, let meetingEpochUs else { return nil }
+        let data = packet.data
         let now = Date()
-        // `startedAt` is per-generation bookkeeping only (part of the
-        // liveness `Snapshot`) - it plays no part in the PTS computation
-        // below any more. See `meetingEpochUs`/`beginMeeting` for the actual
-        // PTS anchor.
         if startedAt == nil { startedAt = now }
-        let nowUs = clock.nowMicroseconds()
-        // `meetingEpochUs` should always be set by the time a frame arrives
-        // (AppModel calls `beginMeeting()` before `startMeetingMicEngine()`
-        // ever runs) - this self-heals rather than crashing or emitting a
-        // nonsensical negative PTS in case that invariant is ever violated,
-        // treating an unexpectedly-epoch-less first frame as meeting-timeline
-        // zero.
-        if meetingEpochUs == nil { meetingEpochUs = nowUs }
-        let ptsUs = nowUs - (meetingEpochUs ?? nowUs)
+        let ptsUs = packet.captureTimeUs - meetingEpochUs
         let isFirstFrame = !hadFirstFrameThisGeneration
         hadFirstFrameThisGeneration = true
         let secondsSinceLastFrame = lastFrameAt.map { now.timeIntervalSince($0) }
@@ -291,8 +280,8 @@ actor MicAudioForwarder {
         lastFrameAt = now
 
         if micOutputEnabled {
-            writer?.send(type: .audio, stream: .mic, ptsUs: ptsUs, payload: data)
-        } else {
+            writer?.send(type: .audio, stream: stream, ptsUs: ptsUs, payload: data)
+        } else if writer != nil {
             pendingMicAudio.append(MicPendingAudio(
                 ptsUs: ptsUs, payload: data, sampleRate: sampleRate, channels: channels
             ))
@@ -306,7 +295,8 @@ actor MicAudioForwarder {
                 // being lost, which should never happen inside the sized
                 // window - worth a log line, not one per frame.
                 if pendingEvictedFrames == 1 || pendingEvictedFrames % 256 == 0 {
-                    AudioLog.error("mic.pending.evicted", [
+                    AudioLog.error("capture.pending.evicted", [
+                        "stream": stream.rawValue,
                         "evictedFrames": pendingEvictedFrames,
                         "evictedBytes": pendingEvictedBytes
                     ])
@@ -326,6 +316,7 @@ actor MicAudioForwarder {
         return DeliveryResult(
             level: level,
             frameSampleCount: data.count / 2,
+            totalFrameCount: frameCount,
             elapsedSeconds: Double(ptsUs) / 1_000_000.0,
             isFirstFrame: isFirstFrame,
             isResumptionAfterGap: mustSurface && !isFirstFrame

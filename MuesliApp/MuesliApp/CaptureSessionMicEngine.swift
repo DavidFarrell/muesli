@@ -32,34 +32,34 @@ actor CaptureSessionMicEngine: MicCapturing {
     private var session: AVCaptureSession?
     private var audioOutput: AVCaptureAudioDataOutput?
     private var isRunning = false
-    private var onAudioData: ((Data) -> Void)?
+    private var processor: MicCaptureProcessor?
     private var observers: [NSObjectProtocol] = []
     private var delegateRelay: SampleBufferRelay?
-    private var convertFailures = 0
-    private var firstBufferLogged = false
 
-    // AVCaptureAudioDataOutput callbacks arrive off-actor on this queue; the
-    // relay hops them onto the actor via Task, mirroring MicEngine's tap
-    // closure (which does the same from a CoreAudio realtime thread).
+    // AVCaptureAudioDataOutput callbacks stay on this queue through native
+    // timestamp mapping and conversion, then enter the bounded ingress.
     private let sampleQueue = DispatchQueue(label: "com.muesli.capturesession.audio")
 
     func start(
+        generation: Int,
         enableVoiceProcessing: Bool,
         preferredInputDeviceID: UInt32?,
         pinned: Bool,
         onConfigurationChange: (@Sendable () -> Void)?,
-        onAudioData: @escaping (Data) -> Void
+        onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) throws {
         guard !isRunning else { return }
         guard let preferredInputDeviceID, let uid = AudioDeviceManager.deviceUID(preferredInputDeviceID) else {
             throw CaptureSessionMicEngineError.deviceNotFound(uid: "none")
         }
 
-        self.onAudioData = onAudioData
+        self.processor = MicCaptureProcessor(generation: generation, output: onAudioData)
         do {
             try startSession(deviceUID: uid, onConfigurationChange: onConfigurationChange)
         } catch {
             AudioLog.error("capturesession.start.fail", ["uid": uid, "error": String(describing: error)])
+            processor?.finish()
+            processor = nil
             throw error
         }
         AudioLog.event("capturesession.start.ok", ["uid": uid, "pinned": pinned])
@@ -91,11 +91,8 @@ actor CaptureSessionMicEngine: MicCapturing {
         guard session.canAddOutput(output) else { throw CaptureSessionMicEngineError.cannotAddOutput }
         session.addOutput(output)
 
-        let relay = SampleBufferRelay { [weak self] sampleBuffer in
-            Task { [weak self] in
-                await self?.handleSampleBuffer(sampleBuffer)
-            }
-        }
+        guard let processor else { throw AudioConverterHelper.ConversionError.invalidFormat }
+        let relay = SampleBufferRelay(processor: processor, session: session)
         output.setSampleBufferDelegate(relay, queue: sampleQueue)
         delegateRelay = relay
         audioOutput = output
@@ -133,14 +130,14 @@ actor CaptureSessionMicEngine: MicCapturing {
         let callback = onConfigurationChange
 
         let runtimeErrorObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureSessionRuntimeError, object: session, queue: nil
+            forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { note in
             let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
             AudioLog.error("capturesession.runtime-error", ["error": String(describing: error)])
             callback()
         }
         let disconnectObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureDeviceWasDisconnected, object: device, queue: nil
+            forName: AVCaptureDevice.wasDisconnectedNotification, object: device, queue: nil
         ) { _ in
             AudioLog.event("capturesession.device-disconnected")
             callback()
@@ -148,60 +145,9 @@ actor CaptureSessionMicEngine: MicCapturing {
         observers = [runtimeErrorObserver, disconnectObserver]
     }
 
-    private func handleSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            noteConversionFailure(reason: "no-format-description")
-            return
-        }
-        let avFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
-
-        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard numSamples > 0,
-              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: avFormat, frameCapacity: AVAudioFrameCount(numSamples)) else {
-            noteConversionFailure(reason: "pcm-buffer-alloc")
-            return
-        }
-        pcmBuffer.frameLength = AVAudioFrameCount(numSamples)
-
-        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
-            sampleBuffer,
-            at: 0,
-            frameCount: Int32(numSamples),
-            into: pcmBuffer.mutableAudioBufferList
-        )
-        guard status == noErr else {
-            noteConversionFailure(reason: "copy-pcm-status-\(status)")
-            return
-        }
-
-        guard let data = AudioConverterHelper.convertToInt16(buffer: pcmBuffer) else {
-            noteConversionFailure(reason: "int16-convert")
-            return
-        }
-
-        if !firstBufferLogged {
-            firstBufferLogged = true
-            AudioLog.event("capturesession.first-buffer", [
-                "sampleRate": avFormat.sampleRate,
-                "channels": avFormat.channelCount
-            ])
-        }
-        onAudioData?(data)
-    }
-
-    private func noteConversionFailure(reason: String) {
-        convertFailures += 1
-        if convertFailures == 1 {
-            AudioLog.error("capturesession.convert.fail", ["reason": reason])
-        }
-    }
-
     func stop() async {
         guard isRunning else { return }
         isRunning = false
-        onAudioData = nil
-        firstBufferLogged = false
-        convertFailures = 0
 
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)
@@ -221,6 +167,8 @@ actor CaptureSessionMicEngine: MicCapturing {
         AudioLog.event("capturesession.stop")
 
         runningSession?.stopRunning()
+        processor?.finish()
+        processor = nil
     }
 
     /// Maps a CoreAudio device UID (`kAudioDevicePropertyDeviceUID` - the same
@@ -242,18 +190,18 @@ actor CaptureSessionMicEngine: MicCapturing {
 
 /// AVCaptureAudioDataOutput requires an NSObject delegate; the engine itself
 /// is an actor and cannot conform directly. This just forwards each buffer.
-private final class SampleBufferRelay: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
-    private let onSampleBuffer: (CMSampleBuffer) -> Void
+nonisolated private final class SampleBufferRelay: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let processor: MicCaptureProcessor
+    private let session: AVCaptureSession
 
-    init(onSampleBuffer: @escaping (CMSampleBuffer) -> Void) {
-        self.onSampleBuffer = onSampleBuffer
+    init(processor: MicCaptureProcessor, session: AVCaptureSession) {
+        self.processor = processor
+        self.session = session
     }
 
-    func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        onSampleBuffer(sampleBuffer)
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // Session PTS may use its audio-device clock. Convert explicitly to
+        // the common host domain; never substitute callback arrival time.
+        processor.receive(sampleBuffer, sourceClock: session.synchronizationClock)
     }
 }

@@ -15,13 +15,21 @@ import os
 ///
 /// Every line is also mirrored into an optional in-app `sink` so it shows up in
 /// the backend log tail without needing Console.
-enum AudioLog {
+nonisolated enum AudioLog {
     static let log = Logger(subsystem: "com.muesli.audio", category: "device")
 
     /// Optional mirror into the app UI, installed once by `AppModel`. It is read
     /// from CoreAudio listener callbacks on arbitrary queues, so the sink itself
     /// is responsible for hopping to the main actor. Set-once at launch.
-    nonisolated(unsafe) static var sink: ((String) -> Void)?
+    private final class SinkStore: @unchecked Sendable {
+        let lock = NSLock()
+        var value: (@Sendable (String) -> Void)?
+    }
+    private static let store = SinkStore()
+    static var sink: (@Sendable (String) -> Void)? {
+        get { store.lock.withLock { store.value } }
+        set { store.lock.withLock { store.value = newValue } }
+    }
 
     static func event(_ key: String, _ fields: [String: Any] = [:]) {
         let line = format(key, fields)

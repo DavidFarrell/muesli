@@ -158,26 +158,30 @@ nonisolated final class BackendProcess {
 
 // MARK: - Framed Writer
 
-enum StreamID: UInt8 {
+nonisolated enum StreamID: UInt8 {
     case system = 0
     case mic = 1
 }
 
-enum MsgType: UInt8 {
+nonisolated enum MsgType: UInt8 {
     case audio = 1
     case screenshotEvent = 2
     case meetingStart = 3
     case meetingStop = 4
 }
 
-final class FramedWriter: FrameSending {
+nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
     /// Frame header size: type (1) + stream (1) + PTS (8) + length (4).
     private static let headerByteCount = 14
 
     private let handle: FileHandle
     private let writeQueue = DispatchQueue(label: "muesli.framed-writer", qos: .userInitiated)
     private var didFail = false
-    var onWriteError: ((Error) -> Void)?
+    private var writeErrorHandler: (@Sendable (Error) -> Void)?
+    var onWriteError: (@Sendable (Error) -> Void)? {
+        get { stateLock.withLock { writeErrorHandler } }
+        set { stateLock.withLock { writeErrorHandler = newValue } }
+    }
 
     /// Guards `backlog` and `isForceClosed` - `send` is called from the
     /// capture queue, the mic forwarder actor and MainActor, and completions

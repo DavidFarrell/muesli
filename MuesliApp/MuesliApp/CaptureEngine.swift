@@ -3,530 +3,192 @@ import ScreenCaptureKit
 import CoreMedia
 import AVFoundation
 import CoreGraphics
-import AudioToolbox
 
-// MARK: - Audio Extraction
+/// SCK's per-generation audio owner. Native sample buffers never cross onto
+/// MainActor. Conversion, bounded admission and sending share the same source
+/// clock as microphone capture; only a latest-only display snapshot crosses.
+nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let processor: MicCaptureProcessor
+    private let ingress: MicAudioIngress
+    private let forwarder: MicAudioForwarder
+    private let onStopped: @Sendable (Error) -> Void
+    let generation: Int
 
-enum AudioExtractError: Error {
-    case missingFormat
-    case unsupportedFormat
-    case failedToGetBufferList(OSStatus)
-}
-
-struct PCMChunk {
-    let pts: CMTime
-    let data: Data
-    let frameCount: Int
-}
-
-final class AudioSampleExtractor {
-    func extractInt16Mono(from sampleBuffer: CMSampleBuffer) throws -> PCMChunk {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            throw AudioExtractError.missingFormat
-        }
-        guard let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            throw AudioExtractError.missingFormat
-        }
-        let asbd = asbdPtr.pointee
-
-        var blockBuffer: CMBlockBuffer?
-        var bufferListSizeNeeded = 0
-        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: &bufferListSizeNeeded,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: nil
-        )
-
-        if status != noErr {
-            throw AudioExtractError.failedToGetBufferList(status)
-        }
-
-        if bufferListSizeNeeded <= 0 {
-            bufferListSizeNeeded = MemoryLayout<AudioBufferList>.size
-        }
-
-        let rawBufferList = UnsafeMutableRawPointer.allocate(
-            byteCount: bufferListSizeNeeded,
-            alignment: MemoryLayout<AudioBufferList>.alignment
-        )
-        defer { rawBufferList.deallocate() }
-        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
-
-        status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: audioBufferList,
-            bufferListSize: bufferListSizeNeeded,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-
-        if status != noErr {
-            throw AudioExtractError.failedToGetBufferList(status)
-        }
-
-        let dataPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-        let pts = sampleBuffer.presentationTimeStamp
-        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
-
-        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-        let isSignedInt = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0
-        let bitsPerChannel = Int(asbd.mBitsPerChannel)
-
-        let bufferCount = Int(dataPointer.count)
-        if bufferCount < 1 {
-            throw AudioExtractError.unsupportedFormat
-        }
-
-        var mono = [Float](repeating: 0, count: frames)
-        let isInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
-        let channelsPerFrame = Int(asbd.mChannelsPerFrame)
-
-        for b in 0..<bufferCount {
-            guard let mData = dataPointer[b].mData else { continue }
-            let byteSize = Int(dataPointer[b].mDataByteSize)
-
-            if isFloat && bitsPerChannel == 32 {
-                let sampleCount = byteSize / MemoryLayout<Float>.size
-                let floats = mData.bindMemory(to: Float.self, capacity: sampleCount)
-                if isInterleaved && channelsPerFrame > 1 {
-                    let framesAvailable = sampleCount / channelsPerFrame
-                    let count = min(frames, framesAvailable)
-                    for i in 0..<count {
-                        var sum: Float = 0
-                        let base = i * channelsPerFrame
-                        for ch in 0..<channelsPerFrame {
-                            sum += floats[base + ch]
-                        }
-                        mono[i] += sum / Float(channelsPerFrame)
-                    }
-                } else {
-                    let count = min(frames, sampleCount)
-                    for i in 0..<count {
-                        mono[i] += floats[i]
-                    }
-                }
-            } else if isSignedInt && bitsPerChannel == 16 {
-                let sampleCount = byteSize / MemoryLayout<Int16>.size
-                let ints = mData.bindMemory(to: Int16.self, capacity: sampleCount)
-                if isInterleaved && channelsPerFrame > 1 {
-                    let framesAvailable = sampleCount / channelsPerFrame
-                    let count = min(frames, framesAvailable)
-                    for i in 0..<count {
-                        var sum: Float = 0
-                        let base = i * channelsPerFrame
-                        for ch in 0..<channelsPerFrame {
-                            sum += Float(ints[base + ch]) / 32768.0
-                        }
-                        mono[i] += sum / Float(channelsPerFrame)
-                    }
-                } else {
-                    let count = min(frames, sampleCount)
-                    for i in 0..<count {
-                        mono[i] += Float(ints[i]) / 32768.0
-                    }
-                }
-            } else if isSignedInt && bitsPerChannel == 32 {
-                let sampleCount = byteSize / MemoryLayout<Int32>.size
-                let ints = mData.bindMemory(to: Int32.self, capacity: sampleCount)
-                if isInterleaved && channelsPerFrame > 1 {
-                    let framesAvailable = sampleCount / channelsPerFrame
-                    let count = min(frames, framesAvailable)
-                    for i in 0..<count {
-                        var sum: Float = 0
-                        let base = i * channelsPerFrame
-                        for ch in 0..<channelsPerFrame {
-                            sum += Float(ints[base + ch]) / 2147483648.0
-                        }
-                        mono[i] += sum / Float(channelsPerFrame)
-                    }
-                } else {
-                    let count = min(frames, sampleCount)
-                    for i in 0..<count {
-                        mono[i] += Float(ints[i]) / 2147483648.0
-                    }
-                }
-            } else {
-                throw AudioExtractError.unsupportedFormat
-            }
-        }
-
-        let denom = Float(bufferCount)
-        var out = Data(count: frames * MemoryLayout<Int16>.size)
-
-        out.withUnsafeMutableBytes { rawBuf in
-            let outPtr = rawBuf.bindMemory(to: Int16.self)
-            for i in 0..<frames {
-                let v = mono[i] / max(1, denom)
-                let clamped = max(-1.0, min(1.0, v))
-                outPtr[i] = Int16(clamped * 32767.0)
-            }
-        }
-
-        return PCMChunk(pts: pts, data: out, frameCount: frames)
-    }
-}
-
-/// Thread-safe wrapper around `MeterPublishGate` for use from the capture
-/// queue (never MainActor) - see `MeterPublishGate`'s own doc comment for
-/// the decision rules. This is a pre-gate: it decides whether it's even
-/// worth enqueuing a main-queue block at all, so steady-state buffers (most
-/// of them, once digital silence sets in) never hop to main - the
-/// authoritative gate still lives in `AudioMetersModel` itself.
-private final class SystemMeterGate {
-    private let queue = DispatchQueue(label: "muesli.system-meter-gate", qos: .userInitiated)
-    private var gate: MeterPublishGate
-
-    init(minPublishInterval: TimeInterval) {
-        gate = MeterPublishGate(minPublishInterval: minPublishInterval)
+    init(generation: Int, forwarder: MicAudioForwarder, display: MicDeliveryDisplayMailbox,
+         onStopped: @escaping @Sendable (Error) -> Void) {
+        self.generation = generation
+        self.forwarder = forwarder
+        self.onStopped = onStopped
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display)
+        self.ingress = ingress
+        processor = MicCaptureProcessor(generation: generation, mixPolicy: .meanOfAllChannels, output: ingress.callback())
     }
 
-    func shouldPublish(level: Float, now: Date) -> Bool {
-        queue.sync { gate.shouldPublish(level: level, now: now) }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio else { return }
+        receive(sampleBuffer)
     }
-}
 
-// MARK: - Capture Engine
+    func receive(_ sampleBuffer: CMSampleBuffer) {
+        processor.receive(sampleBuffer, sourceClock: CMClockGetHostTimeClock())
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        onStopped(error)
+    }
+
+    func finish() async {
+        processor.finish()
+        await ingress.finish()
+        await forwarder.stop()
+    }
+
+    func snapshot() -> MicCaptureProcessor.Snapshot { processor.snapshot() }
+    func ingressSnapshot() -> MicAudioIngress.Snapshot { ingress.snapshot() }
+}
 
 @MainActor
-final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let sampleRate = 16000
-    private let channelCount = 1
-    private let systemMeterGate = SystemMeterGate(minPublishInterval: 0.066)
-
+final class CaptureEngine: NSObject {
     private var stream: SCStream?
+    private var relay: SystemAudioCaptureRelay?
+    private var forwarder: MicAudioForwarder?
+    private var generation = 0
     private var recordingOutput: SCRecordingOutput?
     private let recordingDelegate = RecordingDelegate()
-
-    private let extractor = AudioSampleExtractor()
     private(set) var meetingStartPTS: CMTime?
-    private var writer: FramedWriter?
-    private struct AudioState {
-        var systemSampleRate: Int?
-        var systemChannelCount: Int?
-    }
-    private final class AudioStateStore {
-        private var state: AudioState
-        private let queue = DispatchQueue(label: "muesli.audio.state", qos: .userInitiated)
-
-        init(_ state: AudioState) {
-            self.state = state
-        }
-
-        func withState<T>(_ body: (inout AudioState) -> T) -> T {
-            queue.sync { body(&state) }
-        }
-    }
-
-    private let audioState = AudioStateStore(AudioState())
-    /// Buffer-until-ready gate for the readiness handshake window (2026-07-16
-    /// RCA rec #3): output stays disabled until the backend acknowledges
-    /// meeting_started, so this carries capture start -> acknowledgment
-    /// (~2-3s setup + the 10s handshake timeout). Byte-capped (not
-    /// callback-count-capped - SCK cadence is device/OS dependent) and its
-    /// enable+flush is atomic with respect to concurrent callbacks - see
-    /// PendingAudioGate's doc comment for both gate-blocker rationales.
-    private let systemAudioGate = PendingAudioGate()
 
     var systemLevel: Float = 0
-
-    var debugSystemBuffers: Int = 0
-    var debugSystemFrames: Int = 0
+    var debugSystemBuffers = 0
+    var debugSystemFrames = 0
     var debugSystemPTS: Double = 0
-    var debugSystemFormat: String = "-"
-    var debugSystemErrorMessage: String = "-"
-    var debugAudioErrors: Int = 0
-
-    /// Throttled display mirror for the system level meter + its debug
-    /// counters. Fed directly from the per-buffer callback below instead of
-    /// invalidating the whole AppModel view tree (audit A1).
+    var debugSystemFormat = "-"
+    var debugSystemErrorMessage = "-"
+    var debugAudioErrors = 0
     var metersModel: AudioMetersModel?
-    /// Fired when the system stops the capture stream with an error (e.g. the OS
-    /// tears it down). Previously this delegate callback was unimplemented and
-    /// such stops were silently dropped (audit D13).
     var onStreamStopped: ((Error) -> Void)?
 
-    func startCapture(
-        contentFilter: SCContentFilter,
-        writer: FramedWriter?,
-        recordTo url: URL?
-    ) async throws {
-        systemAudioGate.reset()
-        audioState.withState { state in
-            state.systemSampleRate = nil
-            state.systemChannelCount = nil
+    func startCapture(contentFilter: SCContentFilter, writer: FrameSending?, recordTo url: URL?,
+                      timeline: CaptureTimeline = CaptureTimeline()) async throws {
+        generation += 1
+        let currentGeneration = generation
+        meetingStartPTS = timeline.epochPTS
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, stream: .system)
+        await forwarder.beginMeeting(epoch: timeline)
+        await forwarder.beginGeneration(currentGeneration, writer: writer)
+        let display = MicDeliveryDisplayMailbox { [weak self] result in
+            guard let self, self.generation == currentGeneration else { return }
+            self.systemLevel = result.level
+            self.debugSystemBuffers = result.totalFrameCount
+            self.debugSystemFrames = result.frameSampleCount
+            self.debugSystemPTS = result.elapsedSeconds
+            self.debugSystemFormat = "s16le sr=16000 ch=1"
+            self.metersModel?.updateSystem(level: result.level, buffers: result.totalFrameCount,
+                                          frames: result.frameSampleCount, pts: result.elapsedSeconds,
+                                          format: self.debugSystemFormat)
         }
+        let relay = SystemAudioCaptureRelay(generation: currentGeneration, forwarder: forwarder, display: display) { [weak self] error in
+            AudioLog.error("stream.stopped", ["generation": currentGeneration, "error": String(describing: error)])
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == currentGeneration else { return }
+                self.debugAudioErrors += 1
+                self.debugSystemErrorMessage = String(describing: error)
+                self.metersModel?.setSystemError(message: self.debugSystemErrorMessage, errorCount: self.debugAudioErrors)
+                self.onStreamStopped?(error)
+            }
+        }
+        self.forwarder = forwarder
+        self.relay = relay
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true
-        config.sampleRate = sampleRate
-        config.channelCount = channelCount
+        config.sampleRate = 16000
+        config.channelCount = 1
         config.excludesCurrentProcessAudio = true
-
-        let stream = SCStream(filter: contentFilter, configuration: config, delegate: self)
+        let stream = SCStream(filter: contentFilter, configuration: config, delegate: relay)
         self.stream = stream
-
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop", qos: .userInitiated))
-
-        self.writer = writer
-
-        if #available(macOS 15.0, *), let recordURL = url {
-            let roConfig = SCRecordingOutputConfiguration()
-            roConfig.outputURL = recordURL
-            roConfig.outputFileType = .mp4
-            let ro = SCRecordingOutput(configuration: roConfig, delegate: recordingDelegate)
-            try stream.addRecordingOutput(ro)
-            self.recordingOutput = ro
-        }
-
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            stream.startCapture { error in
-                if let error {
-                    cont.resume(throwing: error)
-                } else {
-                    cont.resume(returning: ())
+        do {
+            try stream.addStreamOutput(relay, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
+            try stream.addStreamOutput(relay, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop", qos: .userInitiated))
+            if #available(macOS 15.0, *), let recordURL = url {
+                let configuration = SCRecordingOutputConfiguration()
+                configuration.outputURL = recordURL
+                configuration.outputFileType = .mp4
+                let output = SCRecordingOutput(configuration: configuration, delegate: recordingDelegate)
+                try stream.addRecordingOutput(output)
+                recordingOutput = output
+            }
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                stream.startCapture { error in
+                    if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume() }
                 }
             }
+        } catch {
+            try? stream.removeStreamOutput(relay, type: .audio)
+            try? stream.removeStreamOutput(relay, type: .screen)
+            await relay.finish()
+            if generation == currentGeneration {
+                self.stream = nil
+                self.relay = nil
+                self.forwarder = nil
+                recordingOutput = nil
+            }
+            throw error
         }
     }
 
     func stopCapture() async {
         guard let stream else { return }
-
-        await withCheckedContinuation { cont in
-            stream.stopCapture { _ in cont.resume() }
+        let stoppedGeneration = generation
+        let relay = self.relay
+        await withCheckedContinuation { continuation in
+            stream.stopCapture { _ in continuation.resume() }
         }
-
+        if let relay {
+            try? stream.removeStreamOutput(relay, type: .audio)
+            try? stream.removeStreamOutput(relay, type: .screen)
+            await relay.finish()
+        }
+        guard generation == stoppedGeneration else { return }
+        // Retire display/error callbacks as well as native audio callbacks.
+        generation += 1
         self.stream = nil
-        self.recordingOutput = nil
-        self.writer = nil
-        self.meetingStartPTS = nil
-        systemAudioGate.reset()
-        audioState.withState { state in
-            state.systemSampleRate = nil
-            state.systemChannelCount = nil
-        }
+        self.relay = nil
+        forwarder = nil
+        recordingOutput = nil
+        meetingStartPTS = nil
     }
 
     struct AudioFormats {
         var systemSampleRate: Int?
         var systemChannels: Int?
-
-        var isComplete: Bool {
-            systemSampleRate != nil
-        }
+        var isComplete: Bool { systemSampleRate != nil }
     }
 
     func waitForAudioFormats(timeoutSeconds: Double) async -> AudioFormats {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            let formats = audioState.withState { state in
-                AudioFormats(
-                    systemSampleRate: state.systemSampleRate,
-                    systemChannels: state.systemChannelCount
-                )
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+        while ContinuousClock.now < deadline {
+            if (relay?.snapshot().convertedFrames ?? 0) > 0 {
+                return AudioFormats(systemSampleRate: 16000, systemChannels: 1)
             }
-            if formats.isComplete {
-                return formats
-            }
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            do { try await Task.sleep(for: .milliseconds(20)) } catch { break }
         }
-        let formats = audioState.withState { state in
-            AudioFormats(
-                systemSampleRate: state.systemSampleRate,
-                systemChannels: state.systemChannelCount
-            )
-        }
-        return formats
+        return AudioFormats(systemSampleRate: nil, systemChannels: nil)
     }
 
-    func setAudioOutputEnabled(_ enabled: Bool) {
-        guard enabled else {
-            systemAudioGate.reset()
-            return
-        }
-        // Flush + enable atomically (gate BLOCKER 1 fix): the buffered
-        // startup prefix is enqueued on the writer's serial queue INSIDE the
-        // gate's critical section, so a concurrent capture callback can
-        // never send a newer PTS ahead of it - which would make the
-        // backend's PTS-aligned writer silently drop the whole prefix.
-        let writer = self.writer
-        systemAudioGate.enableAndFlush { item in
-            writer?.send(type: .audio, stream: .system, ptsUs: item.ptsUs, payload: item.payload)
-        }
+    func setAudioOutputEnabled(_ enabled: Bool) async {
+        await forwarder?.setOutputEnabled(enabled)
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        if type == .screen {
-            return
-        }
-        guard sampleBuffer.isValid else { return }
-
-        do {
-            let pcm = try extractor.extractInt16Mono(from: sampleBuffer)
-
-            if meetingStartPTS == nil {
-                meetingStartPTS = pcm.pts
-            }
-            guard let start = meetingStartPTS else { return }
-
-            let delta = CMTimeSubtract(pcm.pts, start)
-            let seconds = CMTimeGetSeconds(delta)
-            let ptsUs = Int64(seconds * 1_000_000.0)
-
-            let level = rmsLevelInt16(pcm.data)
-            let ptsSeconds = CMTimeGetSeconds(sampleBuffer.presentationTimeStamp)
-            let formatInfo = formatString(from: sampleBuffer) ?? "-"
-
-            // Pre-gate BEFORE dispatching to main at all: previously every
-            // system-audio buffer enqueued a main-queue block regardless of
-            // the throttle inside `AudioMetersModel.updateSystem` - an
-            // invalidation-storm contributor even before counting the
-            // `@Published` writes themselves (audit: 2026-07-06 livelock).
-            // During steady digital silence this now costs one `queue.sync`
-            // on the capture queue and nothing on MainActor at all.
-            if type == .audio, systemMeterGate.shouldPublish(level: level, now: Date()) {
-                DispatchQueue.main.async {
-                    self.systemLevel = level
-                    self.debugSystemBuffers += 1
-                    self.debugSystemFrames = pcm.frameCount
-                    self.debugSystemPTS = ptsSeconds
-                    self.debugSystemFormat = formatInfo
-                    self.metersModel?.updateSystem(
-                        level: self.systemLevel,
-                        buffers: self.debugSystemBuffers,
-                        frames: self.debugSystemFrames,
-                        pts: self.debugSystemPTS,
-                        format: self.debugSystemFormat
-                    )
-                }
-            }
-
-            if type == .screen {
-                return
-            }
-
-            var detectedSampleRate: Int?
-            var detectedChannels: Int?
-            if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                let asbd = asbdPtr.pointee
-                detectedSampleRate = Int(asbd.mSampleRate)
-                detectedChannels = Int(asbd.mChannelsPerFrame)
-            }
-
-            audioState.withState { state in
-                if type == .audio {
-                    if state.systemSampleRate == nil, let detectedSampleRate {
-                        state.systemSampleRate = detectedSampleRate
-                        state.systemChannelCount = detectedChannels
-                    }
-                }
-            }
-
-            guard type == .audio else { return }
-            // No writer means the home-screen level preview: metering only,
-            // nothing to forward now or ever - skip the gate entirely so a
-            // preview idling on the start screen can't accumulate buffered
-            // audio it will never flush.
-            guard let writer else { return }
-            // Gate open: forward live (SCK delivers these callbacks serially
-            // on one queue, and admitOrBuffer only returns true once
-            // enableAndFlush's prefix sends are already enqueued, so this
-            // send can never overtake the flushed prefix). Gate closed: the
-            // frame was buffered for the readiness flush.
-            if systemAudioGate.admitOrBuffer(.init(ptsUs: ptsUs, payload: pcm.data)) {
-                writer.send(type: .audio, stream: .system, ptsUs: ptsUs, payload: pcm.data)
-            }
-        } catch {
-            let formatInfo = formatString(from: sampleBuffer) ?? "-"
-            let errorMessage = describeError(error)
-            DispatchQueue.main.async {
-                if type == .audio {
-                    self.debugAudioErrors += 1
-                    self.debugSystemFormat = formatInfo
-                    self.debugSystemErrorMessage = errorMessage
-                    self.metersModel?.setSystemError(message: errorMessage, errorCount: self.debugAudioErrors)
-                }
-            }
-            return
-        }
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        AudioLog.error("stream.stopped", ["error": String(describing: error)])
-        onStreamStopped?(error)
-    }
+    /// Raw callback/conversion evidence is available independently of meters.
+    func sourceSnapshot() -> MicCaptureProcessor.Snapshot? { relay?.snapshot() }
+    func ingressSnapshot() -> MicAudioIngress.Snapshot? { relay?.ingressSnapshot() }
 
     func streamConfigurationForScreenshots() -> SCStreamConfiguration {
-        let c = SCStreamConfiguration()
-        c.showsCursor = true
-        return c
-    }
-
-    private func rmsLevelInt16(_ data: Data) -> Float {
-        let count = data.count / 2
-        if count == 0 { return 0 }
-
-        var sumSquares: Double = 0
-        data.withUnsafeBytes { raw in
-            let p = raw.bindMemory(to: Int16.self)
-            for i in 0..<count {
-                let v = Double(p[i]) / 32768.0
-                sumSquares += v * v
-            }
-        }
-        let rms = sqrt(sumSquares / Double(count))
-        return Float(min(1.0, rms))
-    }
-
-    private func formatString(from sampleBuffer: CMSampleBuffer) -> String? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            return nil
-        }
-        guard let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            return nil
-        }
-        let asbd = asbdPtr.pointee
-        let rate = Int(asbd.mSampleRate)
-        let channels = asbd.mChannelsPerFrame
-        let bits = asbd.mBitsPerChannel
-        let formatID = fourCC(asbd.mFormatID)
-        let flags = String(format: "0x%08X", asbd.mFormatFlags)
-        return "id=\(formatID) sr=\(rate) ch=\(channels) bits=\(bits) flags=\(flags)"
-    }
-
-    private func describeError(_ error: Error) -> String {
-        if let audioError = error as? AudioExtractError {
-            switch audioError {
-            case .missingFormat:
-                return "missing_format"
-            case .unsupportedFormat:
-                return "unsupported_format"
-            case .failedToGetBufferList(let status):
-                return "buffer_list_error=\(status)"
-            }
-        }
-        return String(describing: error)
-    }
-
-    private func fourCC(_ value: UInt32) -> String {
-        let bytes: [UInt8] = [
-            UInt8((value >> 24) & 0xFF),
-            UInt8((value >> 16) & 0xFF),
-            UInt8((value >> 8) & 0xFF),
-            UInt8(value & 0xFF)
-        ]
-        return bytes.map { $0 >= 32 && $0 < 127 ? String(UnicodeScalar($0)) : "." }.joined()
+        let configuration = SCStreamConfiguration()
+        configuration.showsCursor = true
+        return configuration
     }
 }
 
-final class RecordingDelegate: NSObject, SCRecordingOutputDelegate {}
+nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate {}
