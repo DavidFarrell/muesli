@@ -18,6 +18,9 @@ final class MeetingFileAccessTests: XCTestCase {
     /// registry. Its alarm bounds even a broken fixture; no Trash is invoked.
     @concurrent private static func probe(_ folder: URL, name: String = MeetingFileAccess.accessName,
                                          exclusive: Bool = true) async throws -> Int32 {
+        try probeSync(folder, name: name, exclusive: exclusive)
+    }
+    nonisolated private static func probeSync(_ folder: URL, name: String, exclusive: Bool) throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = ["-c", """
@@ -244,6 +247,25 @@ final class MeetingFileAccessTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: input.urls[0]), Data("image fixture".utf8))
         }
         try await assertProbe(root, busy: false)
+    }
+
+    func testHandedOffTransactionIsActuallyReleasedBeforeItsCompletionCallback() async throws {
+        let root = try folder(), gate = Gate(), callback = TaskCompletion(), store = TranscriptPersistenceStore()
+        let first = try store.start(in: root) { _ in gate.block() }
+        let entered = await gate.entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(entered, .completed)
+        let second = try store.startAfterCurrent(in: root, onCompletion: { _ in
+            do {
+                let status = try Self.probeSync(root, name: MeetingFileAccess.transactionName, exclusive: true)
+                XCTAssertEqual(status, 0, "a real second process must acquire the completed transaction before publication")
+            } catch { XCTFail(error.localizedDescription) }
+            callback.markCompleted()
+        }) { context in try context.commit(files: ["transcript.txt": Data("saved".utf8)]) }
+        gate.release.signal()
+        _ = try await first.value(timeoutSeconds: 2)
+        _ = try await second.value(timeoutSeconds: 2)
+        let published = await callback.wait(timeoutSeconds: 2)
+        XCTAssertEqual(published, .completed)
     }
 
 }

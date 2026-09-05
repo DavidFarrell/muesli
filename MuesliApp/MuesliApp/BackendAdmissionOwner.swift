@@ -122,6 +122,13 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         }
     }
 
+    private final class AccessHandoff: @unchecked Sendable {
+        private let lock = NSLock()
+        private var access: MeetingFileAccess?
+        init(_ access: MeetingFileAccess?) { self.access = access }
+        func take() -> MeetingFileAccess? { lock.withLock { let value = access; access = nil; return value } }
+    }
+
     private static let deadlines = DispatchQueue(label: "muesli.backend-admission-deadline", qos: .utility)
     private let queue = DispatchQueue(label: "muesli.backend-admission", qos: .utility)
     private let lock = NSLock()
@@ -162,11 +169,14 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
             // retains this admission until every original resource really closes.
             let ownedResources = resources
             let ownedMeetingLease = meetingLease
-            let ownedAccess = meetingAccess
+            let accessHandoff = AccessHandoff(meetingAccess)
+            meetingAccess = nil
             Task.detached { [self] in
+                var ownedAccess = accessHandoff.take()
                 if let ownedResources { await Self.maintain(ownedResources, attempt: attempt) }
                 try? ownedMeetingLease?.close()
                 withExtendedLifetime(ownedAccess) {}
+                ownedAccess = nil
                 lock.withLock { if active === attempt { active = nil } }
                 attempt.finished.markCompleted()
             }

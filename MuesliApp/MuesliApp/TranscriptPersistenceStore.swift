@@ -50,13 +50,24 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
 
     static let shared = TranscriptPersistenceStore()
     static let journalDirectoryName = ".transcript-transaction"
+    /// Consume the handed-off reference before executing a successor. Passing
+    /// Transaction itself as a closure parameter retains it until the callback
+    /// returns, even after the worker has published completion.
+    private final class LeaseHandoff: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lease: MeetingFileAccess.Transaction?
+        init(_ lease: MeetingFileAccess.Transaction?) { self.lease = lease }
+        func take() -> MeetingFileAccess.Transaction? {
+            lock.withLock { let value = lease; lease = nil; return value }
+        }
+    }
     private final class Registry: @unchecked Sendable {
-        private struct Pending: Sendable { let id: UUID; let work: @Sendable (MeetingFileAccess.Transaction?) -> Void }
+        private struct Pending: Sendable { let id: UUID; let work: @Sendable (LeaseHandoff?) -> Void }
         let lock = NSLock()
         var owners: [String: UUID] = [:]
         private var pending: [String: Pending] = [:]
         func admit(_ folder: URL, id: UUID, afterCurrent: Bool,
-                   work: @escaping @Sendable (MeetingFileAccess.Transaction?) -> Void) throws -> Bool {
+                   work: @escaping @Sendable (LeaseHandoff?) -> Void) throws -> Bool {
             try lock.withLock {
                 let key = folder.standardizedFileURL.path
                 if owners[key] != nil {
@@ -71,7 +82,7 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
                 return true
             }
         }
-        func release(_ folder: URL, id: UUID, lease: MeetingFileAccess.Transaction?) {
+        func release(_ folder: URL, id: UUID, handoff: LeaseHandoff) {
             let next: Pending? = lock.withLock {
                 let key = folder.standardizedFileURL.path
                 guard owners[key] == id else { return nil }
@@ -82,7 +93,8 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
                 owners.removeValue(forKey: key)
                 return nil
             }
-            if let next { DispatchQueue.global(qos: .utility).async { next.work(lease) } }
+            if let next { DispatchQueue.global(qos: .utility).async { next.work(handoff) } }
+            else { _ = handoff.take() }
         }
         func isBusy(_ folder: URL) -> Bool {
             lock.withLock { owners[folder.standardizedFileURL.path] != nil }
@@ -201,8 +213,8 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
                                 operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
         let id = UUID()
         let owner = Operation<Output>()
-        let work: @Sendable (MeetingFileAccess.Transaction?) -> Void = { [self] inherited in
-            var lease = inherited
+        let work: @Sendable (LeaseHandoff?) -> Void = { [self] inherited in
+            var lease = inherited?.take()
             let result: Result<Output, Failure>
             do {
                 if lease == nil { lease = try MeetingFileAccess.acquire(in: folder, mode: mode).transaction() }
@@ -214,8 +226,9 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
             } catch {
                 result = .failure(.operationFailed(error.localizedDescription))
             }
-            Self.registry.release(folder, id: id, lease: lease)
-            lease = nil // Real close precedes terminal publication; a successor retains the same lease.
+            let handoff = LeaseHandoff(lease)
+            lease = nil // Transfer before a successor can start or a callback can publish.
+            Self.registry.release(folder, id: id, handoff: handoff)
             owner.finish(result)
             onCompletion(result)
         }
