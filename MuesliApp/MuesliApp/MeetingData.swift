@@ -190,7 +190,7 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
     }
 }
 
-struct MeetingHistoryItem: Identifiable {
+nonisolated struct MeetingHistoryItem: Identifiable, Sendable {
     let id: String
     let folderURL: URL
     let title: String

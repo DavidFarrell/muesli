@@ -141,21 +141,30 @@ final class TranscriptModel: ObservableObject {
     }
 
     /// Exact scoped IDs only; compatibility matching is restricted to legacy records.
-    func applySpeakerName(id: String, name: String) -> Bool {
+    func speakerNameAssignments(id: String, name: String) -> [String: String] {
         let ids = Set(segments.map(\.speakerKey))
         if TranscriptSpeakerIdentity(storageKey: id) != nil {
-            guard ids.contains(id) else { return false }
-            speakerNames[id] = name
-            return true
+            return ids.contains(id) ? [id: name] : [:]
         }
         let legacy = Set(segments.filter { $0.sourceSessionID == nil }.map(\.speakerID))
-        let matches = legacy.filter { $0 == id || $0.hasSuffix(":" + id) }
-        for target in matches { speakerNames[target] = name }
-        return !matches.isEmpty
+        return Dictionary(uniqueKeysWithValues: legacy.filter { $0 == id || $0.hasSuffix(":" + id) }.map { ($0, name) })
+    }
+
+    func applySpeakerName(id: String, name: String) -> Bool {
+        let assignments = speakerNameAssignments(id: id, name: name)
+        speakerNames.merge(assignments) { _, new in new }
+        return !assignments.isEmpty
     }
 
     func assertNoPendingReplacement(in folder: URL) throws {
         guard pendingReplacement?.folder != folder else { throw TranscriptPersistenceStore.Failure.busy }
+    }
+
+    @discardableResult
+    func applyCommittedSpeakerNames(_ names: [String: String], expectedGeneration: UInt64) -> Bool {
+        guard contentGeneration == expectedGeneration else { return false }
+        speakerNames.merge(names) { _, reviewed in reviewed }
+        return true
     }
 
     func renameSpeaker(id: String, to name: String) {

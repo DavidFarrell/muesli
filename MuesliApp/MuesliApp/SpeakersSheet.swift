@@ -6,6 +6,7 @@ struct SpeakersSheet: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var transcript: TranscriptModel
     @Environment(\.dismiss) var dismiss
+    @State private var draftNames: [String: String] = [:]
     @FocusState private var focusedSpeakerID: String?
 
     var body: some View {
@@ -26,8 +27,8 @@ struct SpeakersSheet: View {
                             .frame(width: 210, alignment: .leading)
 
                         TextField("Name", text: Binding(
-                            get: { transcript.displayName(for: id) },
-                            set: { model.renameSpeaker(id: id, to: $0) }
+                            get: { draftNames[id] ?? transcript.displayName(for: id) },
+                            set: { draftNames[id] = $0; model.renameSpeaker(id: id, to: $0) }
                         ))
                         .focused($focusedSpeakerID, equals: id)
                         .onKeyPress(keys: [.init("\t")], phases: .down) { keyPress in
@@ -42,6 +43,7 @@ struct SpeakersSheet: View {
                 }
             }
 
+            if let notice = model.metadataEditNotice { Text(notice).font(.caption).foregroundStyle(.orange) }
             HStack {
                 Spacer()
                 Button("Done") { dismiss() }

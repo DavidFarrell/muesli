@@ -232,9 +232,15 @@ struct MeetingViewer: View {
                     isEditing: $isEditingTitle
                 ) { newTitle in
                     do {
-                        try model.renameMeeting(meeting, to: newTitle)
+                        try await model.renameMeeting(meeting, to: newTitle)
                         return nil
                     } catch {
+                        if let failure = error as? TranscriptPersistenceStore.Failure {
+                            switch failure {
+                            case .timedOut, .cancelled: return nil // The retained owner's notice remains authoritative.
+                            default: break
+                            }
+                        }
                         return "Couldn't rename: \(error.localizedDescription)"
                     }
                 }

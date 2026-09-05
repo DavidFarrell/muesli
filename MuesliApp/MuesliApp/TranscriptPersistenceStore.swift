@@ -113,6 +113,13 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
             completion.markCompleted()
         }
 
+        /// Only for an original worker that has observed its terminal callback.
+        /// This takes a short state lock and never waits for completion.
+        func completedValue() throws -> Output {
+            guard let result = lock.withLock({ result }) else { throw Failure.busy }
+            return try result.get()
+        }
+
         @concurrent func wait(timeoutSeconds: Double) async -> WaitResult<Output> {
             switch await completion.wait(timeoutSeconds: timeoutSeconds) {
             case .timedOut: return .timedOut
