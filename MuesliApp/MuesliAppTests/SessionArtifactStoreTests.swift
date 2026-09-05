@@ -1,0 +1,163 @@
+import XCTest
+import CoreGraphics
+import ScreenCaptureKit
+
+@MainActor
+final class SessionArtifactStoreTests: XCTestCase {
+    private func folder() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+    private func pixel() -> CGImage {
+        let context = CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        return context.makeImage()!
+    }
+    private func store(_ folder: URL, offset: Int64 = 0,
+                       png: SessionArtifactStore.PNGWriter? = nil) throws -> SessionArtifactStore {
+        if let png {
+            return try SessionArtifactStore(meetingDirectory: folder, sourceSessionID: UUID().uuidString,
+                timeline: CaptureTimeline(epochMicroseconds: 1_000_000), timelineOffsetUs: offset, pngWriter: png)
+        }
+        return try SessionArtifactStore(meetingDirectory: folder, sourceSessionID: UUID().uuidString,
+            timeline: CaptureTimeline(epochMicroseconds: 1_000_000), timelineOffsetUs: offset)
+    }
+    private func ledger(_ store: SessionArtifactStore) throws -> [[String: Any]] {
+        try String(contentsOf: store.directory.appendingPathComponent("assets.jsonl"), encoding: .utf8)
+            .split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
+    }
+    nonisolated private final class Requests: @unchecked Sendable {
+        let lock = NSLock()
+        var replies: [@Sendable (ScreenshotScheduler.Image?) -> Void] = []
+        let received = DispatchSemaphore(value: 0)
+        func request(_ reply: @escaping @Sendable (ScreenshotScheduler.Image?) -> Void) {
+            lock.withLock { replies.append(reply) }; received.signal()
+        }
+        func reply(_ image: ScreenshotScheduler.Image) {
+            let callback = lock.withLock { replies.removeFirst() }; callback(image)
+        }
+        var count: Int { lock.withLock { replies.count } }
+    }
+
+    func testThreeSessionsUseUniquePathsAndCommonOffsets() async throws {
+        let folder = try folder()
+        var paths: [String] = []
+        for offset in [0, 10_000_000, 25_000_000] {
+            let store = try store(folder, offset: Int64(offset))
+            let event = expectation(description: "committed screenshot")
+            let expectedTime = Double(offset) / 1_000_000 + 2
+            XCTAssertTrue(store.submitScreenshot(pixel(), captureTimeUs: 3_000_000) { screenshot in
+                XCTAssertEqual(screenshot.t, expectedTime)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent(screenshot.path).path))
+                event.fulfill()
+            })
+            await fulfillment(of: [event], timeout: 3)
+            let result = await store.finish(timeoutSeconds: 3)
+            XCTAssertTrue(result.status.isComplete)
+            let row = try XCTUnwrap(ledger(store).last)
+            paths.append(try XCTUnwrap(row["path"] as? String))
+            XCTAssertEqual(row["t"] as? Double, expectedTime)
+        }
+        XCTAssertEqual(Set(paths).count, 3)
+    }
+
+    func testPNGFailureNeverCommitsOrEmitsScreenshot() async throws {
+        let store = try store(folder())
+        let screenshots = store.directory.appendingPathComponent("screenshots")
+        // Make the actual ImageIO destination fail, using only this fixture's
+        // directory. The production PNG encoder and error checks still run.
+        try FileManager.default.removeItem(at: screenshots)
+        try Data([0]).write(to: screenshots)
+        let event = expectation(description: "no false screenshot"); event.isInverted = true
+        XCTAssertTrue(store.submitScreenshot(pixel(), captureTimeUs: 2_000_000) { _ in event.fulfill() })
+        await fulfillment(of: [event], timeout: 0.1)
+        let result = await store.finish(timeoutSeconds: 2)
+        XCTAssertFalse(result.status.isComplete)
+        XCTAssertEqual(result.status.committedScreenshots, 0)
+        XCTAssertEqual(try ledger(store).count, 1)
+    }
+
+    func testVideoReservationsStayUniqueAcrossTwoResumes() async throws {
+        let folder = try folder()
+        let stores = try (0..<3).map { _ in try store(folder) }
+        let urls = try stores.map { try XCTUnwrap($0.nextVideoURL()) }
+        XCTAssertEqual(Set(urls).count, 3)
+        XCTAssertEqual(Set(urls.map { $0.deletingLastPathComponent() }).count, 3)
+        for store in stores {
+            let result = await store.finish(timeoutSeconds: 2)
+            XCTAssertFalse(result.status.isComplete, "reservation is not evidence of a real output")
+        }
+    }
+
+    func testStopDuringEncodingSuppressesLateSuccess() async throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let store = try store(folder(), png: { _, _ in entered.signal(); _ = release.wait(timeout: .now() + 3) })
+        let event = expectation(description: "stopped result"); event.isInverted = true
+        store.submitScreenshot(pixel(), captureTimeUs: 2_000_000) { _ in event.fulfill() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        store.stopScreenshots()
+        release.signal()
+        await fulfillment(of: [event], timeout: 0.1)
+        let result = await store.finish(timeoutSeconds: 2)
+        XCTAssertEqual(result.status.committedScreenshots, 0)
+        XCTAssertEqual(try ledger(store).count, 1)
+    }
+
+    func testOneOutstandingRequestSurvivesStopAndTwoResumes() async throws {
+        let folder = try folder(), scheduler = ScreenshotScheduler(), requests = Requests()
+        let stores = try (0..<3).map { _ in try store(folder) }
+        let stale = expectation(description: "old screenshot"); stale.isInverted = true
+        scheduler.start(every: 60, store: stores[0], request: requests.request) { _ in stale.fulfill() }
+        scheduler.requestNow()
+        XCTAssertEqual(requests.received.wait(timeout: .now() + 2), .success)
+        for store in stores.dropFirst() {
+            scheduler.stop()
+            scheduler.start(every: 60, store: store, request: requests.request) { _ in stale.fulfill() }
+            scheduler.requestNow()
+        }
+        // This barrier is another request job; it cannot admit while the first
+        // framework callback owns the slot.
+        XCTAssertEqual(requests.received.wait(timeout: .now() + 0.1), .timedOut)
+        XCTAssertEqual(requests.count, 1)
+        requests.reply(.init(image: pixel(), captureTimeUs: 2_000_000))
+        await fulfillment(of: [stale], timeout: 0.1)
+        for store in stores { XCTAssertEqual(try ledger(store).count, 1) }
+        scheduler.stop()
+        for store in stores { _ = await store.finish(timeoutSeconds: 2) }
+    }
+
+    func testVideoTimeoutThenRealSDKCompletionPersistsOriginalOutput() async throws {
+        let store = try store(folder())
+        let url = try XCTUnwrap(store.nextVideoURL())
+        try Data([1, 2, 3]).write(to: url)
+        let delegate = RecordingDelegate(url: url)
+        let configuration = SCRecordingOutputConfiguration(); configuration.outputURL = url
+        let output = SCRecordingOutput(configuration: configuration, delegate: delegate)
+        store.retainRecording(delegate)
+        guard case .timedOut(let pending) = await store.finish(timeoutSeconds: 0.02) else { return XCTFail("missing SDK finish") }
+        XCTAssertEqual(pending.pendingVideos, 1)
+        XCTAssertNil(store.nextVideoURL())
+        delegate.recordingOutputDidFinishRecording(output)
+        guard case .completed(let status) = await store.finish(timeoutSeconds: 2) else { return XCTFail("late completion") }
+        XCTAssertTrue(status.isComplete)
+        XCTAssertEqual(status.finishedVideos, 1)
+        XCTAssertEqual(try ledger(store).last?["status"] as? String, "finished")
+    }
+
+    func testNativeFailureAndUnregisteredReservationRemainIncomplete() async throws {
+        let store = try store(folder()), url = try XCTUnwrap(store.nextVideoURL())
+        let delegate = RecordingDelegate(url: url)
+        store.retainRecording(delegate)
+        delegate.recordingSetupFailed(NSError(domain: "native", code: 3))
+        let result = await store.finish(timeoutSeconds: 2)
+        XCTAssertFalse(result.status.isComplete)
+        XCTAssertEqual(try ledger(store).last?["status"] as? String, "failed")
+        let other = try self.store(folder())
+        for _ in 0..<16 { XCTAssertNotNil(other.nextVideoURL()) }
+        XCTAssertNil(other.nextVideoURL())
+        let unregistered = await other.finish(timeoutSeconds: 2)
+        XCTAssertFalse(unregistered.status.isComplete)
+    }
+}

@@ -278,6 +278,7 @@ final class AppModel: ObservableObject {
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
     private var sourceTimeline: CaptureTimeline?
+    private var sessionArtifactStore: SessionArtifactStore?
     private var inferenceFailure: String?
     // Backend-readiness handshake state (2026-07-16 RCA rec #3 - backend
     // wedged pre-read-loop, meeting presented as recording, 26 minutes lost).
@@ -2367,14 +2368,30 @@ final class AppModel: ObservableObject {
             }.value
             sourceRecorder = recorder
             inferenceFailure = nil
+            let captureTimeline = CaptureTimeline()
             let recordURL: URL?
             if captureMode == .video {
-                recordURL = folderURL.appendingPathComponent("recording.mp4")
+                let artifacts = try await Task.detached {
+                    try SessionArtifactStore(meetingDirectory: folderURL, sourceSessionID: sourceID,
+                        timeline: captureTimeline, timelineOffsetUs: offsetUs)
+                }.value
+                sessionArtifactStore = artifacts
+                captureEngine.recoveryRecordingURLProvider = { [artifacts] in artifacts.nextVideoURL() }
+                captureEngine.onRecordingOutputCreated = { [artifacts] in artifacts.retainRecording($0) }
+                guard let url = artifacts.nextVideoURL() else {
+                    throw NSError(domain: "Muesli", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Could not reserve a new video segment"])
+                }
+                recordURL = url
+                try updateSessionArtifactsMetadata(for: session, directory: artifacts.relativeDirectory,
+                                                   timelineOffsetSeconds: timestampOffset)
             } else {
+                sessionArtifactStore = nil
+                captureEngine.recoveryRecordingURLProvider = nil
+                captureEngine.onRecordingOutputCreated = nil
                 recordURL = nil
             }
 
-            let captureTimeline = CaptureTimeline()
             sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
             try await captureEngine.startCapture(
@@ -2449,25 +2466,16 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            if captureMode == .video {
-                let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
-                try FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
-
-                screenshotScheduler.start(
-                    every: 5.0,
-                    contentFilter: screenshotFilter,
-                    streamConfig: captureEngine.streamConfigurationForScreenshots(),
-                    meetingStartPTSProvider: { captureTimeline.epochPTS },
-                    outputDir: screenshotsDir
-                ) { [weak self] tSec, relativePath in
-                    guard let self else { return }
-                    let evt: [String: Any] = [
-                        "t": tSec,
-                        "path": relativePath
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: evt) {
-                        let ptsUs = Int64(tSec * 1_000_000.0)
-                        self.writer?.send(type: .screenshotEvent, stream: .system, ptsUs: ptsUs, payload: data)
+            if let artifacts = sessionArtifactStore {
+                let request = ScreenshotScheduler.NativeRequest(filter: screenshotFilter,
+                    configuration: captureEngine.streamConfigurationForScreenshots())
+                // The sink belongs to this attempt. Source assets still persist
+                // when inference is absent or its UI projection is cancelled.
+                let eventWriter = writer
+                screenshotScheduler.start(every: 5, store: artifacts, request: request.capture) { event in
+                    if let data = try? JSONEncoder().encode(event) {
+                        eventWriter?.send(type: .screenshotEvent, stream: .system,
+                            ptsUs: Int64(event.t * 1_000_000), payload: data)
                     }
                 }
             }
@@ -3233,6 +3241,27 @@ final class AppModel: ObservableObject {
         )
         updated.sessions.append(newSession)
         try writeMeetingMetadata(updated, to: session.folderURL)
+    }
+
+    private func updateSessionArtifactsMetadata(for session: MeetingSession, directory: String,
+                                                timelineOffsetSeconds: Double) throws {
+        var metadata = try readMeetingMetadata(from: session.folderURL)
+        guard let index = metadata.sessions.indices.last else { return }
+        metadata.sessions[index].artifactsFolder = directory
+        metadata.sessions[index].timelineOffsetSeconds = timelineOffsetSeconds
+        try writeMeetingMetadata(metadata, to: session.folderURL)
+    }
+
+    /// Finalization must retain this owner and await its typed outcome after
+    /// native stop. Taking it closes screenshot admission immediately; pending
+    /// SDK video callbacks continue to address this original session's ledger.
+    private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        let store = sessionArtifactStore
+        sessionArtifactStore = nil
+        store?.stopScreenshots()
+        captureEngine.recoveryRecordingURLProvider = nil
+        captureEngine.onRecordingOutputCreated = nil
+        return store
     }
 
     private func finalizeMeetingMetadata(

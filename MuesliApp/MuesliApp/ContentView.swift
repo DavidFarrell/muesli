@@ -641,61 +641,6 @@ struct Permissions {
     }
 }
 
-// MARK: - Screenshot Scheduler
-
-final class ScreenshotScheduler {
-    private var timer: DispatchSourceTimer?
-    private let ciContext = CIContext()
-
-    func start(
-        every intervalSeconds: Double,
-        contentFilter: SCContentFilter,
-        streamConfig: SCStreamConfiguration,
-        meetingStartPTSProvider: @escaping () -> CMTime?,
-        outputDir: URL,
-        onScreenshotEvent: @escaping (_ tSeconds: Double, _ relativePath: String) -> Void
-    ) {
-        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "muesli.screenshots", qos: .userInitiated))
-        t.schedule(deadline: .now() + intervalSeconds, repeating: intervalSeconds)
-        t.setEventHandler { [weak self] in
-            guard let self else { return }
-            SCScreenshotManager.captureSampleBuffer(contentFilter: contentFilter, configuration: streamConfig) { sb, err in
-                guard err == nil, let sb else { return }
-                guard let startPTS = meetingStartPTSProvider() else { return }
-
-                let pts = sb.presentationTimeStamp
-                let delta = CMTimeSubtract(pts, startPTS)
-                let tSec = max(0, CMTimeGetSeconds(delta))
-
-                guard let imgBuf = CMSampleBufferGetImageBuffer(sb) else { return }
-                let ci = CIImage(cvImageBuffer: imgBuf)
-                guard let cg = self.ciContext.createCGImage(ci, from: ci.extent) else { return }
-
-                let name = String(format: "t+%010.3f.png", tSec)
-                let fileURL = outputDir.appendingPathComponent(name)
-                self.writePNG(cgImage: cg, to: fileURL)
-
-                onScreenshotEvent(tSec, "screenshots/\(name)")
-            }
-        }
-        self.timer = t
-        t.resume()
-    }
-
-    func stop() {
-        timer?.cancel()
-        timer = nil
-    }
-
-    private func writePNG(cgImage: CGImage, to url: URL) {
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-            return
-        }
-        CGImageDestinationAddImage(dest, cgImage, nil)
-        CGImageDestinationFinalize(dest)
-    }
-}
-
 // MARK: - ScreenCaptureKit Helpers
 
 enum ScreenCaptureKitHelpers {

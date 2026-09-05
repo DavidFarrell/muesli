@@ -37,6 +37,7 @@ nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, 
     private var durationSeconds: Double?
     private var fileSize: Int64?
     private var failure: String?
+    private var observer: (@Sendable (RecordingArtifactSnapshot) -> Void)?
 
     init(url: URL) {
         self.url = url
@@ -60,7 +61,7 @@ nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, 
             fileSize = size >= 0 ? Int64(size) : nil
             return true
         }
-        if changed { completion.markCompleted() }
+        if changed { publishCompletion() }
     }
 
     func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
@@ -76,7 +77,7 @@ nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, 
             failure = error.localizedDescription
             return true
         }
-        if changed { completion.markCompleted() }
+        if changed { publishCompletion() }
     }
 
     func snapshot() -> RecordingArtifactSnapshot {
@@ -84,6 +85,24 @@ nonisolated final class RecordingDelegate: NSObject, SCRecordingOutputDelegate, 
             RecordingArtifactSnapshot(id: id, url: url, status: status,
                                       durationSeconds: durationSeconds, fileSize: fileSize, error: failure)
         }
+    }
+
+    /// One artifact owner receives the terminal event even if it subscribes
+    /// after the SDK callback. Delivery is outside the state lock.
+    func observeCompletion(_ callback: @escaping @Sendable (RecordingArtifactSnapshot) -> Void) {
+        let immediate = lock.withLock {
+            if status == .finished || status == .failed { return true }
+            precondition(observer == nil)
+            observer = callback
+            return false
+        }
+        if immediate { callback(snapshot()) }
+    }
+
+    private func publishCompletion() {
+        let callback = lock.withLock { let value = observer; observer = nil; return value }
+        completion.markCompleted()
+        callback?(snapshot())
     }
 
     @concurrent func waitForCompletion(timeoutSeconds: Double) async -> RecordingArtifactWaitResult {

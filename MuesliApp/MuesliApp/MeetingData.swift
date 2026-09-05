@@ -27,6 +27,7 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
     var streams: [String: MeetingStreamInfo]
     var timelineOffsetSeconds: Double? = nil
     var durationSeconds: Double? = nil
+    var artifactsFolder: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -36,6 +37,7 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
         case streams
         case timelineOffsetSeconds = "timeline_offset_seconds"
         case durationSeconds = "duration_seconds"
+        case artifactsFolder = "artifacts_folder"
     }
 }
 

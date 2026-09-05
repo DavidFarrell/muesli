@@ -55,6 +55,8 @@
 				ObjCExceptionCatching.swift,
 				OrphanedMeetingRecovery.swift,
 				RecordingArtifact.swift,
+				SessionArtifactStore.swift,
+				ScreenshotScheduler.swift,
 				PendingAudioGate.swift,
 				TempTranscriptCleanup.swift,
 				TaskCompletion.swift,
