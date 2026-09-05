@@ -23,6 +23,7 @@ actor BatchRediarizer {
         let t0: Double
         let t1: Double
         let text: String
+        var sourceSessionID: String? = nil
 
         enum CodingKeys: String, CodingKey {
             case speakerId = "speaker_id"
@@ -30,6 +31,7 @@ actor BatchRediarizer {
             case t0
             case t1
             case text
+            case sourceSessionID = "source_session_id"
         }
     }
 
@@ -37,6 +39,22 @@ actor BatchRediarizer {
         let turns: [Turn]
         let speakers: [String]
         let duration: Double
+        var sources: [SourceInventory]? = nil
+    }
+
+    nonisolated struct SourceInventory: Codable, Sendable {
+        let sourceSessionID: String
+        let audioFolder: String
+        let timelineOffsetSeconds: Double
+        let durationSeconds: Double
+        let storageKind: String
+        enum CodingKeys: String, CodingKey {
+            case sourceSessionID = "source_session_id"
+            case audioFolder = "audio_folder"
+            case timelineOffsetSeconds = "timeline_offset_seconds"
+            case durationSeconds = "duration_seconds"
+            case storageKind = "storage_kind"
+        }
     }
 
     nonisolated private struct StatusEnvelope: Codable {
@@ -54,6 +72,7 @@ actor BatchRediarizer {
         let turns: [Turn]
         let speakers: [String]
         let duration: Double
+        let sources: [SourceInventory]?
     }
 
     nonisolated private final class ProcessStore: @unchecked Sendable {
@@ -94,7 +113,8 @@ actor BatchRediarizer {
             if let failure = try? JSONDecoder().decode(ErrorEnvelope.self, from: data), failure.type == "error" {
                 lock.withLock { if error == nil { error = failure.message ?? "Batch reprocess failed." } }
             } else if let value = try? JSONDecoder().decode(ResultEnvelope.self, from: data), value.type == "result" {
-                lock.withLock { result = Result(turns: value.turns, speakers: value.speakers, duration: value.duration) }
+                lock.withLock { result = Result(turns: value.turns, speakers: value.speakers,
+                                               duration: value.duration, sources: value.sources) }
             } else if let status = try? JSONDecoder().decode(StatusEnvelope.self, from: data), status.type == "status" {
                 // A future progress stage is harmless; a malformed result is not.
                 return nil
