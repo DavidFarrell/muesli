@@ -1,0 +1,9 @@
+{
+  "meeting_metadata": 1,
+  "source_manifest": 1,
+  "session_asset_events": 1,
+  "transcript_transaction": 1,
+  "backend_frame_protocol": 1,
+  "build_identity": 1,
+  "observed_runtime_identity": 1
+}

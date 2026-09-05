@@ -6,6 +6,12 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+        BC0000010000000000000001 /* EmbeddedBuildIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000004; };
+        BC0000010000000000000002 /* EmbeddedBuildIdentity.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000004; };
+        BC0000010000000000000003 /* build-identity.json in Resources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000005; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		AA0000010000000000000008 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -17,6 +23,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+        BC0000010000000000000004 /* EmbeddedBuildIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddedBuildIdentity.swift; sourceTree = DERIVED_FILE_DIR; };
+        BC0000010000000000000005 /* build-identity.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "build-identity.json"; sourceTree = DERIVED_FILE_DIR; };
 		636552CF2F1D175D0042F2C9 /* MuesliApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MuesliApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000010000000000000001 /* MuesliAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MuesliAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -29,6 +37,7 @@
 				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
+				BuildIdentity.swift,
 				BatchRediarizer.swift,
 				BackendLogWriter.swift,
 				BackendOutputReader.swift,
@@ -130,6 +139,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 636552DA2F1D175E0042F2C9 /* Build configuration list for PBXNativeTarget "MuesliApp" */;
 			buildPhases = (
+				BC0000010000000000000006 /* Generate Build Identity */,
 				636552CB2F1D175D0042F2C9 /* Sources */,
 				636552CC2F1D175D0042F2C9 /* Frameworks */,
 				636552CD2F1D175D0042F2C9 /* Resources */,
@@ -152,6 +162,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = AA0000010000000000000006 /* Build configuration list for PBXNativeTarget "MuesliAppTests" */;
 			buildPhases = (
+				BC0000010000000000000007 /* Generate Test Build Identity */,
 				AA0000010000000000000004 /* Sources */,
 				AA0000010000000000000003 /* Frameworks */,
 			);
@@ -214,16 +225,45 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                BC0000010000000000000003,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+        BC0000010000000000000006 /* Generate Build Identity */ = {
+            isa = PBXShellScriptBuildPhase;
+            alwaysOutOfDate = 1;
+            buildActionMask = 2147483647;
+            files = ();
+            inputPaths = ("$(SRCROOT)/../scripts/write-build-identity.py", "$(SRCROOT)/../scripts/build-schemas.json");
+            name = "Generate Build Identity";
+            outputPaths = ("$(DERIVED_FILE_DIR)/EmbeddedBuildIdentity.swift", "$(DERIVED_FILE_DIR)/build-identity.json");
+            runOnlyForDeploymentPostprocessing = 0;
+            shellPath = /bin/sh;
+            shellScript = "set -eu\n/usr/bin/python3 \"$SRCROOT/../scripts/write-build-identity.py\" --root \"$SRCROOT/..\" --output \"$DERIVED_FILE_DIR\"\n";
+        };
+        BC0000010000000000000007 /* Generate Test Build Identity */ = {
+            isa = PBXShellScriptBuildPhase;
+            alwaysOutOfDate = 1;
+            buildActionMask = 2147483647;
+            files = ();
+            inputPaths = ("$(SRCROOT)/../scripts/write-build-identity.py", "$(SRCROOT)/../scripts/build-schemas.json");
+            name = "Generate Test Build Identity";
+            outputPaths = ("$(DERIVED_FILE_DIR)/EmbeddedBuildIdentity.swift", "$(DERIVED_FILE_DIR)/build-identity.json");
+            runOnlyForDeploymentPostprocessing = 0;
+            shellPath = /bin/sh;
+            shellScript = "set -eu\n/usr/bin/python3 \"$SRCROOT/../scripts/write-build-identity.py\" --root \"$SRCROOT/..\" --output \"$DERIVED_FILE_DIR\"\n";
+        };
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		636552CB2F1D175D0042F2C9 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                BC0000010000000000000001,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -231,6 +271,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                BC0000010000000000000002,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -282,7 +323,7 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -343,7 +384,7 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;

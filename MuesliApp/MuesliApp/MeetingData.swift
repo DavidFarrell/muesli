@@ -30,6 +30,9 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
     var artifactsFolder: String? = nil
     var artifactFinalization: MeetingArtifactFinalization? = nil
     var finalizationStatus: String? = nil
+    var buildIdentity: BuildIdentity? = nil
+    var sourceSessionID: String? = nil
+    var observedRuntimeIdentity: ObservedRuntimeIdentity? = nil
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -42,6 +45,9 @@ nonisolated struct MeetingSessionMetadata: Codable, Hashable, Sendable {
         case artifactsFolder = "artifacts_folder"
         case artifactFinalization = "artifact_finalization"
         case finalizationStatus = "finalization_status"
+        case buildIdentity = "build_identity"
+        case sourceSessionID = "source_session_id"
+        case observedRuntimeIdentity = "observed_runtime_identity"
     }
 }
 
@@ -101,6 +107,8 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
     var sessions: [MeetingSessionMetadata]
     var segmentCount: Int
     var speakerNames: [String: String]
+    var buildIdentity: BuildIdentity? = nil
+    var lastReprocessIdentity: ObservedRuntimeIdentity? = nil
 
     /// Preserve the observed previous outcome before Resume changes the meeting
     /// status to recording. Missing historical session evidence stays unknown.
@@ -177,6 +185,8 @@ nonisolated struct MeetingMetadata: Codable, Sendable {
         case sessions
         case segmentCount = "segment_count"
         case speakerNames = "speaker_names"
+        case buildIdentity = "build_identity"
+        case lastReprocessIdentity = "last_reprocess_identity"
     }
 }
 

@@ -464,28 +464,14 @@ final class AppModel: ObservableObject {
     var debugSystemErrorMessage: String { captureEngine.debugSystemErrorMessage }
     var debugAudioErrors: Int { captureEngine.debugAudioErrors }
     var backendLogPath: String? { backendLogURL?.path }
+    private var diagnosticSourceID: String?
+    private var diagnosticRuntimeIdentity: ObservedRuntimeIdentity?
     var debugSummary: String {
-        let tail = backendLogWriter.tailSnapshot(limit: 50).joined(separator: "\n")
-        return """
-        System buffers: \(debugSystemBuffers) frames: \(debugSystemFrames)
-        System PTS: \(String(format: "%.3f", debugSystemPTS))
-        System format: \(debugSystemFormat)
-        System errors: \(debugAudioErrors)
-        System last error: \(debugSystemErrorMessage)
-        Mic buffers: \(debugMicBuffers) frames: \(debugMicFrames)
-        Mic PTS: \(String(format: "%.3f", debugMicPTS))
-        Mic format: \(debugMicFormat)
-        Mic errors: \(debugMicErrors)
-        Mic last error: \(debugMicErrorMessage)
-        App Support: \(appSupportPath)
-        Backend folder: \(backendFolderPath)
-        Backend log: \(backendLogPath ?? "-")
-        Backend python: \(backendPythonCandidatePath ?? "-") exists=\(backendPythonExists)
-        Sandboxed: \(isSandboxed)
-        Transcript temp folder: \(tempTranscriptFolderPath ?? "-")
-        Backend log tail:
-        \(tail)
-        """
+        BuildDiagnostic.summary(runtime: diagnosticRuntimeIdentity, counters: [
+            "system_buffers": debugSystemBuffers, "system_frames": debugSystemFrames,
+            "system_errors": debugAudioErrors, "mic_buffers": debugMicBuffers,
+            "mic_frames": debugMicFrames, "mic_errors": debugMicErrors
+        ], sandboxed: isSandboxed)
     }
 
     private func resolveBackendPython(for root: URL) -> Result<String, BackendPythonError> {
@@ -679,7 +665,11 @@ final class AppModel: ObservableObject {
         if let data = line.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let type = obj["type"] as? String {
-            if type == "error" {
+            if type == "runtime_identity", let sessionFolderURL,
+               currentSession?.folderURL == sessionFolderURL,
+               let sourceID = diagnosticSourceID {
+                diagnosticRuntimeIdentity = ObservedRuntimeIdentity.event(line, sourceSessionID: sourceID)
+            } else if type == "error" {
                 let message = (obj["message"] as? String) ?? line
                 appendBackendLog("[error] \(message)", toTail: ingestIntoLiveTranscript, handle: backendLogHandle)
             } else if type == "status" {
@@ -2270,6 +2260,8 @@ final class AppModel: ObservableObject {
         let metadata = prepared.priorMetadata
         let timestampOffset = prepared.timestampOffset
         let sourceID = prepared.sourceID
+        diagnosticSourceID = sourceID
+        diagnosticRuntimeIdentity = nil
         let recorder = prepared.recorder
         let captureTimeline = prepared.timeline
         let session = MeetingSession(title: title, folderURL: folderURL, startedAt: prepared.startedAt)
@@ -3459,6 +3451,7 @@ final class AppModel: ObservableObject {
         }
         let replacement = try await transcriptModel.applyBatchResult(result, requestID: requestID, in: meeting.folderURL)
         let metadata = replacement.metadata
+        diagnosticRuntimeIdentity = metadata.lastReprocessIdentity
         // Use the committed worker result; do not reread storage on the UI.
         let updatedItem = MeetingHistoryItem(id: meeting.id, folderURL: meeting.folderURL,
                                              title: metadata.title, createdAt: metadata.createdAt,

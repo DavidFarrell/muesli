@@ -189,6 +189,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
             var updated = prior ?? MeetingMetadata(version: 1, title: title, createdAt: startedAt,
                 updatedAt: startedAt, durationSeconds: 0, lastTimestamp: 0, status: .recording,
                 sessions: [], segmentCount: 0, speakerNames: [:])
+            if prior == nil { updated.buildIdentity = .current }
             updated.preservePreviousSessionOutcome()
             updated.status = .recording
             updated.updatedAt = startedAt
@@ -196,7 +197,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
                 endedAt: nil, audioFolder: audio.lastPathComponent,
                 streams: ["system": MeetingStreamInfo(sampleRate: 16_000, channels: 1),
                           "mic": MeetingStreamInfo(sampleRate: 16_000, channels: 1)],
-                timelineOffsetSeconds: offset))
+                timelineOffsetSeconds: offset, buildIdentity: .current, sourceSessionID: sourceID))
             metadata = updated
             // Index the source before subsequent setup. Abandonment retains
             // this new, empty source as interrupted; prior sessions never move.

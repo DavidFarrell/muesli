@@ -159,11 +159,20 @@ final class MeetingStartPreparationTests: XCTestCase {
     func testReadyOwnershipTransferAndExclusiveLogsPreserveEarlierSession() async throws {
         let base = try root(), owner = MeetingStartPreparationOwner()
         guard case .ready(let first) = await owner.prepare(.init(title: "Ready", meetingsDirectory: base), timeoutSeconds: 2) else { return XCTFail("not ready") }
+        let firstMetadata = try metadata(first.folderURL)
+        XCTAssertEqual(firstMetadata.buildIdentity, .current)
+        XCTAssertEqual(firstMetadata.sessions[0].buildIdentity, .current)
+        XCTAssertEqual(firstMetadata.sessions[0].sourceSessionID, first.sourceID)
+        XCTAssertNil(firstMetadata.sessions[0].observedRuntimeIdentity)
         try first.logHandle.write(contentsOf: Data("first diagnostic\n".utf8))
         await close(first)
         try await idle(owner)
         guard case .ready(let second) = await owner.prepare(.init(title: "Ready", resumeFolder: first.folderURL), timeoutSeconds: 2) else { return XCTFail("resume failed") }
         XCTAssertEqual(second.sourceID == first.sourceID, false)
+        let resumedMetadata = try metadata(second.folderURL)
+        XCTAssertEqual(resumedMetadata.buildIdentity, firstMetadata.buildIdentity)
+        XCTAssertEqual(resumedMetadata.sessions.map(\.sourceSessionID), [first.sourceID, second.sourceID])
+        XCTAssertEqual(resumedMetadata.sessions.map(\.buildIdentity), [.current, .current])
         XCTAssertNotEqual(first.logURL, second.logURL)
         XCTAssertNotEqual(first.eventsURL, second.eventsURL)
         XCTAssertEqual(try String(contentsOf: first.logURL, encoding: .utf8), "first diagnostic\n")
