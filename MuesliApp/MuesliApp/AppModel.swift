@@ -242,19 +242,13 @@ final class AppModel: ObservableObject {
     // live on AppModel directly; both now live inside the forwarder.
     private let micAudioForwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
     // Owns backend.log file writes + the copy-debug ring buffer off
-    // MainActor (2026-07-06 livelock fix, item 5). `nonisolated(unsafe)`:
-    // BackendLogWriter is internally serialized on its own private queue
-    // (see its doc comment), so it is genuinely safe to call from any
-    // isolation domain, incl. `AudioLog.sink`'s arbitrary-queue closure -
-    // that is the entire point of moving it off MainActor.
-    private nonisolated(unsafe) let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
+    // MainActor. The writer explicitly opts out of default MainActor
+    // isolation and confines its mutable state to its own serial queue.
+    private nonisolated let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
     // Detects (and logs) a wedged main thread from entirely off-main code -
     // see its doc comment (2026-07-06 livelock fix, item 2). Assigned in
-    // init() since it depends on `backendLogWriter`/`micAudioForwarder`.
+    // init() since it depends on `backendLogWriter`.
     private let mainActorStarvationWatchdog: MainActorStarvationWatchdog
-    // Cheap storm tripwire - see its doc comment (2026-07-06 livelock fix,
-    // item 7). Assigned in init() for the same reason.
-    private let stormTripwire: RunLoopStormTripwire
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
@@ -284,7 +278,7 @@ final class AppModel: ObservableObject {
     private var transcriptEventsURL: URL?
     private var currentTranscriptEventsStartOffset: UInt64 = 0
     private var backendAccessURL: URL?
-    private var stdoutTask: Task<Void, Never>?
+    private var stdoutTask: CompletionTrackedTask?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let aecModeKey = "aecMode"
     private let inputSelectionModeKey = "inputSelectionMode"
@@ -349,9 +343,8 @@ final class AppModel: ObservableObject {
 
     init() {
         mainActorStarvationWatchdog = MainActorStarvationWatchdog(
-            logWriter: backendLogWriter, forwarder: micAudioForwarder
+            logWriter: backendLogWriter
         )
-        stormTripwire = RunLoopStormTripwire(logWriter: backendLogWriter)
 
         if let stored = UserDefaults.standard.string(forKey: aecModeKey),
            let mode = AECMode(rawValue: stored) {
@@ -371,16 +364,11 @@ final class AppModel: ObservableObject {
             self?.backendLogWriter.append("[audio] \(line)", toTail: true)
         }
 
-        // Safe only now: every stored property (including stormTripwire
-        // itself) is assigned by this point, so this escaping closure can
-        // capture `self`.
-        stormTripwire.setContextProvider { [weak self] in
-            guard let self else {
-                return RunLoopStormTripwire.Context(
-                    activeScreen: "-", transcriptRows: 0, historyCount: 0, meterPublishCount: 0
-                )
-            }
-            return RunLoopStormTripwire.Context(
+        // Sample UI context only when the watchdog's one outstanding echo
+        // executes. A stall report uses the last successful sample and its age.
+        mainActorStarvationWatchdog.setContextProvider { [weak self] in
+            guard let self else { return nil }
+            return MainActorStarvationWatchdog.Context(
                 activeScreen: String(describing: self.activeScreen),
                 transcriptRows: self.transcriptModel.segments.count,
                 historyCount: self.meetingHistory.count,
@@ -388,7 +376,6 @@ final class AppModel: ObservableObject {
             )
         }
         mainActorStarvationWatchdog.start()
-        stormTripwire.start()
 
         // Restore the persisted device policy (a pin survives relaunch by UID).
         inputSelection = Self.persistedSelection(
@@ -2422,8 +2409,12 @@ final class AppModel: ObservableObject {
                 try backend.start()
                 self.backend = backend
                 stdoutTask?.cancel()
-                stdoutTask = Task { @MainActor in
+                stdoutTask = CompletionTrackedTask { @MainActor in
                     for await line in backend.stdoutLines {
+                        // A bounded drain may request cancellation and close
+                        // this session's files before a pending next() resumes.
+                        // Never process a late buffered line after that point.
+                        guard !Task.isCancelled else { break }
                         let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
                         self.handleBackendJSONLine(
                             line,
@@ -2826,7 +2817,7 @@ final class AppModel: ObservableObject {
     private func finalizeStoppedMeeting(
         session: MeetingSession,
         backend: BackendProcess?,
-        stdoutTask: Task<Void, Never>?,
+        stdoutTask: CompletionTrackedTask?,
         backendLogHandle: FileHandle?,
         transcriptEventsHandle: FileHandle?,
         backendAccessURL: URL?,
@@ -2908,7 +2899,7 @@ final class AppModel: ObservableObject {
             )
         }
         backend?.cleanup()
-        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
+        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0, logHandle: backendLogHandle)
         synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
         backendLogWriter.synchronize(label: "backend log")
 
@@ -2977,27 +2968,16 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {
+    private func waitForStdoutDrain(task: CompletionTrackedTask?, timeoutSeconds: Double, logHandle: FileHandle?) async {
         guard let task else { return }
-        let finished = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                await task.value
-                return true
-            }
-            group.addTask {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                } catch {
-                    return false
-                }
-                return false
-            }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
-        }
-        if !finished {
+        let outcome = await task.wait(timeoutSeconds: timeoutSeconds)
+        if outcome != .completed {
             task.cancel()
+            appendBackendLog(
+                "Stdout drain \(outcome == .timedOut ? "timed out" : "wait cancelled"); cancellation requested, completion unconfirmed.",
+                toTail: false,
+                handle: logHandle
+            )
         }
     }
 

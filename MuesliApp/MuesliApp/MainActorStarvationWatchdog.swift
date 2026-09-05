@@ -1,124 +1,202 @@
 import Foundation
 
-/// Runs entirely off MainActor so it can detect - and log - a wedged main
-/// thread even WHILE it is wedged. This is the exact blind spot in the
-/// 2026-07-06 incident: the mic-frames watchdog and recovery ladder were
-/// both MainActor, so the storm that killed the mic feed also starved the
-/// machinery that should have noticed. This watchdog never triggers
-/// recovery itself (it can't - if MainActor is truly wedged there is no
-/// recovery action it could run there anyway); it only makes the failure
-/// mode diagnosable from backend.log/Console after the fact, without
-/// needing a live repro.
+/// A timer-owned liveness probe. There is at most one outstanding MainActor
+/// echo, including across stop/start. A late echo clears that slot; a timeout
+/// only reports it and never creates another task behind the blocked actor.
 ///
-/// Mechanism: a background timer pings MainActor with a trivial task and
-/// races it against a timeout. If the echo doesn't land within the
-/// threshold, MainActor is starved - log it (rate-limited while the
-/// condition persists) along with the mic forwarder's ground-truth liveness
-/// so the log answers "was the mic actually still flowing during this
-/// stall?" without needing to cross-reference anything else.
-final class MainActorStarvationWatchdog {
+/// `nonisolated` is essential with the app's MainActor default isolation.
+/// Mutable state belongs exclusively to `queue`; the unchecked conformance
+/// expresses that confinement, not permission to access it from other queues.
+nonisolated final class MainActorStarvationWatchdog: @unchecked Sendable {
+    struct Context: Sendable, Equatable {
+        let activeScreen: String
+        let transcriptRows: Int
+        let historyCount: Int
+        let meterPublishCount: Int
+    }
+
+    struct Report: Sendable, Equatable {
+        enum Kind: Sendable { case starved, recovered }
+        let kind: Kind
+        let elapsed: Duration
+        /// Context comes from the last completed echo, never a read during a
+        /// stall. It cannot establish current microphone or capture health.
+        let lastResponsiveContext: Context?
+        let contextAge: Duration?
+
+        var logLine: String {
+            var line = "mainactor.\(kind == .starved ? "starved" : "recovered") echo_ms=\(milliseconds(elapsed))"
+            if let context = lastResponsiveContext, let contextAge {
+                line += " last_responsive_context_age_ms=\(milliseconds(contextAge))"
+                line += " screen=\(context.activeScreen) transcript_rows=\(context.transcriptRows)"
+                line += " history=\(context.historyCount) meter_publishes_total=\(context.meterPublishCount)"
+            } else {
+                line += " last_responsive_context=unavailable"
+            }
+            return line
+        }
+
+        private func milliseconds(_ duration: Duration) -> Int64 {
+            let value = duration.components
+            return value.seconds * 1_000 + value.attoseconds / 1_000_000_000_000_000
+        }
+    }
+
+    /// Pure state machine: tests advance a monotonic clock without sleeping.
+    struct ProbeState: Sendable {
+        struct Pending: Sendable {
+            let id: UInt64
+            var sentAt: Duration
+        }
+        struct Tick: Sendable {
+            var echoID: UInt64?
+            var report: Report?
+        }
+
+        let threshold: Duration
+        let relogInterval: Duration
+        private(set) var running = false
+        private(set) var pending: Pending?
+        private var nextID: UInt64 = 0
+        private var lastStarvedReportAt: Duration?
+        private var lastContext: Context?
+        private var lastContextAt: Duration?
+
+        init(threshold: Duration, relogInterval: Duration) {
+            self.threshold = threshold
+            self.relogInterval = relogInterval
+        }
+
+        mutating func start(now: Duration) {
+            guard !running else { return }
+            running = true
+            lastStarvedReportAt = nil
+            // Keep the outstanding echo across restart. Its eventual reply
+            // still proves MainActor ran, with a fresh observation window.
+            pending?.sentAt = now
+        }
+
+        mutating func stop() {
+            running = false
+            lastStarvedReportAt = nil
+        }
+
+        mutating func tick(now: Duration) -> Tick {
+            guard running else { return Tick() }
+            guard let pending else {
+                nextID &+= 1
+                self.pending = Pending(id: nextID, sentAt: now)
+                return Tick(echoID: nextID)
+            }
+            let elapsed = now - pending.sentAt
+            guard elapsed >= threshold else { return Tick() }
+            if let lastStarvedReportAt, now - lastStarvedReportAt < relogInterval {
+                return Tick()
+            }
+            lastStarvedReportAt = now
+            return Tick(report: report(kind: .starved, elapsed: elapsed, now: now))
+        }
+
+        mutating func acknowledge(id: UInt64, now: Duration, context: Context?) -> Report? {
+            guard let pending, pending.id == id else { return nil }
+            self.pending = nil
+            let recovered = running && lastStarvedReportAt != nil
+                ? report(kind: .recovered, elapsed: now - pending.sentAt, now: now) : nil
+            lastStarvedReportAt = nil
+            lastContext = context
+            lastContextAt = context == nil ? nil : now
+            return recovered
+        }
+
+        private func report(kind: Report.Kind, elapsed: Duration, now: Duration) -> Report {
+            Report(kind: kind, elapsed: elapsed, lastResponsiveContext: lastContext,
+                   contextAge: lastContextAt.map { now - $0 })
+        }
+    }
+
     private let queue = DispatchQueue(label: "muesli.mainactor.watchdog", qos: .utility)
-    private var timer: DispatchSourceTimer?
-
+    private let clock = ContinuousClock()
+    private let origin: ContinuousClock.Instant
     private let logWriter: BackendLogWriter
-    private let forwarder: MicAudioForwarder
     private let pingIntervalSeconds: Double
-    private let starvedThresholdSeconds: Double
-    private let starvedRelogIntervalSeconds: Double
-
-    private var pingInFlight = false
-    private var isStarved = false
-    private var lastStarvedLogAt: Date = .distantPast
+    private var contextProvider: @MainActor @Sendable () -> Context?
+    private let onReport: (@Sendable (Report) -> Void)?
+    private var timer: DispatchSourceTimer?
+    private var state: ProbeState
 
     init(
         logWriter: BackendLogWriter,
-        forwarder: MicAudioForwarder,
         pingIntervalSeconds: Double = 2.0,
         starvedThresholdSeconds: Double = 5.0,
-        starvedRelogIntervalSeconds: Double = 10.0
+        starvedRelogIntervalSeconds: Double = 10.0,
+        contextProvider: @escaping @MainActor @Sendable () -> Context? = { nil },
+        onReport: (@Sendable (Report) -> Void)? = nil
     ) {
+        precondition(pingIntervalSeconds.isFinite && pingIntervalSeconds > 0)
+        precondition(starvedThresholdSeconds.isFinite && starvedThresholdSeconds > 0)
+        precondition(starvedRelogIntervalSeconds.isFinite && starvedRelogIntervalSeconds > 0)
         self.logWriter = logWriter
-        self.forwarder = forwarder
         self.pingIntervalSeconds = pingIntervalSeconds
-        self.starvedThresholdSeconds = starvedThresholdSeconds
-        self.starvedRelogIntervalSeconds = starvedRelogIntervalSeconds
+        self.contextProvider = contextProvider
+        self.onReport = onReport
+        origin = clock.now
+        state = ProbeState(threshold: .seconds(starvedThresholdSeconds),
+                           relogInterval: .seconds(starvedRelogIntervalSeconds))
+    }
+
+    deinit { timer?.cancel() }
+
+    func setContextProvider(_ provider: @escaping @MainActor @Sendable () -> Context?) {
+        queue.async { [self] in contextProvider = provider }
     }
 
     func start() {
-        stop()
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + pingIntervalSeconds, repeating: pingIntervalSeconds)
-        t.setEventHandler { [weak self] in self?.tick() }
-        timer = t
-        t.resume()
+        queue.async { [self] in
+            guard timer == nil else { return }
+            state.start(now: now())
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: pingIntervalSeconds)
+            timer.setEventHandler { [weak self] in self?.tick() }
+            self.timer = timer
+            timer.resume()
+        }
     }
 
     func stop() {
-        timer?.cancel()
-        timer = nil
-        pingInFlight = false
+        queue.async { [self] in
+            timer?.cancel()
+            timer = nil
+            state.stop()
+        }
     }
+
+    private func now() -> Duration { origin.duration(to: clock.now) }
 
     private func tick() {
-        guard !pingInFlight else { return }
-        pingInFlight = true
-        let sentAt = Date()
-        let threshold = starvedThresholdSeconds
-        let forwarder = self.forwarder
+        dispatchPrecondition(condition: .onQueue(queue))
+        let action = state.tick(now: now())
+        if let report = action.report { emit(report) }
+        guard let id = action.echoID else { return }
+        let contextProvider = self.contextProvider
+        Task { @MainActor [weak self] in
+            let context = contextProvider()
+            self?.acknowledge(id: id, context: context)
+        }
+    }
 
-        Task {
-            let echoed = await Self.echoMainActor(timeoutSeconds: threshold)
-            let elapsedMs = Int(Date().timeIntervalSince(sentAt) * 1000)
-            let snap = echoed ? nil : await forwarder.snapshot()
-            self.queue.async {
-                self.pingInFlight = false
-                self.handleEchoResult(echoed: echoed, elapsedMs: elapsedMs, snap: snap)
+    private func acknowledge(id: UInt64, context: Context?) {
+        queue.async { [self] in
+            if let report = state.acknowledge(id: id, now: now(), context: context) {
+                emit(report)
             }
         }
     }
 
-    /// Races a trivial MainActor hop against a timeout. If MainActor is free,
-    /// the hop wins almost instantly; if it's wedged in a continuous storm,
-    /// the timeout wins and this returns `false`. The (still-pending) echo
-    /// task is left to complete whenever MainActor eventually frees up -
-    /// harmless, since at most one ping is ever in flight at a time
-    /// (`pingInFlight` above).
-    private static func echoMainActor(timeoutSeconds: Double) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask { @MainActor in true }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                return false
-            }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
-        }
-    }
-
-    private func handleEchoResult(echoed: Bool, elapsedMs: Int, snap: MicAudioForwarder.Snapshot?) {
-        if echoed {
-            if isStarved {
-                isStarved = false
-                logWriter.append("mainactor.recovered echo_ms=\(elapsedMs)", toTail: true)
-            }
-            return
-        }
-
-        isStarved = true
-        let now = Date()
-        guard now.timeIntervalSince(lastStarvedLogAt) >= starvedRelogIntervalSeconds else { return }
-        lastStarvedLogAt = now
-
-        let sinceLastFrameMs: Int
-        if let last = snap?.lastFrameAt {
-            sinceLastFrameMs = Int(now.timeIntervalSince(last) * 1000)
-        } else {
-            sinceLastFrameMs = -1
-        }
-        logWriter.append(
-            "mainactor.starved echo_ms=\(elapsedMs) micFramesSinceLastMs=\(sinceLastFrameMs) micTotalFrames=\(snap?.frameCount ?? -1)",
-            toTail: true
-        )
+    private func emit(_ report: Report) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        // Reporting and file enqueue never await another executor. The log
+        // queue can persist this while MainActor is still stuck.
+        logWriter.append(report.logLine, toTail: true)
+        onReport?(report)
     }
 }
