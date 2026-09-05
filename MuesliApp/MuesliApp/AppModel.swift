@@ -2899,7 +2899,7 @@ final class AppModel: ObservableObject {
         let incomplete = inferenceFailed || exitStatus != 0 || !journalComplete
         let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
-            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+            let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
                     Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
@@ -3213,7 +3213,7 @@ final class AppModel: ObservableObject {
     ) async {
         let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
-            let operation = try TranscriptPersistenceStore.shared.start(in: session.folderURL,
+            let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
                     Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in

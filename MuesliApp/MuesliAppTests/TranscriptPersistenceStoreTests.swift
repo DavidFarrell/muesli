@@ -37,6 +37,52 @@ final class TranscriptPersistenceStoreTests: XCTestCase {
         XCTAssertTrue(gate.markTerminal(folder: folder, id: second))
     }
 
+    func testStopRetainsFinalizationBehindStalledMetadataEditWithoutCompetingOwners() async throws {
+        let (folder, _, _) = try fixture()
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let store = TranscriptPersistenceStore()
+        let edit = try store.start(in: folder) { context in
+            var metadata = try context.readMetadata()
+            metadata.title = "Saved before Stop"
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            try context.commit(files: ["meeting.json": encoder.encode(metadata)])
+            return true
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        let journal = folder.appendingPathComponent("events.jsonl")
+        let line = #"{"type":"segment","speaker_id":"system:0","stream":"system","source_session_id":"original","t0":0,"t1":1,"text":"durable final word"}"# + "\n"
+        try Data(line.utf8).write(to: journal)
+        var status = BackendStdoutStatus(); status.durableBytes = UInt64(line.utf8.count)
+        let frozenStatus = status
+        let finalization = try store.startAfterCurrent(in: folder) { context in
+            try TranscriptReplacement.commitStoppedMeeting(context: context, timestampOffset: 0,
+                segments: [], speakerNames: [:], journalURL: journal, journalStatus: frozenStatus,
+                sourceManifest: nil, artifactResult: nil, incomplete: true)
+        }
+        switch await finalization.wait(timeoutSeconds: 0.02) {
+        case .timedOut: break
+        default: XCTFail("Blocked finalization must retain a pending result")
+        }
+        XCTAssertThrowsError(try store.start(in: folder) { _ in true })
+        XCTAssertThrowsError(try store.startAfterCurrent(in: folder) { _ in true }, "only one terminal intent is retained")
+        let cancelledWait = Task { await finalization.wait(timeoutSeconds: 3) }
+        cancelledWait.cancel()
+        if case .cancelled = await cancelledWait.value {} else { XCTFail("Wait cancellation must be observed") }
+        release.signal()
+        let saved = try await finalization.value(timeoutSeconds: 3)
+        XCTAssertEqual(saved.title, "Saved before Stop")
+        XCTAssertEqual(saved.status, .degraded)
+        XCTAssertTrue(try String(contentsOf: folder.appendingPathComponent("transcript.txt"), encoding: .utf8).contains("durable final word"))
+        let originalCompleted = try await edit.value(timeoutSeconds: 1)
+        XCTAssertTrue(originalCompleted)
+        let next = try store.start(in: folder) { _ in true }
+        let admitted = try await next.value(timeoutSeconds: 1)
+        XCTAssertTrue(admitted)
+    }
+
     func testStoppedFinalizerReplaysOnlyDurableJournalAndCommitsAllFilesTogether() async throws {
         for fail in [false, true] {
             let (folder, old, _) = try fixture()
