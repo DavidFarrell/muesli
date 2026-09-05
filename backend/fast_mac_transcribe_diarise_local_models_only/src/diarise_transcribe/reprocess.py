@@ -6,6 +6,7 @@ Re-runs transcription + diarization on existing audio files.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import json
 import math
 import tempfile
@@ -15,22 +16,25 @@ import traceback
 from pathlib import Path
 from typing import List, Optional
 
-from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
-from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
-from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
-from .diarisation import DiarSegment
-from .merge import merge_transcript_with_diarisation
-from .recovery import (
-    RecoveryWindow,
-    cluster_recovery_windows,
-    drop_words_in_windows,
-    filter_words_in_window,
-    find_wordless_segments,
-    offset_words,
-    splice_words,
-)
-from .senko_diarisation import SenkoDiarizer
-from .source_recording import MANIFEST_NAME, CommittedSource, committed_sources
+# Model imports can emit diagnostics; reserve stdout for protocol events.
+with redirect_stdout(sys.stderr):
+    from .audio import normalise_audio, is_wav_16k_mono, check_ffmpeg, get_audio_duration, slice_wav_to_temp
+    from .asr import ASRModel, DEFAULT_MODEL, TranscriptResult, Word
+    from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
+    from .diarisation import DiarSegment
+    from .merge import merge_transcript_with_diarisation
+    from .recovery import (
+        RecoveryWindow,
+        cluster_recovery_windows,
+        drop_words_in_windows,
+        filter_words_in_window,
+        find_wordless_segments,
+        offset_words,
+        splice_words,
+    )
+    from .senko_diarisation import SenkoDiarizer
+    from .source_recording import MANIFEST_NAME, CommittedSource, committed_sources
+
 
 
 STREAM_FILES = {
@@ -39,8 +43,11 @@ STREAM_FILES = {
 }
 
 
+_protocol_stdout = None
+
+
 def emit(obj: dict) -> None:
-    print(json.dumps(obj), flush=True)
+    print(json.dumps(obj), file=_protocol_stdout or sys.stdout, flush=True)
 
 
 def emit_status(stage: str, stream: Optional[str] = None, **extra) -> None:
@@ -426,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def _main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
@@ -522,6 +529,19 @@ def main() -> int:
         print(message, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    global _protocol_stdout
+    previous = _protocol_stdout
+    _protocol_stdout = sys.stdout
+    try:
+        # Third-party inference prints belong to stderr, including nested
+        # calls. emit() retains the original stdout for JSONL result delivery.
+        with redirect_stdout(sys.stderr):
+            return _main()
+    finally:
+        _protocol_stdout = previous
 
 
 if __name__ == "__main__":

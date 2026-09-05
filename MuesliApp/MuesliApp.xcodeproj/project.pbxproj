@@ -29,6 +29,7 @@
 				AudioLog.swift,
 				AudioMetersModel.swift,
 				BackendProcess.swift,
+				BatchRediarizer.swift,
 				BackendLogWriter.swift,
 				BackendOutputReader.swift,
 				BackendStartupGate.swift,

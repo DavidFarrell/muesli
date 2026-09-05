@@ -199,3 +199,22 @@ def test_truncated_committed_source_fails_without_using_compatibility_wav(tmp_pa
     assert reprocess.main() == 1
     assert any("Truncated committed" in e.get("message", "") for e in events)
     assert (meeting / "audio" / "mic.pcm").read_bytes() == b"short"
+
+
+def test_model_diagnostics_do_not_contaminate_stdout_protocol(tmp_path, monkeypatch, capsys):
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    _write_wav_stub(audio / "mic.wav")
+    monkeypatch.setattr(reprocess, "get_audio_duration", lambda _: 1.0)
+
+    def noisy_model(*args, **kwargs):
+        print("model diagnostic is not JSON")
+        return {"turns": [], "speakers": [], "duration": 1.0}
+
+    monkeypatch.setattr(reprocess, "reprocess_stream", noisy_model)
+    monkeypatch.setattr(sys, "argv", ["reprocess.py", str(tmp_path), "--stream", "mic"])
+    assert reprocess.main() == 0
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines()]
+    assert events[-1]["type"] == "result"
+    assert "model diagnostic is not JSON" in captured.err

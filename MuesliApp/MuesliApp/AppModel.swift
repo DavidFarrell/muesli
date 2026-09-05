@@ -3504,7 +3504,7 @@ final class AppModel: ObservableObject {
     func runBatchRediarization(
         for meeting: MeetingHistoryItem,
         stream: BatchRediarizer.Stream,
-        progressHandler: @escaping (BatchRediarizer.Progress) -> Void
+        progressHandler: @escaping @MainActor @Sendable (BatchRediarizer.Progress) -> Void
     ) async throws -> BatchRediarizer.Result {
         guard let backendProjectRoot = backendFolderURL else {
             throw NSError(
