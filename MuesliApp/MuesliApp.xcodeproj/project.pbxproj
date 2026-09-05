@@ -37,6 +37,7 @@
 				LocalAudioRecorder.swift,
 				TranscriptEventJournal.swift,
 				MeetingData.swift,
+				MeetingStartPreparation.swift,
 				MeetingRenamer.swift,
 				MainActorStarvationWatchdog.swift,
 				MeterPublishGate.swift,

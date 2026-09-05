@@ -281,6 +281,7 @@ final class AppModel: ObservableObject {
     private var backend: BackendProcess?
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
+    private let meetingStartPreparation = MeetingStartPreparationOwner()
     private var sourceTimeline: CaptureTimeline?
     private var sessionArtifactStore: SessionArtifactStore?
     private var isPreparingResume = false
@@ -2149,18 +2150,18 @@ final class AppModel: ObservableObject {
 
     func startMeeting() async {
         guard !isStartingMeeting else { return }
-        await startMeeting(resuming: nil, metadata: nil, timestampOffset: 0)
+        await startMeeting(resuming: nil)
         if !isCapturing, case .start = activeScreen {
             await startHomeLevelPreview()
         }
     }
 
-    private func startMeeting(
-        resuming meeting: MeetingHistoryItem?,
-        metadata: MeetingMetadata?,
-        timestampOffset: Double
-    ) async {
+    private func startMeeting(resuming meeting: MeetingHistoryItem?) async {
         guard !isStartingMeeting else { return }
+        guard !meetingStartPreparation.isBusy else {
+            shareableContentError = "The previous start is still preparing or closing its files. Try again after that operation returns."
+            return
+        }
         // The choke point for BOTH the fresh-start (public startMeeting()) and
         // resume (resumeMeeting -> here directly) paths. stopMeeting() clears
         // isCapturing and flips activeScreen back to .start well before its
@@ -2179,7 +2180,6 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
-        refreshMeetingTitleForDateRollover()
         refreshPermissions()
         loadInputDevices()
         backendFolderError = nil
@@ -2242,78 +2242,67 @@ final class AppModel: ObservableObject {
             }
         }
 
-        var title = normaliseMeetingTitle(meetingTitle)
-        let folderURL: URL
-        let audioDir: URL
-        var sessionID = 1
-        if let meeting {
-            do {
-                let prepared = try prepareResumeSession(for: meeting)
-                folderURL = meeting.folderURL
-                audioDir = prepared.audioFolderURL
-                sessionID = prepared.sessionID
-            } catch {
-                shareableContentError = "Failed to prepare resume session: \(error)"
-                return
-            }
-        } else {
-            if let autoTitle = autoNumberedMeetingTitle(from: meetingTitle) {
-                meetingTitle = autoTitle
-                title = normaliseMeetingTitle(autoTitle)
-            }
-            do {
-                folderURL = try createMeetingFolder(title: title)
-                audioDir = folderURL.appendingPathComponent("audio", isDirectory: true)
-                try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
-            } catch {
-                shareableContentError = "Failed to create meeting folder: \(error)"
-                return
-            }
+        let request = MeetingStartPreparationOwner.Request(
+            title: normaliseMeetingTitle(meetingTitle),
+            automaticDatePrefix: parseAutoMeetingTitle(meetingTitle) == nil ? nil : Self.meetingDatePrefix(for: Date()),
+            resumeFolder: meeting?.folderURL,
+            video: captureMode == .video)
+        let prepared: MeetingStartPreparationOwner.Prepared
+        switch await meetingStartPreparation.prepare(request, timeoutSeconds: 8) {
+        case .ready(let value): prepared = value
+        case .failed(let message):
+            shareableContentError = "Could not prepare meeting files: \(message)"
+            return
+        case .timedOut:
+            shareableContentError = "Preparing meeting files took too long. The original operation still owns its files; another start will wait for its cleanup."
+            return
+        case .cancelled:
+            shareableContentError = "Meeting start was cancelled. Its file preparation will close before another start is allowed."
+            return
+        case .busy:
+            shareableContentError = "The previous meeting preparation is still closing its files."
+            return
         }
-
-        let session = MeetingSession(title: title, folderURL: folderURL, startedAt: Date())
+        let title = prepared.title
+        let folderURL = prepared.folderURL
+        let audioDir = prepared.audioDirectory
+        let metadata = prepared.priorMetadata
+        let timestampOffset = prepared.timestampOffset
+        let sourceID = prepared.sourceID
+        let recorder = prepared.recorder
+        let captureTimeline = prepared.timeline
+        let session = MeetingSession(title: title, folderURL: folderURL, startedAt: prepared.startedAt)
+        meetingTitle = title
         currentSession = session
+        sourceRecorder = recorder
+        sessionArtifactStore = prepared.artifacts
+        sourceTimeline = captureTimeline
+        inferenceFailure = nil
+        backendLogURL = prepared.logURL
+        backendLogHandle = prepared.logHandle
+        backendLogWriter.reset(handle: prepared.logHandle)
+        transcriptEventsURL = prepared.eventsURL
+        currentTranscriptEventsStartOffset = 0
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
-        if let metadata {
-            transcriptModel.speakerNames = metadata.speakerNames
+        transcriptModel.speakerNames = metadata?.speakerNames ?? [:]
+        if let data = prepared.transcriptData, let content = String(data: data, encoding: .utf8) {
+            for line in content.split(whereSeparator: \.isNewline) {
+                transcriptModel.ingest(jsonLine: String(line))
+            }
         }
-        if meeting != nil {
-            loadTranscriptFromDisk(in: folderURL)
-            loadAttachments(from: folderURL)
-        } else {
-            clearAttachments()
+        clearAttachments()
+        if let data = prepared.attachmentsData {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            do { currentAttachments = try decoder.decode(AttachmentsManifest.self, from: data).attachments }
+            catch { appendBackendLog("Failed to decode saved attachments: \(error.localizedDescription)", toTail: true) }
         }
-        if timestampOffset > 0 {
-            transcriptModel.timestampOffset = timestampOffset
-        }
+        transcriptModel.timestampOffset = timestampOffset
 
         do {
-            resetBackendLog(in: folderURL)
-            try resetTranscriptEventsLog(in: audioDir)
-            if meeting == nil {
-                try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
-            } else if let metadata {
-                try appendResumeSessionMetadata(metadata, for: session, sessionID: sessionID, audioFolderName: audioDir.lastPathComponent)
-            }
-
-            let sourceID = UUID().uuidString
-            guard timestampOffset.isFinite, timestampOffset >= 0, timestampOffset < 1_000_000_000 else {
-                throw LocalAudioRecorder.RecorderError.invalidManifest
-            }
-            let offsetUs = Int64(timestampOffset * 1_000_000)
-            let recorder = try await Task.detached {
-                try LocalAudioRecorder(directory: audioDir, sessionID: sourceID, timelineOffsetUs: offsetUs)
-            }.value
-            sourceRecorder = recorder
-            inferenceFailure = nil
-            let captureTimeline = CaptureTimeline()
+            try Task.checkCancellation()
             let recordURL: URL?
-            if captureMode == .video {
-                let artifacts = try await Task.detached {
-                    try SessionArtifactStore(meetingDirectory: folderURL, sourceSessionID: sourceID,
-                        timeline: captureTimeline, timelineOffsetUs: offsetUs)
-                }.value
-                sessionArtifactStore = artifacts
+            if let artifacts = prepared.artifacts {
                 captureEngine.recoveryRecordingURLProvider = { [artifacts] in artifacts.nextVideoURL() }
                 captureEngine.onRecordingOutputCreated = { [artifacts] in artifacts.retainRecording($0) }
                 guard let url = artifacts.nextVideoURL() else {
@@ -2321,10 +2310,7 @@ final class AppModel: ObservableObject {
                         userInfo: [NSLocalizedDescriptionKey: "Could not reserve a new video segment"])
                 }
                 recordURL = url
-                try updateSessionArtifactsMetadata(for: session, directory: artifacts.relativeDirectory,
-                                                   timelineOffsetSeconds: timestampOffset)
             } else {
-                sessionArtifactStore = nil
                 captureEngine.recoveryRecordingURLProvider = nil
                 captureEngine.onRecordingOutputCreated = nil
                 recordURL = nil
@@ -2382,13 +2368,6 @@ final class AppModel: ObservableObject {
             let metaData = try JSONSerialization.data(withJSONObject: meta)
             writer?.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
             appendBackendLog("Sent meeting_start", toTail: true)
-            updateMeetingMetadataStreams(
-                for: session,
-                systemSampleRate: systemSampleRate,
-                systemChannels: systemChannels,
-                micSampleRate: micSampleRate,
-                micChannels: micChannels
-            )
             // Readiness describes inference only. Capture already writes to
             // the app-owned source store and must continue during this wait.
             if let sessionBackend = backend {
@@ -3754,24 +3733,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { isPreparingResume = false }
-            do {
-                let metadata = try readMeetingMetadata(from: item.folderURL)
-                let directory = item.folderURL
-                let offset = try await Task.detached {
-                    try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: directory, metadata: metadata)
-                }.value
-                guard !isStartingMeeting, !isCapturing, !isFinalizing else { return }
-                let current = try readMeetingMetadata(from: item.folderURL)
-                guard current.sessions.map(\.sessionID) == metadata.sessions.map(\.sessionID) else {
-                    throw NSError(domain: "MeetingResume", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "Meeting sources changed during resume preparation"])
-                }
-                meetingTitle = current.title
-                await startMeeting(resuming: item, metadata: current, timestampOffset: offset)
-            } catch {
-                shareableContentError = "Cannot resume this meeting: \(error.localizedDescription)"
-                appendBackendLog("Failed to resume meeting \(item.id): \(error.localizedDescription)", toTail: true)
-            }
+            await startMeeting(resuming: item)
         }
     }
 

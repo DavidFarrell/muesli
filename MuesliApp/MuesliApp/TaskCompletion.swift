@@ -23,6 +23,8 @@ nonisolated final class TaskCompletion: @unchecked Sendable {
     // All mutable state is under lock. Continuations resume outside the lock.
     private let lock = NSLock()
     private var completed = false
+    private var observerInstalled = false
+    private var completionObserver: (@Sendable () -> Void)?
     private var waiters: [UUID: Waiter] = [:]
 
     func markCompleted() {
@@ -33,6 +35,25 @@ nonisolated final class TaskCompletion: @unchecked Sendable {
             return resolved
         }
         for waiter in resolved { waiter.resolve(.completed) }
+        let observer = lock.withLock {
+            let observer = completionObserver
+            completionObserver = nil
+            return observer
+        }
+        observer?()
+    }
+
+    /// One owner may observe real completion without creating a waiting task.
+    /// The callback runs on the completing caller, outside the state lock.
+    func observeCompletion(_ observer: @escaping @Sendable () -> Void) {
+        let callNow = lock.withLock {
+            precondition(!observerInstalled, "Only one completion owner may be registered")
+            observerInstalled = true
+            if completed { return true }
+            completionObserver = observer
+            return false
+        }
+        if callNow { observer() }
     }
 
     var pendingWaiterCount: Int { lock.withLock { waiters.count } }

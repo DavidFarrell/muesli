@@ -217,7 +217,22 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     }
 
     @concurrent func finish(timeoutSeconds: Double) async -> SessionArtifactFinishResult {
-        lock.withLock { closing = true; screenshotsAllowed = false }
+        requestFinish()
+        switch await completion.wait(timeoutSeconds: timeoutSeconds) {
+        case .completed: return .completed(status())
+        case .timedOut: return .timedOut(status())
+        case .cancelled: return .cancelled(status())
+        }
+    }
+
+    func requestFinish() {
+        let schedule = lock.withLock {
+            let schedule = !closing
+            closing = true
+            screenshotsAllowed = false
+            return schedule
+        }
+        guard schedule else { return }
         queue.async { [self] in
             let unregistered = lock.withLock {
                 let unregistered = videos.filter { $0.value.delegate == nil }.map(\.key)
@@ -227,11 +242,10 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
             if unregistered > 0 { persistFailure("A reserved video output was never created", kind: "video_not_created", count: unregistered) }
             finishIfReady()
         }
-        switch await completion.wait(timeoutSeconds: timeoutSeconds) {
-        case .completed: return .completed(status())
-        case .timedOut: return .timedOut(status())
-        case .cancelled: return .cancelled(status())
-        }
+    }
+
+    func observeClosed(_ observer: @escaping @Sendable () -> Void) {
+        completion.observeCompletion(observer)
     }
 
     private func completeVideo(_ state: RecordingArtifactSnapshot) {

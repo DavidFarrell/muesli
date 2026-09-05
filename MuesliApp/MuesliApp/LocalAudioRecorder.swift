@@ -252,6 +252,17 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     /// Expiry leaves the file owner and queued close intact; it never grants
     /// permission to close its handles from another queue or claim completion.
     func finish(timeoutSeconds: Double = 10) async -> Manifest? {
+        requestFinish()
+        let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
+        guard outcome == .completed else {
+            lock.withLock { closeWaitExpired = true }
+            return nil
+        }
+        return lock.withLock { closedManifest }
+    }
+
+    /// Nonblocking close admission, shared with abandoned-start cleanup.
+    func requestFinish() {
         let schedule = lock.withLock {
             accepting = false
             let schedule = !closeRequested
@@ -259,12 +270,12 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             return schedule
         }
         if schedule { queue.async { [self] in closeOnQueue() } }
-        let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
-        guard outcome == .completed else {
-            lock.withLock { closeWaitExpired = true }
-            return nil
-        }
-        return lock.withLock { closedManifest }
+    }
+
+    /// One immutable owner can retain an abandoned preparation until the
+    /// actual close and source-lease release, independently of wait deadlines.
+    func observeClosed(_ observer: @escaping @Sendable () -> Void) {
+        closeCompletion.observeCompletion(observer)
     }
 
     private func drain() {
