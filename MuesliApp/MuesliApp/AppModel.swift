@@ -472,7 +472,7 @@ final class AppModel: ObservableObject {
         Task.detached(priority: .background) { [weak self] in
             let removed = TempTranscriptCleanup.sweep(temporaryDirectory: FileManager.default.temporaryDirectory)
             guard removed > 0 else { return }
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 self?.appendBackendLog(
                     "Cleaned up \(removed) stale transcript temp folder(s) from previous launches.",
                     toTail: false
@@ -2496,7 +2496,7 @@ final class AppModel: ObservableObject {
         appendBackendLog("PATH: \(mergedPath)", toTail: true)
         appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
         backend.onExit = { [weak self] status in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
                     && self.transcriptEventsURL == sessionEventsURL
@@ -2511,7 +2511,7 @@ final class AppModel: ObservableObject {
             }
         }
         backend.onStderrLine = { [weak self] line in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
                     && self.transcriptEventsURL == sessionEventsURL
@@ -2540,7 +2540,7 @@ final class AppModel: ObservableObject {
         }
         let createdWriter = FramedWriter(stdinHandle: backend.stdin)
         createdWriter.onWriteError = { [weak self] error in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self, self.transcriptEventsURL == sessionEventsURL else { return }
                 self.handleBackendWriteError(error)
             }
@@ -2888,7 +2888,7 @@ final class AppModel: ObservableObject {
         do {
             let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
-                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
+                    Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
                 try TranscriptReplacement.commitStoppedMeeting(context: context,
                     timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
@@ -3081,7 +3081,7 @@ final class AppModel: ObservableObject {
         do {
             let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
-                    Task { @MainActor in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
+                    Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
                 let prior = try context.readMetadata()
                 let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
