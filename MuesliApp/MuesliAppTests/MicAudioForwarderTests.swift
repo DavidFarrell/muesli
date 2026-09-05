@@ -4,7 +4,7 @@ import XCTest
 /// frame `MicAudioForwarder` sends without needing a real `FramedWriter`
 /// (which requires a live `FileHandle` from a running process - see
 /// `FrameSending`'s doc comment in `MicAudioForwarder.swift`).
-private final class FakeFrameSender: FrameSending {
+nonisolated private final class FakeFrameSender: FrameSending, @unchecked Sendable {
     struct SentFrame {
         let type: MsgType
         let stream: StreamID
@@ -25,7 +25,7 @@ private final class FakeFrameSender: FrameSending {
 /// from sequential `await`-separated steps within a single test method (the
 /// actor under test never calls it concurrently with a test's `advance`), so
 /// `@unchecked Sendable` is safe here without actor isolation of its own.
-private final class FakeMicMonotonicClock: MicMonotonicClock, @unchecked Sendable {
+nonisolated private final class FakeMicMonotonicClock: MicMonotonicClock, @unchecked Sendable {
     private var microseconds: Int64 = 0
 
     func nowMicroseconds() -> Int64 { microseconds }
@@ -47,6 +47,12 @@ private final class FakeMicMonotonicClock: MicMonotonicClock, @unchecked Sendabl
 /// makes ahead of it, and must only reset via the meeting-scoped
 /// `beginMeeting`/`endMeeting` pair.
 final class MicAudioForwarderTests: XCTestCase {
+    private func packet(_ data: Data, clock: MicMonotonicClock, generation: Int) -> CapturedMicAudio {
+        CapturedMicAudio(data: data, captureTimeUs: clock.nowMicroseconds(), generation: generation,
+                         nativeSampleRate: 16000, nativeChannels: 1, nativeFrameCount: data.count / 2, formatEpoch: 1,
+                         outputSampleRate: 16000)
+    }
+
     private func makeSampleData(byteCount: Int = 320) -> Data {
         // Silent frame - the tests below exercise PTS/generation bookkeeping,
         // not level computation or meter gating, so content doesn't matter.
@@ -69,9 +75,9 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginGeneration(1, writer: sender)
         await forwarder.setOutputEnabled(true)
 
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
         clock.advance(seconds: 48.0)
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
 
         // Mirrors restartMeetingMicEngineForInputSwitch: stop() runs BEFORE
         // the next beginGeneration, mid-meeting. Must not clear the epoch.
@@ -80,7 +86,7 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.setOutputEnabled(true)
 
         clock.advance(seconds: 4.0)
-        let result = await forwarder.deliver(makeSampleData(), generation: 2)
+        let result = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 2))
 
         XCTAssertNotNil(result)
         XCTAssertEqual(
@@ -105,16 +111,16 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginMeeting()
         await forwarder.beginGeneration(1, writer: sender)
         await forwarder.setOutputEnabled(true)
-        let firstGen1 = await forwarder.deliver(makeSampleData(), generation: 1)
+        let firstGen1 = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
         XCTAssertEqual(firstGen1?.isFirstFrame, true)
-        let secondGen1 = await forwarder.deliver(makeSampleData(), generation: 1)
+        let secondGen1 = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
         XCTAssertEqual(secondGen1?.isFirstFrame, false)
 
         clock.advance(seconds: 48.0)
         await forwarder.stop()
         await forwarder.beginGeneration(2, writer: sender)
         await forwarder.setOutputEnabled(true)
-        let firstGen2 = await forwarder.deliver(makeSampleData(), generation: 2)
+        let firstGen2 = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 2))
         XCTAssertEqual(firstGen2?.isFirstFrame, true, "first-frame surfacing resets per generation")
     }
 
@@ -133,9 +139,9 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginGeneration(1, writer: sender)
         // Output deliberately NOT enabled yet - frames must queue.
 
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
         clock.advance(seconds: 0.5)
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
 
         XCTAssertTrue(sender.sent.isEmpty, "frames must queue, not send, before output is enabled")
 
@@ -162,7 +168,7 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginMeeting()
         await forwarder.beginGeneration(1, writer: sender)
         await forwarder.setOutputEnabled(true)
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
 
         clock.advance(seconds: 100.0)
         await forwarder.stop()
@@ -172,7 +178,7 @@ final class MicAudioForwarderTests: XCTestCase {
         await forwarder.beginMeeting()
         await forwarder.beginGeneration(2, writer: sender)
         await forwarder.setOutputEnabled(true)
-        let result = await forwarder.deliver(makeSampleData(), generation: 2)
+        let result = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 2))
 
         XCTAssertEqual(
             result?.elapsedSeconds ?? -1, 0.0, accuracy: 0.001,
@@ -198,7 +204,7 @@ final class MicAudioForwarderTests: XCTestCase {
 
         let frameCount = 120 // 12s at a 0.1s cadence - past the 10s timeout
         for _ in 0..<frameCount {
-            _ = await forwarder.deliver(makeSampleData(), generation: 1)
+            _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
             clock.advance(seconds: 0.1)
         }
         XCTAssertTrue(sender.sent.isEmpty, "nothing may reach the pipe before the backend is ready")
@@ -215,7 +221,7 @@ final class MicAudioForwarderTests: XCTestCase {
         }
 
         // Post-flush deliveries forward immediately.
-        _ = await forwarder.deliver(makeSampleData(), generation: 1)
+        _ = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 1))
         XCTAssertEqual(sender.sent.count, frameCount + 1)
     }
 
@@ -237,7 +243,7 @@ final class MicAudioForwarderTests: XCTestCase {
 
         // 640B frames against a 2,000B cap: only the newest 3 (1,920B) fit.
         for _ in 0..<10 {
-            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            _ = await forwarder.deliver(packet(makeSampleData(byteCount: 640), clock: clock, generation: 1))
             clock.advance(seconds: 0.1)
         }
         await forwarder.setOutputEnabled(true)
@@ -266,7 +272,7 @@ final class MicAudioForwarderTests: XCTestCase {
 
         let frameCount = 650 // 13s at 20ms per callback (640B each at 16kHz)
         for _ in 0..<frameCount {
-            _ = await forwarder.deliver(makeSampleData(byteCount: 640), generation: 1)
+            _ = await forwarder.deliver(packet(makeSampleData(byteCount: 640), clock: clock, generation: 1))
             clock.advance(seconds: 0.02)
         }
         await forwarder.setOutputEnabled(true)

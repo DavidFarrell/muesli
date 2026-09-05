@@ -8,18 +8,19 @@ import Foundation
 /// satisfies an `async` protocol requirement, because a cross-actor call
 /// already requires `await` at the call site - so neither conformer needs to
 /// change its own method signatures to adopt this.
-protocol MicCapturing: Actor {
+nonisolated protocol MicCapturing: Actor {
     /// - `pinned`: true when the device was a deliberate user pick (bind
     ///   unconditionally) rather than the system-default follow policy.
     /// - `onConfigurationChange`: fired when the OS moves the route, or (for
     ///   the capture-session engine) the bound device disconnects or the
     ///   session hits a runtime error. The caller re-resolves and restarts.
     func start(
+        generation: Int,
         enableVoiceProcessing: Bool,
         preferredInputDeviceID: UInt32?,
         pinned: Bool,
         onConfigurationChange: (@Sendable () -> Void)?,
-        onAudioData: @escaping (Data) -> Void
+        onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) async throws
 
     func stop() async

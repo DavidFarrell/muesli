@@ -14,7 +14,7 @@ import Foundation
 /// reads it). Moving both the ring buffer and the file I/O off MainActor
 /// removes that drumbeat entirely and means backend.log can keep being
 /// written even if the main thread is wedged.
-final class BackendLogWriter {
+nonisolated final class BackendLogWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "muesli.backend-log", qos: .utility)
     private var handle: FileHandle?
     private var ringBuffer: [String] = []
