@@ -40,7 +40,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     }
 
     struct PowerEvent: Codable, Sendable, Equatable {
-        enum Kind: String, Codable, Sendable { case willSleep = "will_sleep", didWake = "did_wake", monitorUnavailable = "monitor_unavailable" }
+        enum Kind: String, Codable, Sendable {
+            case willSleep = "will_sleep", didWake = "did_wake", monitorUnavailable = "monitor_unavailable"
+            case bindingDuringSleep = "binding_during_sleep"
+        }
         let kind: Kind
         let cycle_id: UUID?
         let source_time_us: Int64?
@@ -246,9 +249,14 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             guard !closeRequested else { return }
             if pendingPowerEvents.count < 128 { pendingPowerEvents.append(event) }
             else { omittedPowerEvents = min(Int64.max - 1, omittedPowerEvents) + 1 }
-            latestError = event.kind == .monitorUnavailable
-                ? "System sleep observation is unavailable; capture continuity cannot be verified."
-                : "Recording was interrupted by system sleep. The unrecorded interval is preserved in source power events."
+            switch event.kind {
+            case .monitorUnavailable:
+                latestError = "System sleep observation is unavailable; capture continuity cannot be verified."
+            case .bindingDuringSleep:
+                latestError = "Recording began during a pending sleep transition; capture continuity cannot be verified."
+            case .willSleep, .didWake:
+                latestError = "Recording was interrupted by system sleep. The unrecorded interval is preserved in source power events."
+            }
         }
     }
 

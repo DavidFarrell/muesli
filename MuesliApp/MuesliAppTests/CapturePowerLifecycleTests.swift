@@ -104,8 +104,25 @@ final class CapturePowerLifecycleTests: XCTestCase {
         let secondManifest = try await finished(second)
         XCTAssertEqual(firstManifest.power_events?.map(\.kind), [.willSleep])
         XCTAssertFalse(firstManifest.completed)
-        XCTAssertNil(secondManifest.power_events)
-        XCTAssertTrue(secondManifest.completed)
+        XCTAssertEqual(secondManifest.power_events?.map(\.kind), [.bindingDuringSleep])
+        XCTAssertNil(secondManifest.power_events?.first?.cycle_id, "The new source must not inherit the old cycle identity")
+        XCTAssertFalse(secondManifest.completed, "Pending wake cannot certify that new capture began after actual sleep")
+    }
+
+    func testFirstSourceBoundDuringPendingSleepHasUnknownContinuity() async throws {
+        let lifecycle = CapturePowerLifecycle()
+        lifecycle.willSleep() // No source was bound at this receipt.
+        let recorder = try LocalAudioRecorder(directory: folder())
+        lifecycle.bind(recorder: recorder, timeline: CaptureTimeline(), sourceSessionID: "first")
+        recorder.record(source: .mic, ptsUs: 0, payload: Data(repeating: 1, count: 3200))
+        lifecycle.didWake()
+        recorder.record(source: .mic, ptsUs: 100_000, payload: Data(repeating: 2, count: 3200))
+        XCTAssertNil(lifecycle.takeWake(), "The old unbound cycle cannot target a later source")
+        let manifest = try await finished(recorder)
+        XCTAssertFalse(manifest.completed)
+        XCTAssertEqual(manifest.power_events?.map(\.kind), [.bindingDuringSleep])
+        XCTAssertNil(manifest.power_events?.first?.observed_pause_us)
+        XCTAssertEqual(manifest.streams["mic"]?.committed_bytes, 6400)
     }
 
     func testRetiredPreviewAndCoalescedWakeMailbox() {

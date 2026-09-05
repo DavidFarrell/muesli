@@ -51,6 +51,12 @@ nonisolated final class CapturePowerLifecycle: @unchecked Sendable {
             if !monitorAvailable {
                 record(.monitorUnavailable, for: value, cycleID: nil, observed: observed, pauseUs: nil)
             }
+            if sleep != nil {
+                // A replacement/first source does not inherit the old cycle,
+                // but absence of its own WillSleep cannot prove it started
+                // after actual wake while HasPoweredOn is still pending.
+                record(.bindingDuringSleep, for: value, cycleID: nil, observed: observed, pauseUs: nil)
+            }
             return value.id
         }
     }
