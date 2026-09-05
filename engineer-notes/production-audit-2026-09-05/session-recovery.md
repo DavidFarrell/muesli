@@ -65,3 +65,10 @@ sources and mocked models, including a missing first legacy source and source
 inventory equality between mic-only and both-stream runs. Swift tests add a
 60-second source with last word at 10 seconds, an unknown earlier extent, derived
 export failure, and a zero-audio 300-second captured scope.
+
+Unscoped legacy recording.mp4 is explicitly ambiguous: old resumes could
+replace that one filename, and no source-specific capture extent exists. Resume
+therefore refuses to assign it to an audio session, even when that session has
+valid empty PCM/WAVs. Recovery/reprocessing access and the original file remain
+unchanged. The additional regression passes with the full 12-test recovery
+suite; log /private/tmp/muesli-legacy-video-tests.log.

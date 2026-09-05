@@ -26,6 +26,10 @@ nonisolated enum OrphanedMeetingRecovery {
         let root = folderURL.standardizedFileURL.resolvingSymlinksInPath()
         var end = 0.0
         guard !metadata.sessions.isEmpty else { throw resumeError("No source sessions are listed") }
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("recording.mp4").path),
+           metadata.sessions.contains(where: { $0.artifactsFolder == nil }) {
+            throw resumeError("This meeting has an unscoped legacy video whose session extent is unknown; its original media remains available for recovery and reprocessing")
+        }
         for session in metadata.sessions.sorted(by: { $0.sessionID < $1.sessionID }) {
             let audio = root.appendingPathComponent(session.audioFolder).standardizedFileURL.resolvingSymlinksInPath()
             guard audio.path.hasPrefix(root.path + "/") else { throw resumeError("Source folder is outside the meeting") }

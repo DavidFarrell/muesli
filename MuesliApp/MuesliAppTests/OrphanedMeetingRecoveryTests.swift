@@ -207,6 +207,19 @@ final class OrphanedMeetingRecoveryTests: XCTestCase {
         XCTAssertEqual(evidence.durationSeconds, 300)
         XCTAssertEqual(evidence.sessions.first?.durationSeconds, 300)
     }
+
+    func testUnscopedLegacyVideoCannotBeTreatedAsAnEmptyAudioSession() async throws {
+        let root = try folder()
+        let recorder = try LocalAudioRecorder(directory: root.appendingPathComponent("audio"))
+        _ = await recorder.finish()
+        let evidence = Data("legacy MP4 evidence without session provenance".utf8)
+        let video = root.appendingPathComponent("recording.mp4")
+        try evidence.write(to: video)
+        XCTAssertThrowsError(try OrphanedMeetingRecovery.verifiedResumeOffset(folderURL: root, metadata: metadata())) { error in
+            XCTAssertTrue(error.localizedDescription.contains("unscoped legacy video"))
+        }
+        XCTAssertEqual(try Data(contentsOf: video), evidence)
+    }
 }
 
 nonisolated private final class ResumeWriteCounter: @unchecked Sendable {
