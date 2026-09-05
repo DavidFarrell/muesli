@@ -263,6 +263,9 @@ final class AppModel: ObservableObject {
     private var backend: BackendProcess?
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
+    private let powerLifecycle = SystemPowerObserver.shared.lifecycle
+    private var powerBindingID: UUID?
+    private var powerBindingIsMeeting = false
     private var currentMeetingAccess: MeetingFileAccess?
     private let meetingStartPreparation = MeetingStartPreparationOwner()
     private var sourceTimeline: CaptureTimeline?
@@ -421,6 +424,13 @@ final class AppModel: ObservableObject {
             )
         }
         mainActorStarvationWatchdog.start()
+        powerLifecycle.setWakeHandler { [weak self, powerLifecycle] in
+            Task { @MainActor [weak self] in
+                guard let wake = powerLifecycle.takeWake() else { return }
+                self?.handleSystemWake(wake)
+            }
+        }
+        SystemPowerObserver.shared.start()
 
         // Restore the persisted device policy (a pin survives relaunch by UID).
         inputSelection = Self.persistedSelection(
@@ -1048,6 +1058,10 @@ final class AppModel: ObservableObject {
             return
         }
 
+        if powerBindingID == nil {
+            powerBindingIsMeeting = false
+            powerBindingID = powerLifecycle.bind()
+        }
         if !isPreviewCaptureRunning {
             if let display = selectedDisplay ?? displays.first {
             let audioFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
@@ -1164,6 +1178,7 @@ final class AppModel: ObservableObject {
     }
 
     private func stopHomeLevelPreviewNow() async {
+        if !powerBindingIsMeeting { retirePowerBinding() }
         if let engine = previewMicEngine,
            await stopNativeMicrophone(engine, ingress: previewMicAudioIngress, preview: true) {
             await previewMicAudioIngress?.finish()
@@ -1218,6 +1233,30 @@ final class AppModel: ObservableObject {
             await model.stopHomeLevelPreviewNow()
             await model.startHomeLevelPreviewNow()
         }
+    }
+
+    private func retirePowerBinding() {
+        if let id = powerBindingID { powerLifecycle.retire(id) }
+        powerBindingID = nil
+        powerBindingIsMeeting = false
+    }
+
+    private func handleSystemWake(_ wake: CapturePowerLifecycle.Wake) {
+        guard powerBindingID == wake.bindingID else { return }
+        if powerBindingIsMeeting {
+            guard sourceRecorder != nil, !isFinalizing, wake.sourceSessionID == diagnosticSourceID else { return }
+            if transcribeMic {
+                micHealth.invalidateAfterSystemWake()
+            }
+        } else {
+            guard wantsHomeLevelPreview else { return }
+            previewMicHealth.invalidateAfterSystemWake()
+        }
+        captureEngine.invalidateAfterSystemWake()
+        // Health invalidation rejects old-generation progress. The existing
+        // supervisor performs bounded, coalesced source/preview reconciliation
+        // when the original native owner is available, including silent SCK.
+        startMicFramesWatchdog()
     }
 
     private func shouldEnableVoiceProcessing() -> Bool {
@@ -2161,6 +2200,8 @@ final class AppModel: ObservableObject {
         meetingCatalog.protect(folderURL)
         currentSession = session
         sourceRecorder = recorder
+        powerBindingIsMeeting = true
+        powerBindingID = powerLifecycle.bind(recorder: recorder, timeline: captureTimeline, sourceSessionID: sourceID)
         currentMeetingAccess = prepared.access
         sessionArtifactStore = prepared.artifacts
         sourceTimeline = captureTimeline
@@ -2405,6 +2446,7 @@ final class AppModel: ObservableObject {
         wasResume: Bool,
         priorMetadata: MeetingMetadata?
     ) async {
+        retirePowerBinding()
         let stoppingAccess = currentMeetingAccess
         defer { currentMeetingAccess = nil; withExtendedLifetime(stoppingAccess) {} }
         let stoppingArtifacts = takeSessionArtifactStore()
@@ -2489,6 +2531,7 @@ final class AppModel: ObservableObject {
 
     func stopMeeting() async {
         guard isCapturing, !isFinalizing else { return }
+        retirePowerBinding()
         let stoppingAccess = currentMeetingAccess
 
         isFinalizing = true

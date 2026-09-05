@@ -86,6 +86,11 @@ nonisolated struct CaptureSourceHealth: Sendable {
         }
     }
 
+    mutating func invalidateAfterSystemWake(now: Date = Date()) {
+        resetRecoveryBudget(now: now)
+        fail("Capture was interrupted by system sleep.", now: now)
+    }
+
     mutating func reset() { self = CaptureSourceHealth(maximumAttempts: maximumAttempts) }
 }
 

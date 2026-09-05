@@ -342,6 +342,13 @@ final class CaptureEngine: NSObject {
         health.resetRecoveryBudget()
     }
 
+    func invalidateAfterSystemWake() {
+        guard desiredIntent.active else { return }
+        health.invalidateAfterSystemWake()
+        // Existing supervision waits for the original operation owner; fresh
+        // callbacks cannot clear this invalidation before a new generation.
+    }
+
     func restartCapture(expectedRequest: Int? = nil) async -> Bool {
         if let expectedRequest, !desiredIntent.matches(expectedRequest) { return false }
         guard let request, !operationOwner.isBusy else { return false }

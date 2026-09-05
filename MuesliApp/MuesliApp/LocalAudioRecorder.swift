@@ -34,6 +34,20 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         var last_problem: String?
         var losses: [Loss] = []
         var loss_details_omitted: Int64 = 0
+        // Optional additive fields keep manifests from older app versions readable.
+        var power_events: [PowerEvent]?
+        var power_events_omitted: Int64?
+    }
+
+    struct PowerEvent: Codable, Sendable, Equatable {
+        enum Kind: String, Codable, Sendable { case willSleep = "will_sleep", didWake = "did_wake", monitorUnavailable = "monitor_unavailable" }
+        let kind: Kind
+        let cycle_id: UUID?
+        let source_time_us: Int64?
+        let process_continuous_us: Int64
+        // Duration between observed notifications, not claimed captured media
+        // or an exact kernel sleep duration. Never changes PCM sample positions.
+        let observed_pause_us: Int64?
     }
 
     struct Loss: Codable, Sendable {
@@ -111,6 +125,8 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var lastCommitUptime = ProcessInfo.processInfo.systemUptime
     private var rejectedLosses: [Loss] = []
     private var omittedLosses: Int64 = 0
+    private var pendingPowerEvents: [PowerEvent] = []
+    private var omittedPowerEvents: Int64 = 0
     private var closedManifest: Manifest?
     private let closeCompletion = TaskCompletion()
 
@@ -220,6 +236,19 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             Self.addLoss(Loss(source: source.rawValue, reason: "source_failure_unknown_range",
                               start_frame: nil, end_frame: nil, frames: 0),
                          to: &rejectedLosses, omitted: &omittedLosses)
+        }
+    }
+
+    /// Admission only; the original source queue commits both evidence and the
+    /// incomplete marker even if post-wake native audio resumes immediately.
+    func reportPowerEvent(_ event: PowerEvent) {
+        lock.withLock {
+            guard !closeRequested else { return }
+            if pendingPowerEvents.count < 128 { pendingPowerEvents.append(event) }
+            else { omittedPowerEvents = min(Int64.max - 1, omittedPowerEvents) + 1 }
+            latestError = event.kind == .monitorUnavailable
+                ? "System sleep observation is unavailable; capture continuity cannot be verified."
+                : "Recording was interrupted by system sleep. The unrecorded interval is preserved in source power events."
         }
     }
 
@@ -374,9 +403,24 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let error = latestError
         let losses = rejectedLosses
         let omitted = omittedLosses
+        let power = pendingPowerEvents
+        let powerOmitted = omittedPowerEvents
         rejectedLosses.removeAll()
         omittedLosses = 0
+        pendingPowerEvents.removeAll(keepingCapacity: true)
+        omittedPowerEvents = 0
         lock.unlock()
+        if !power.isEmpty || powerOmitted > 0 {
+            var recorded = manifest.power_events ?? []
+            let admitted = power.prefix(max(0, 128 - recorded.count))
+            recorded.append(contentsOf: admitted)
+            manifest.power_events = recorded
+            let lost = powerOmitted.addingReportingOverflow(Int64(power.count - admitted.count))
+            let total = (manifest.power_events_omitted ?? 0).addingReportingOverflow(lost.partialValue)
+            manifest.power_events_omitted = lost.overflow || total.overflow ? Int64.max : total.partialValue
+            manifest.completed = false
+            dirty = true
+        }
         for loss in losses {
             appendManifestLoss(loss)
             dirty = true
@@ -443,6 +487,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
                 try Self.exportWAVs(manifest: manifest, directory: directory, beforeIO: beforeIO)
                 manifest.completed = failedSources.isEmpty && manifest.problem_count == 0
                     && manifest.streams.values.allSatisfy { $0.dropped_frames == 0 }
+                    && (manifest.power_events?.isEmpty ?? true) && (manifest.power_events_omitted ?? 0) == 0
                 dirty = true
                 commitIfNeeded()
             } catch {
@@ -510,6 +555,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         guard result.schema_version == 1, !result.session_id.isEmpty,
               result.timeline_offset_us >= 0,
               result.streams.count == Source.allCases.count else { throw RecorderError.invalidManifest }
+        guard (result.power_events?.count ?? 0) <= 128, (result.power_events_omitted ?? 0) >= 0,
+              result.power_events?.allSatisfy({ $0.process_continuous_us >= 0 && ($0.source_time_us ?? 0) >= 0 && ($0.observed_pause_us ?? 0) >= 0 }) ?? true else {
+            throw RecorderError.invalidManifest
+        }
         for source in Source.allCases {
             guard let state = result.streams[source.rawValue], state.sample_rate == 16_000,
                   state.channels == 1, state.committed_bytes >= 0, state.committed_bytes % 2 == 0,

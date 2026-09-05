@@ -73,6 +73,8 @@
 				CapturedMicAudio.swift,
 				CaptureEngine.swift,
 				CaptureSourceHealth.swift,
+				CapturePowerLifecycle.swift,
+				SystemPowerObserver.swift,
 				CaptureOperationOwner.swift,
 				AudioConverterHelper.swift,
 				MicCapturing.swift,
