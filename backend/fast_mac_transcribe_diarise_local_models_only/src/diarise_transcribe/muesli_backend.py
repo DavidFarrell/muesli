@@ -24,6 +24,7 @@ from .asr import ASRModel, DEFAULT_MODEL
 from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
 from .diarisation import DiarSegment
 from .merge import merge_transcript_with_diarisation
+from .source_recording import CommittedSource, committed_sources
 
 MSG_AUDIO = 1
 MSG_SCREENSHOT_EVENT = 2
@@ -78,39 +79,78 @@ def read_exact(f: BinaryIO, n: int) -> bytes:
 
 
 class StdoutWriter:
-    def __init__(self) -> None:
-        self._queue: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
+    """Bounded delivery: inference can wait for the reader; source capture cannot.
+
+    close acknowledges delivery rather than merely enqueueing a daemon-thread
+    sentinel. A broken or stalled stdout is an inference failure, never a reason
+    to delete source PCM. The app owns the process deadline and source recording.
+    """
+    def __init__(self, output=None, capacity: int = 256) -> None:
+        self._output = output if output is not None else sys.stdout
+        self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=max(1, capacity))
+        self._lock = threading.Lock()
+        self._closing = False
+        self._close_lock = threading.Lock()
+        self._sentinel_enqueued = False
+        self._error: Optional[BaseException] = None
         self._thread = threading.Thread(target=self._run, name="stdout-writer", daemon=True)
         self._thread.start()
 
     def write(self, line: str) -> None:
-        self._queue.put(line)
+        if len(line.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("backend event exceeds 4 MiB limit")
+        while True:
+            with self._lock:
+                if self._error is not None:
+                    raise RuntimeError("backend stdout delivery failed") from self._error
+                if self._closing:
+                    raise RuntimeError("backend stdout is closed")
+                try:
+                    self._queue.put_nowait(line)
+                    return
+                except queue.Full:
+                    pass
+            time.sleep(0.005)
 
-    def close(self) -> None:
-        self._queue.put(None)
+    def close(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        if not self._close_lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
+            with self._lock:
+                self._closing = True
+            if not self._sentinel_enqueued and self._thread.is_alive():
+                try:
+                    self._queue.put(None, timeout=max(0.0, deadline - time.monotonic()))
+                    self._sentinel_enqueued = True
+                except queue.Full:
+                    return False
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            with self._lock:
+                return not self._thread.is_alive() and self._error is None
+        finally:
+            self._close_lock.release()
 
     def _run(self) -> None:
-        while True:
-            line = self._queue.get()
-            if line is None:
-                break
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except Exception:
-                pass
+        try:
+            while True:
+                line = self._queue.get()
+                if line is None:
+                    break
+                self._output.write(line)
+                self._output.flush()
+        except BaseException as exc:
+            with self._lock:
+                self._error = exc
 
 
 def emit_jsonl(obj: dict, writer: Optional["StdoutWriter"] = None) -> None:
     line = json.dumps(obj, ensure_ascii=False) + "\n"
-    try:
-        if writer:
-            writer.write(line)
-        else:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-    except Exception:
-        return
+    if writer:
+        writer.write(line)
+    else:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def log(msg: str, verbose: bool) -> None:
@@ -251,7 +291,7 @@ def write_aligned_audio(
 
 def snapshot_stream(writer: StreamWriter, sample_rate: int, channels: int) -> StreamSnapshot:
     pcm_path = writer.path.with_suffix(".pcm")
-    size = pcm_path.stat().st_size if pcm_path.exists() else 0
+    size = writer.size_bytes if isinstance(writer, CommittedSource) else (pcm_path.stat().st_size if pcm_path.exists() else 0)
     return StreamSnapshot(
         pcm_path=pcm_path,
         sample_rate=sample_rate,
@@ -290,7 +330,8 @@ def write_wav_chunk(
             while remaining > 0:
                 chunk = pcm.read(min(1024 * 1024, remaining))
                 if not chunk:
-                    break
+                    temp_path.unlink(missing_ok=True)
+                    raise ValueError("Committed source was truncated while reading an inference snapshot")
                 wav_out.writeframes(chunk)
                 remaining -= len(chunk)
 
@@ -520,6 +561,7 @@ class LiveProcessor:
         self._event = threading.Event()
         self._stop_event = threading.Event()
         self._finalize_requested = False
+        self.finalization_succeeded = False
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -530,13 +572,21 @@ class LiveProcessor:
         if duration >= self._live_min_seconds and (duration - self._last_processed_duration) >= self._live_interval:
             self._event.set()
 
-    def stop(self, finalize: bool) -> None:
+    def stop(self, finalize: bool) -> bool:
         self._finalize_requested = finalize
         self._stop_event.set()
         self._event.set()
         self._thread.join()
+        return self.finalization_succeeded
 
     def _snapshot(self) -> Optional[StreamSnapshot]:
+        if self._state.source_directory is not None:
+            with self._state.lock:
+                session_id = self._state.source_session_id
+            if session_id is None:
+                return None  # Wait for the meeting-start control/identity.
+            source = committed_sources(self._state.source_directory, session_id)[self._stream_name]
+            return snapshot_stream(source, source.sample_rate, source.channels)
         with self._state.lock:
             writer = self._state.get_stream(self._stream_name)
             if self._stream_name == "system":
@@ -550,18 +600,36 @@ class LiveProcessor:
         return snapshot_stream(writer, sample_rate, channels)
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._event.wait(timeout=0.5)
-            self._event.clear()
-            if self._maybe_process(finalize=False):
-                continue
-        if self._finalize_requested:
-            self._maybe_process(finalize=True)
+        try:
+            while not self._stop_event.is_set():
+                self._event.wait(timeout=0.5)
+                self._event.clear()
+                self._maybe_process(finalize=False)
+            if self._finalize_requested:
+                self.finalization_succeeded = self._maybe_process(finalize=True)
+        except Exception as exc:
+            # Includes snapshot/chunk/emitter failures that would otherwise
+            # kill only this daemon thread and leave process exit falsely clean.
+            self.finalization_succeeded = False
+            emit_jsonl({"type": "error", "stream": self._stream_name,
+                        "message": f"processing_thread_failed: {exc}"}, self._state.stdout_writer)
 
     def _maybe_process(self, finalize: bool) -> bool:
-        snapshot = self._snapshot()
-        if not snapshot or snapshot.size_bytes <= 0:
+        try:
+            snapshot = self._snapshot()
+        except (OSError, ValueError) as exc:
+            # A storage/manifest fault stops this processing attempt, never the
+            # source recorder. The live polling loop can retry after recovery.
+            message = f"source_snapshot_failed: {exc}"
+            if getattr(self, "_last_snapshot_error", None) != message:
+                emit_jsonl({"type": "error", "message": message}, self._state.stdout_writer)
+                self._last_snapshot_error = message
             return False
+        self._last_snapshot_error = None
+        if not snapshot:
+            return False
+        if snapshot.size_bytes == 0:
+            return finalize  # Empty source is distinct from failed inference.
 
         bytes_per_sec = snapshot.sample_rate * snapshot.channels * BYTES_PER_SAMPLE
         if bytes_per_sec <= 0:
@@ -652,6 +720,8 @@ class BackendState:
     def __init__(self, stdout_writer: StdoutWriter) -> None:
         self.lock = threading.Lock()
         self.stdout_writer = stdout_writer
+        self.source_directory: Optional[Path] = None
+        self.source_session_id: Optional[str] = None
         self.system_writer: Optional[StreamWriter] = None
         self.mic_writer: Optional[StreamWriter] = None
         self.sample_rate: int = 48000
@@ -677,6 +747,10 @@ def create_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=".",
         help="Directory to write capture artifacts (default: current directory)",
+    )
+    parser.add_argument(
+        "--source-recording", action="store_true",
+        help="Read app-owned committed PCM from output-dir; never write or delete source audio",
     )
     parser.add_argument(
         "--transcribe-stream",
@@ -774,8 +848,23 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stdout_writer = StdoutWriter()
+    protocol_stdout = sys.stdout
+    stdout_writer = StdoutWriter(protocol_stdout)
+    # Reserve the original stream for framed JSON events. Third-party model
+    # diagnostics must not corrupt the authoritative protocol journal.
+    sys.stdout = sys.stderr
+    try:
+        result = _run_backend(args, output_dir, stdout_writer)
+    finally:
+        sys.stdout = protocol_stdout
+        delivered = stdout_writer.close()
+    return result if delivered else 1
+
+
+def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
     state = BackendState(stdout_writer)
+    if args.source_recording:
+        state.source_directory = output_dir
     emitter = TranscriptEmitter(stdout_writer, finalize_lag=args.finalize_lag)
 
     transcribe_streams = ["system", "mic"] if args.transcribe_stream == "both" else [args.transcribe_stream]
@@ -831,20 +920,29 @@ def main() -> int:
                     meeting_meta.get("mic_channels", meeting_meta.get("channels", state.channels))
                 )
 
-                state.system_writer = open_stream_writer(
-                    output_dir / "system.wav",
-                    state.system_sample_rate,
-                    state.system_channels
-                )
-                state.mic_writer = open_stream_writer(
-                    output_dir / "mic.wav",
-                    state.mic_sample_rate,
-                    state.mic_channels
-                )
+                if args.source_recording:
+                    expected = meeting_meta.get("source_session_id")
+                    if not isinstance(expected, str) or not expected:
+                        raise ValueError("App-owned source mode requires source_session_id")
+                    sources = committed_sources(output_dir, expected)
+                    state.source_session_id = expected
+                    state.sample_rate = state.system_sample_rate = state.mic_sample_rate = 16000
+                    state.channels = state.system_channels = state.mic_channels = 1
+                    state.system_writer = sources["system"]
+                    state.mic_writer = sources["mic"]
+                else:
+                    state.system_writer = open_stream_writer(
+                        output_dir / "system.wav", state.system_sample_rate, state.system_channels
+                    )
+                    state.mic_writer = open_stream_writer(
+                        output_dir / "mic.wav", state.mic_sample_rate, state.mic_channels
+                    )
 
             emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_writer)
 
         elif msg_type == MSG_AUDIO:
+            if args.source_recording:
+                raise ValueError("App-owned source mode does not accept audio over stdin")
             t = pts_us / 1_000_000.0
             with state.lock:
                 if stream_id == STREAM_SYSTEM and state.system_writer:
@@ -885,17 +983,25 @@ def main() -> int:
             emit_jsonl({"type": "status", "message": "meeting_stopped"}, stdout_writer)
             break
 
+    processing_complete = True
     if not args.no_live:
         for live_processor in live_processors.values():
-            live_processor.stop(finalize=True)
+            processing_complete = live_processor.stop(finalize=True) and processing_complete
 
     with state.lock:
         system_writer = state.system_writer
         mic_writer = state.mic_writer
 
-    if system_writer:
+    if args.source_recording and state.source_session_id is not None:
+        # Refresh the final committed high-water marks. Python never closes,
+        # exports over, or deletes either of the app's authoritative files.
+        sources = committed_sources(output_dir, state.source_session_id)
+        system_writer = sources["system"]
+        mic_writer = sources["mic"]
+
+    if system_writer and not args.source_recording:
         close_stream_writer(system_writer)
-    if mic_writer:
+    if mic_writer and not args.source_recording:
         close_stream_writer(mic_writer)
 
     writers = {"system": system_writer, "mic": mic_writer}
@@ -904,8 +1010,8 @@ def main() -> int:
         writer = writers.get(stream_name)
         if not writer or writer.bytes_written == 0:
             emit_jsonl({
-                "type": "error",
-                "message": f"no_audio_for_stream_{stream_name}",
+                "type": "status",
+                "message": f"empty_source_{stream_name}",
             }, stdout_writer)
             continue
         had_audio = True
@@ -928,6 +1034,7 @@ def main() -> int:
             temp_wav = write_wav_from_pcm(snapshot, output_dir)
             if not temp_wav:
                 emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_writer)
+                processing_complete = False
                 continue
 
             try:
@@ -946,6 +1053,7 @@ def main() -> int:
                     )
             except Exception as exc:
                 emit_jsonl({"type": "error", "message": str(exc)}, stdout_writer)
+                processing_complete = False
                 continue
             finally:
                 temp_wav.unlink(missing_ok=True)
@@ -966,20 +1074,20 @@ def main() -> int:
                 live_asr_only=args.live_asr_only,
             )
 
-    if not args.keep_wav:
+    if processing_complete and not args.keep_wav and not args.source_recording:
         if system_writer:
             system_writer.path.unlink(missing_ok=True)
         if mic_writer:
             mic_writer.path.unlink(missing_ok=True)
 
-    if not args.keep_pcm:
+    if processing_complete and not args.keep_pcm and not args.source_recording:
         if system_writer:
             system_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
         if mic_writer:
             mic_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
 
-    stdout_writer.close()
-    return 0
+    emit_jsonl({"type": "status", "message": "inference_completed" if processing_complete else "inference_incomplete"}, stdout_writer)
+    return 0 if processing_complete else 1
 
 
 if __name__ == "__main__":

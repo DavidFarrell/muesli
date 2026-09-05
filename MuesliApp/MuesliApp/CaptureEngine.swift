@@ -15,11 +15,12 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     let generation: Int
 
     init(generation: Int, forwarder: MicAudioForwarder, display: MicDeliveryDisplayMailbox,
+         onRejected: (@Sendable (CapturedMicAudio, MicAudioIngress.RejectionReason) -> Void)? = nil,
          onStopped: @escaping @Sendable (Error) -> Void) {
         self.generation = generation
         self.forwarder = forwarder
         self.onStopped = onStopped
-        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display)
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display, onRejected: onRejected)
         self.ingress = ingress
         processor = MicCaptureProcessor(generation: generation, mixPolicy: .meanOfAllChannels, output: ingress.callback())
     }
@@ -68,13 +69,13 @@ final class CaptureEngine: NSObject {
     var onStreamStopped: ((Error) -> Void)?
 
     func startCapture(contentFilter: SCContentFilter, writer: FrameSending?, recordTo url: URL?,
-                      timeline: CaptureTimeline = CaptureTimeline()) async throws {
+                      timeline: CaptureTimeline = CaptureTimeline(), audioOutputEnabled: Bool = false) async throws {
         generation += 1
         let currentGeneration = generation
         meetingStartPTS = timeline.epochPTS
         let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, stream: .system)
         await forwarder.beginMeeting(epoch: timeline)
-        await forwarder.beginGeneration(currentGeneration, writer: writer)
+        await forwarder.beginGeneration(currentGeneration, writer: writer, outputEnabled: audioOutputEnabled)
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             guard let self, self.generation == currentGeneration else { return }
             self.systemLevel = result.level
@@ -86,7 +87,11 @@ final class CaptureEngine: NSObject {
                                           frames: result.frameSampleCount, pts: result.elapsedSeconds,
                                           format: self.debugSystemFormat)
         }
-        let relay = SystemAudioCaptureRelay(generation: currentGeneration, forwarder: forwarder, display: display) { [weak self] error in
+        let relay = SystemAudioCaptureRelay(generation: currentGeneration, forwarder: forwarder, display: display,
+            onRejected: { packet, reason in
+                writer?.reportLoss(stream: .system, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
+                                   frames: Int64(packet.outputFrameCount), reason: String(describing: reason))
+            }) { [weak self] error in
             AudioLog.error("stream.stopped", ["generation": currentGeneration, "error": String(describing: error)])
             Task { @MainActor [weak self] in
                 guard let self, self.generation == currentGeneration else { return }

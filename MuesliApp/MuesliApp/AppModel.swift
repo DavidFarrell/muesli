@@ -255,6 +255,9 @@ final class AppModel: ObservableObject {
 
     private var backend: BackendProcess?
     private var writer: FramedWriter?
+    private var sourceRecorder: LocalAudioRecorder?
+    private var sourceTimeline: CaptureTimeline?
+    private var inferenceFailure: String?
     // Backend-readiness handshake state (2026-07-16 RCA rec #3 - backend
     // wedged pre-read-loop, meeting presented as recording, 26 minutes lost).
     // The gate opens when the child acknowledges MSG_MEETING_START with a
@@ -277,7 +280,6 @@ final class AppModel: ObservableObject {
     private var backendStallLogTicks = 0
     private var backendLogHandle: FileHandle?
     private var backendLogURL: URL?
-    private var transcriptEventsHandle: FileHandle?
     private var transcriptEventsURL: URL?
     private var currentTranscriptEventsStartOffset: UInt64 = 0
     private var backendAccessURL: URL?
@@ -584,23 +586,13 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
     }
 
-    private func resetTranscriptEventsLog(in folderURL: URL, append: Bool) {
-        let logURL = folderURL.appendingPathComponent("transcript_events.jsonl")
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        }
+    private func resetTranscriptEventsLog(in audioDirectory: URL) throws {
+        let logURL = audioDirectory.appendingPathComponent("transcript_events.jsonl")
+        // Each source session has its own journal. Never truncate or append
+        // into a prior session while its timed-out reader may still own it.
+        try Data().write(to: logURL, options: .withoutOverwriting)
+        currentTranscriptEventsStartOffset = 0
         transcriptEventsURL = logURL
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            if append {
-                currentTranscriptEventsStartOffset = (try? handle.seekToEnd()) ?? 0
-            } else {
-                try? handle.truncate(atOffset: 0)
-                currentTranscriptEventsStartOffset = 0
-            }
-            transcriptEventsHandle = handle
-        } else {
-            currentTranscriptEventsStartOffset = 0
-        }
     }
 
     private func loadTranscriptFromDisk(in folderURL: URL) {
@@ -616,35 +608,13 @@ final class AppModel: ObservableObject {
     }
 
     private func closeTranscriptEventsLog() {
-        if let handle = transcriptEventsHandle {
-            try? handle.close()
-        }
-        transcriptEventsHandle = nil
+        transcriptEventsURL = nil
         currentTranscriptEventsStartOffset = 0
     }
 
     private func closeHandle(_ handle: FileHandle?) {
         if let handle {
             try? handle.close()
-        }
-    }
-
-    private func writeDataToHandle(_ data: Data, handle: FileHandle?) -> Error? {
-        guard let handle else { return nil }
-        do {
-            try handle.write(contentsOf: data)
-            return nil
-        } catch {
-            return error
-        }
-    }
-
-    private func synchronizeHandle(_ handle: FileHandle?, label: String) {
-        guard let handle else { return }
-        do {
-            try handle.synchronize()
-        } catch {
-            appendBackendLog("Failed to flush \(label): \(error.localizedDescription)", toTail: true)
         }
     }
 
@@ -656,30 +626,26 @@ final class AppModel: ObservableObject {
         backendLogWriter.append(trimmed, toTail: toTail, handle: handle)
     }
 
+    private func reportInferenceFailure(_ message: String) {
+        inferenceFailure = message
+        shareableContentError = "Live transcription unavailable. Audio is being saved locally. " + message
+        appendBackendLog(shareableContentError ?? message, toTail: true)
+        meters.setBackendAlert( "Live transcription unavailable; source audio continues recording.")
+    }
+
     private func handleBackendWriteError(_ error: Error) {
-        guard isCapturing else { return }
-        let message = "Backend connection lost: \(error.localizedDescription)"
-        shareableContentError = message
-        appendBackendLog(message, toTail: true)
-        Task { await stopMeeting() }
+        guard sourceRecorder != nil else { return }
+        reportInferenceFailure(error.localizedDescription)
     }
 
     private func handleBackendJSONLine(
         _ line: String,
-        transcriptEventsHandle: FileHandle?,
         backendLogHandle: FileHandle?,
         ingestIntoLiveTranscript: Bool,
         sessionFolderURL: URL? = nil
     ) {
-        if let data = (line + "\n").data(using: .utf8) {
-            if let error = writeDataToHandle(data, handle: transcriptEventsHandle) {
-                appendBackendLog(
-                    "Failed to append transcript event: \(error.localizedDescription)",
-                    toTail: ingestIntoLiveTranscript,
-                    handle: backendLogHandle
-                )
-            }
-        }
+        // Authoritative data is already journaled by the reader. UI
+        // consumption is a disposable projection and never owns its file.
         if let data = line.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let type = obj["type"] as? String {
@@ -1288,11 +1254,17 @@ final class AppModel: ObservableObject {
         // mechanism only papered over: no buffer can arrive before its
         // generation is recognised.
         await micAudioIngress?.finish()
-        await micAudioForwarder.beginGeneration(generation, writer: writer)
+        await micAudioForwarder.beginGeneration(generation, writer: sourceRecorder, outputEnabled: sourceRecorder != nil)
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             self?.onMicAudioDelivered(result, generation: generation)
         }
-        let ingress = MicAudioIngress.forwarding(to: micAudioForwarder, display: display)
+        let recorder = sourceRecorder
+        let timeline = sourceTimeline
+        let ingress = MicAudioIngress.forwarding(to: micAudioForwarder, display: display, onRejected: { packet, reason in
+            guard let timeline else { return }
+            recorder?.reportLoss(stream: .mic, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
+                                 frames: Int64(packet.outputFrameCount), reason: reason.rawValue)
+        })
         micAudioIngress = ingress
 
         try await engine.start(
@@ -1339,7 +1311,7 @@ final class AppModel: ObservableObject {
         // them via setOutputEnabled(true) the moment meeting_started
         // arrives. On mid-meeting engine rebuilds the gate is already open,
         // so this enables immediately - exactly the old timing.
-        if backendStartupGate.isReady {
+        if sourceRecorder != nil {
             await micAudioForwarder.setOutputEnabled(true)
         }
         debugMicErrorMessage = "-"
@@ -1534,64 +1506,23 @@ final class AppModel: ObservableObject {
     /// it surfaces an unmissable persistent alert instead, and the stop path
     /// (see stopMeeting) uses the flag to bypass the drain and escalate.
     private func checkBackendWriteBacklog() {
-        guard let writer, isCapturing, !isFinalizing else { return }
-        let snap = writer.backlogSnapshot()
-        if snap.isStalled {
-            backendStallLogTicks += 1
-            // Log the transition loudly, then re-log the queue-depth trend
-            // every ~30s rather than every 2s tick.
-            if !backendWriteStalled || backendStallLogTicks % 15 == 0 {
-                AudioLog.error("writequeue.stalled", [
-                    "outstandingFrames": snap.outstandingFrames,
-                    "outstandingBytes": snap.outstandingBytes,
-                    "droppedFrames": snap.droppedFrames,
-                    "droppedBytes": snap.droppedBytes,
-                    "failedWrites": snap.failedWrites,
-                    "rejectedAfterClose": snap.rejectedAfterCloseFrames,
-                    "stalledSeconds": Int(snap.secondsSinceLastProgress ?? -1)
-                ])
+        guard isCapturing, !isFinalizing else { return }
+        if let status = sourceRecorder?.status(), let error = status.error {
+            let message = "Audio preservation problem: " + error
+            if shareableContentError != message {
+                shareableContentError = message
+                appendBackendLog(message, toTail: true)
             }
-            if !backendWriteStalled {
-                backendWriteStalled = true
-                appendBackendLog(
-                    "Backend stopped consuming audio (write queue stalled) - recording is NOT being saved to disk.",
-                    toTail: true
-                )
-                meters.setBackendAlert(
-                    "Recording backend stopped responding - audio is NOT being saved. Stop and restart the meeting, or use a backup recorder."
-                )
-            }
-        } else if backendWriteStalled {
-            // The child resumed reading. Frames that were queued (not
-            // dropped) have now been written, so if nothing was dropped the
-            // recording is whole - clear the alarm. If frames WERE dropped
-            // there is a real gap in the audio; the alert must survive so
-            // the user knows this meeting is damaged.
-            backendWriteStalled = false
-            backendStallLogTicks = 0
-            AudioLog.event("writequeue.recovered", [
-                "droppedFrames": snap.droppedFrames,
-                "droppedBytes": snap.droppedBytes
-            ])
-            if snap.droppedFrames > 0 {
-                appendBackendLog(
-                    "Backend resumed consuming audio after a stall; \(snap.droppedFrames) audio frames (\(snap.droppedBytes) bytes) were dropped and are lost.",
-                    toTail: true
-                )
-                meters.setBackendAlert(
-                    "Recording backend recovered after a stall - some audio during the stall was lost."
-                )
-            } else {
-                appendBackendLog("Backend resumed consuming audio after a stall; no frames were dropped.", toTail: true)
-                meters.clearBackendAlert()
-            }
+            meters.setBackendAlert(message)
+        }
+        guard let writer else { return }
+        let snapshot = writer.backlogSnapshot()
+        if snapshot.isStalled, !backendWriteStalled {
+            backendWriteStalled = true
+            reportInferenceFailure("The transcription process stopped consuming control messages.")
         }
     }
 
-    /// True when the input is pinned to a specific device that is not
-    /// currently the live system default - i.e. there is somewhere sensible to
-    /// fall back to. Re-resolved fresh each call rather than cached, since the
-    /// OS default can move independently of our pin.
     private func isPinnedAwayFromSystemDefaultInput() -> Bool {
         guard case .pinned(let uid) = inputSelection else { return false }
         guard let pinnedID = AudioDeviceManager.deviceID(forUID: uid) else { return false }
@@ -1886,18 +1817,6 @@ final class AppModel: ObservableObject {
                 handle: logHandle
             )
         }
-    }
-
-    private func linesFromTranscriptEvents(
-        in folderURL: URL,
-        startingAt offset: UInt64
-    ) -> [String] {
-        let eventsURL = folderURL.appendingPathComponent("transcript_events.jsonl")
-        guard let data = try? Data(contentsOf: eventsURL) else { return [] }
-        let start = Int(min(offset, UInt64(data.count)))
-        let slice = data.subdata(in: start..<data.count)
-        guard let content = String(data: slice, encoding: .utf8) else { return [] }
-        return content.split(whereSeparator: \.isNewline).map(String.init)
     }
 
     func exportTranscriptFiles() {
@@ -2258,10 +2177,7 @@ final class AppModel: ObservableObject {
         backendStallLogTicks = 0
         meters.clearBackendAlert()
 
-        guard let backendProjectRoot = backendFolderURL else {
-            shareableContentError = "Select the backend folder before starting."
-            return
-        }
+        let backendProjectRoot = backendFolderURL
 
         // Always use a display filter for audio capture (system-wide audio)
         // Use selectedDisplay if available, otherwise fall back to first display
@@ -2341,130 +2257,23 @@ final class AppModel: ObservableObject {
 
         do {
             resetBackendLog(in: folderURL)
-            resetTranscriptEventsLog(in: folderURL, append: meeting != nil)
+            try resetTranscriptEventsLog(in: audioDir)
             if meeting == nil {
                 try createInitialMeetingMetadata(for: session, audioFolderName: audioDir.lastPathComponent)
             } else if let metadata {
                 try appendResumeSessionMetadata(metadata, for: session, sessionID: sessionID, audioFolderName: audioDir.lastPathComponent)
             }
 
-            guard startBackendAccess(for: backendProjectRoot) else {
-                shareableContentError = "Backend folder access denied. Re-select the folder."
-                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
-                return
+            let sourceID = UUID().uuidString
+            guard timestampOffset.isFinite, timestampOffset >= 0, timestampOffset < 1_000_000_000 else {
+                throw LocalAudioRecorder.RecorderError.invalidManifest
             }
-
-            let writer: FramedWriter
-            switch resolveBackendPython(for: backendProjectRoot) {
-            case .success(let backendPython):
-                if !FileManager.default.fileExists(atPath: backendPython) {
-                    let message = "Backend python not found at \(backendPython)."
-                    shareableContentError = message
-                    backendFolderError = message
-                    await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
-                    return
-                }
-                let transcribeStream: String
-                if transcribeSystem && transcribeMic {
-                    transcribeStream = "both"
-                } else if transcribeSystem {
-                    transcribeStream = "system"
-                } else {
-                    transcribeStream = "mic"
-                }
-
-                var command = [
-                    backendPython,
-                    "-m",
-                    "diarise_transcribe.muesli_backend",
-                    "--emit-meters",
-                    "--transcribe-stream",
-                    transcribeStream,
-                    "--output-dir",
-                    audioDir.path
-                ]
-                command.append("--keep-wav")
-                command.append("--live-asr-only")
-                #if DEBUG
-                command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
-                #endif
-                let baseEnv = ProcessInfo.processInfo.environment
-                let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-                let mergedPath: String
-                if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
-                    mergedPath = "\(defaultPath):\(existingPath)"
-                } else {
-                    mergedPath = defaultPath
-                }
-                let backendEnv = [
-                    "PYTHONPATH": backendProjectRoot.appendingPathComponent("src").path,
-                    "PATH": mergedPath
-                ]
-                let backend = try BackendProcess(
-                    command: command,
-                    workingDirectory: backendProjectRoot,
-                    environment: backendEnv
-                )
-                let sessionFolderURL = folderURL
-                let sessionLogHandle = backendLogHandle
-                let sessionEventsHandle = transcriptEventsHandle
-                appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
-                appendBackendLog("PATH: \(mergedPath)", toTail: true)
-                appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
-                backend.onExit = { [weak self] status in
-                    Task { @MainActor in
-                        guard let self else { return }
-                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                        self.appendBackendLog(
-                            "Backend exited with status \(status)",
-                            toTail: isActiveSession,
-                            handle: sessionLogHandle
-                        )
-                    }
-                }
-                backend.onStderrLine = { [weak self] line in
-                    Task { @MainActor in
-                        guard let self else { return }
-                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                        self.appendBackendLog(
-                            "[stderr] \(line)",
-                            toTail: isActiveSession,
-                            handle: sessionLogHandle
-                        )
-                    }
-                }
-                try backend.start()
-                self.backend = backend
-                stdoutTask?.cancel()
-                stdoutTask = Task { @MainActor in
-                    for await line in backend.stdoutLines {
-                        let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                        self.handleBackendJSONLine(
-                            line,
-                            transcriptEventsHandle: sessionEventsHandle,
-                            backendLogHandle: sessionLogHandle,
-                            ingestIntoLiveTranscript: isActiveSession,
-                            sessionFolderURL: sessionFolderURL
-                        )
-                    }
-                }
-                let createdWriter = FramedWriter(stdinHandle: backend.stdin)
-                createdWriter.onWriteError = { [weak self] error in
-                    Task { @MainActor in
-                        self?.handleBackendWriteError(error)
-                    }
-                }
-                self.writer = createdWriter
-                writer = createdWriter
-
-            case .failure(let error):
-                shareableContentError = error.message
-                backendFolderError = error.message
-                appendBackendLog("Backend start blocked: \(error.message)", toTail: true)
-                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
-                return
-            }
-
+            let offsetUs = Int64(timestampOffset * 1_000_000)
+            let recorder = try await Task.detached {
+                try LocalAudioRecorder(directory: audioDir, sessionID: sourceID, timelineOffsetUs: offsetUs)
+            }.value
+            sourceRecorder = recorder
+            inferenceFailure = nil
             let recordURL: URL?
             if captureMode == .video {
                 recordURL = folderURL.appendingPathComponent("recording.mp4")
@@ -2473,12 +2282,14 @@ final class AppModel: ObservableObject {
             }
 
             let captureTimeline = CaptureTimeline()
+            sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
             try await captureEngine.startCapture(
                 contentFilter: audioFilter,
-                writer: writer,
+                writer: recorder,
                 recordTo: recordURL,
-                timeline: captureTimeline
+                timeline: captureTimeline,
+                audioOutputEnabled: true
             )
 
             resetMicDebugState()
@@ -2486,8 +2297,8 @@ final class AppModel: ObservableObject {
             await startMeetingMicEngine()
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
-            let systemSampleRate = formats.systemSampleRate ?? captureSampleRate
-            let systemChannels = formats.systemChannels ?? captureChannels
+            let systemSampleRate = 16_000
+            let systemChannels = 1
             let micSampleRate = micOutputSampleRate
             let micChannels = micOutputChannels
 
@@ -2497,8 +2308,19 @@ final class AppModel: ObservableObject {
                 appendBackendLog("System audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(systemSampleRate)Hz/\(systemChannels)ch.", toTail: true)
             }
 
+            if let backendProjectRoot {
+                do {
+                    _ = try launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir, folderURL: folderURL)
+                } catch {
+                    reportInferenceFailure(error.localizedDescription)
+                }
+            } else {
+                reportInferenceFailure("No local transcription backend is configured.")
+            }
+
             let meta: [String: Any] = [
                 "protocol_version": 1,
+                "source_session_id": sourceID,
                 "sample_format": "s16le",
                 "title": title,
                 "start_wall_time": ISO8601DateFormatter().string(from: session.startedAt),
@@ -2510,7 +2332,7 @@ final class AppModel: ObservableObject {
                 "mic_channels": micChannels
             ]
             let metaData = try JSONSerialization.data(withJSONObject: meta)
-            writer.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
+            writer?.send(type: .meetingStart, stream: .system, ptsUs: 0, payload: metaData)
             appendBackendLog("Sent meeting_start", toTail: true)
             updateMeetingMetadataStreams(
                 for: session,
@@ -2519,45 +2341,20 @@ final class AppModel: ObservableObject {
                 micSampleRate: micSampleRate,
                 micChannels: micChannels
             )
-            // Backend-readiness handshake (2026-07-16 RCA rec #3): do not
-            // report the meeting as recording - and do not let a single
-            // audio byte into the pipe - until the child acknowledges
-            // MSG_MEETING_START with meeting_started (which it emits only
-            // after its stream writers exist on disk). The incident this
-            // guards against: the backend wedged before its read loop, Swift
-            // piped audio into a full pipe for 26 minutes, and the meeting
-            // looked healthy throughout. Audio captured during the wait is
-            // NOT lost on a healthy start: mic frames buffer in the
-            // forwarder's pending ring, system audio in CaptureEngine's, and
-            // both flush below the moment the gate opens.
-            let sessionBackend = backend
-            let readiness = await backendStartupGate.waitUntilReady(
-                timeoutSeconds: backendReadinessTimeoutSeconds,
-                isProcessAlive: { sessionBackend?.isRunning ?? false }
-            )
-            guard readiness == .ready else {
-                let reason: String
-                switch readiness {
-                case .processExited:
-                    reason = "backend process exited during startup"
-                default:
-                    reason = "no meeting_started acknowledgment within \(Int(backendReadinessTimeoutSeconds))s"
+            // Readiness describes inference only. Capture already writes to
+            // the app-owned source store and must continue during this wait.
+            if let sessionBackend = backend {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let readiness = await self.backendStartupGate.waitUntilReady(
+                        timeoutSeconds: self.backendReadinessTimeoutSeconds,
+                        isProcessAlive: { sessionBackend.isRunning })
+                    guard self.sourceRecorder === recorder else { return }
+                    if readiness != .ready {
+                        self.reportInferenceFailure("The transcription process did not become ready.")
+                    }
                 }
-                AudioLog.error("backend.readiness.failed", ["reason": reason])
-                appendBackendLog("Backend readiness handshake failed (\(reason)); treating meeting start as FAILED.", toTail: true)
-                shareableContentError = "Recording backend failed to start - meeting NOT recording. (\(reason).)"
-                await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
-                return
             }
-            appendBackendLog("Backend ready (meeting_started acknowledged)", toTail: true)
-
-            await captureEngine.setAudioOutputEnabled(true)
-            // Open the mic side too: at first start the engine came up with
-            // the gate still closed (see attemptMeetingMicEngineStart), so
-            // everything delivered so far sits in the forwarder's pending
-            // ring - this flushes it to the now-provably-listening backend
-            // in order, PTS intact.
-            await micAudioForwarder.setOutputEnabled(true)
 
             if captureMode == .video {
                 let screenshotsDir = folderURL.appendingPathComponent("screenshots", isDirectory: true)
@@ -2594,6 +2391,126 @@ final class AppModel: ObservableObject {
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
+    }
+
+    /// Live inference may be absent or fail; source recording has a separate owner.
+    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL) throws -> FramedWriter {
+    guard startBackendAccess(for: backendProjectRoot) else {
+        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied."])
+    }
+
+    switch resolveBackendPython(for: backendProjectRoot) {
+    case .success(let backendPython):
+        if !FileManager.default.fileExists(atPath: backendPython) {
+            let message = "Backend python not found at \(backendPython)."
+            throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        let transcribeStream: String
+        if transcribeSystem && transcribeMic {
+            transcribeStream = "both"
+        } else if transcribeSystem {
+            transcribeStream = "system"
+        } else {
+            transcribeStream = "mic"
+        }
+
+        var command = [
+            backendPython,
+            "-m",
+            "diarise_transcribe.muesli_backend",
+            "--emit-meters",
+            "--transcribe-stream",
+            transcribeStream,
+            "--output-dir",
+            audioDir.path
+        ]
+        command.append("--keep-wav")
+        command.append("--source-recording")
+        command.append("--live-asr-only")
+        #if DEBUG
+        command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
+        #endif
+        let baseEnv = ProcessInfo.processInfo.environment
+        let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let mergedPath: String
+        if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
+            mergedPath = "\(defaultPath):\(existingPath)"
+        } else {
+            mergedPath = defaultPath
+        }
+        let backendEnv = [
+            "PYTHONPATH": backendProjectRoot.appendingPathComponent("src").path,
+            "PATH": mergedPath
+        ]
+        let backend = try BackendProcess(
+            command: command,
+            workingDirectory: backendProjectRoot,
+            environment: backendEnv,
+            eventJournalURL: transcriptEventsURL
+        )
+        let sessionFolderURL = folderURL
+        let sessionEventsURL = transcriptEventsURL
+        let sessionLogHandle = backendLogHandle
+        appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
+        appendBackendLog("PATH: \(mergedPath)", toTail: true)
+        appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
+        backend.onExit = { [weak self] status in
+            Task { @MainActor in
+                guard let self else { return }
+                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
+                if isActiveSession && !self.isFinalizing {
+                    self.reportInferenceFailure("The transcription process exited (status \(status)).")
+                }
+                self.appendBackendLog(
+                    "Backend exited with status \(status)",
+                    toTail: isActiveSession,
+                    handle: sessionLogHandle
+                )
+            }
+        }
+        backend.onStderrLine = { [weak self] line in
+            Task { @MainActor in
+                guard let self else { return }
+                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
+                self.appendBackendLog(
+                    "[stderr] \(line)",
+                    toTail: isActiveSession,
+                    handle: sessionLogHandle
+                )
+            }
+        }
+        try backend.start()
+        self.backend = backend
+        stdoutTask?.cancel()
+        stdoutTask = Task { @MainActor in
+            for await line in backend.stdoutLines {
+                guard !Task.isCancelled else { break }
+                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
+                    && self.transcriptEventsURL == sessionEventsURL
+                self.handleBackendJSONLine(
+                    line,
+                    backendLogHandle: sessionLogHandle,
+                    ingestIntoLiveTranscript: isActiveSession,
+                    sessionFolderURL: sessionFolderURL
+                )
+            }
+        }
+        let createdWriter = FramedWriter(stdinHandle: backend.stdin)
+        createdWriter.onWriteError = { [weak self] error in
+            Task { @MainActor in
+                guard let self, self.transcriptEventsURL == sessionEventsURL else { return }
+                self.handleBackendWriteError(error)
+            }
+        }
+        self.writer = createdWriter
+        return createdWriter
+
+    case .failure(let error):
+        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: error.message])
+    }
+
     }
 
     /// Explicit teardown for a startMeeting() attempt that threw partway
@@ -2634,6 +2551,10 @@ final class AppModel: ObservableObject {
         micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
+        let hadSourceRecorder = sourceRecorder != nil
+        let sourceResult = await sourceRecorder?.finish()
+        sourceRecorder = nil
+        sourceTimeline = nil
         micStartTime = nil
         resetMicRecoveryLadder()
 
@@ -2673,7 +2594,13 @@ final class AppModel: ObservableObject {
         closeTranscriptEventsLog()
         stopBackendAccess()
 
-        rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
+        if hadSourceRecorder {
+            // Source capture may have succeeded before another source failed.
+            // Keep this session indexed so preserved material is recoverable.
+            finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult, incomplete: true)
+        } else {
+            rollBackFailedMeetingMetadata(for: session, wasResume: wasResume, priorMetadata: priorMetadata)
+        }
 
         clearAttachments()
         currentSession = nil
@@ -2713,7 +2640,7 @@ final class AppModel: ObservableObject {
         // already defaults a folder with no meeting.json to .completed).
         guard var metadata = try? readMeetingMetadata(from: session.folderURL) else { return }
         guard metadata.status == .recording else { return }
-        metadata.status = .completed
+        metadata.status = .interrupted
         metadata.updatedAt = Date()
         try? writeMeetingMetadata(metadata, to: session.folderURL)
     }
@@ -2749,6 +2676,9 @@ final class AppModel: ObservableObject {
         micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
+        let sourceResult = await sourceRecorder?.finish()
+        sourceRecorder = nil
+        sourceTimeline = nil
         micStartTime = nil
         resetMicRecoveryLadder()
 
@@ -2788,19 +2718,19 @@ final class AppModel: ObservableObject {
         let stoppingWriter = writer
         let stoppingStdoutTask = stdoutTask
         let stoppingBackendLogHandle = backendLogHandle
-        let stoppingTranscriptEventsHandle = transcriptEventsHandle
         let stoppingBackendAccessURL = backendAccessURL
         let stoppingTranscriptEventsStartOffset = currentTranscriptEventsStartOffset
+        let stoppingTranscriptEventsURL = transcriptEventsURL
         let stoppingTranscriptSegments = transcriptModel.segments.filter { !$0.isPartial }
         let stoppingSpeakerNames = transcriptModel.speakerNames
         let stoppingTimestampOffset = transcriptModel.timestampOffset
+        let stoppingInferenceFailed = inferenceFailure != nil
 
         writer = nil
         backend = nil
         stdoutTask = nil
         backendLogHandle = nil
         backendLogURL = nil
-        transcriptEventsHandle = nil
         transcriptEventsURL = nil
         backendAccessURL = nil
         currentTranscriptEventsStartOffset = 0
@@ -2811,7 +2741,6 @@ final class AppModel: ObservableObject {
         activeScreen = .start
 
         guard let stoppingSession else {
-            closeHandle(stoppingTranscriptEventsHandle)
             closeHandle(stoppingBackendLogHandle)
             stopBackendAccess(for: stoppingBackendAccessURL)
             isFinalizing = false
@@ -2825,13 +2754,15 @@ final class AppModel: ObservableObject {
                 backend: stoppingBackend,
                 stdoutTask: stoppingStdoutTask,
                 backendLogHandle: stoppingBackendLogHandle,
-                transcriptEventsHandle: stoppingTranscriptEventsHandle,
                 backendAccessURL: stoppingBackendAccessURL,
                 transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
+                transcriptEventsURL: stoppingTranscriptEventsURL,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
                 speakerNamesSnapshot: stoppingSpeakerNames,
                 timestampOffsetSnapshot: stoppingTimestampOffset,
-                writer: stoppingWriter
+                writer: stoppingWriter,
+                sourceManifest: sourceResult,
+                inferenceFailed: stoppingInferenceFailed
             )
         }
     }
@@ -2841,16 +2772,17 @@ final class AppModel: ObservableObject {
         backend: BackendProcess?,
         stdoutTask: Task<Void, Never>?,
         backendLogHandle: FileHandle?,
-        transcriptEventsHandle: FileHandle?,
         backendAccessURL: URL?,
         transcriptEventsStartOffset: UInt64,
+        transcriptEventsURL: URL?,
         transcriptSegmentsSnapshot: [TranscriptSegment],
         speakerNamesSnapshot: [String: String],
         timestampOffsetSnapshot: Double,
-        writer: FramedWriter? = nil
+        writer: FramedWriter? = nil,
+        sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        inferenceFailed: Bool = false
     ) async {
         defer {
-            closeHandle(transcriptEventsHandle)
             // Ordered after any writes still queued on the writer's own
             // serial queue - see BackendLogWriter.close's doc comment for
             // why this must not be a bare `handle.close()` here.
@@ -2920,18 +2852,29 @@ final class AppModel: ObservableObject {
                 handle: backendLogHandle
             )
         }
+        let journalDrain = await backend?.finishStdout(timeoutSeconds: 5)
+        let journalComplete: Bool
+        if case .drained(let status) = journalDrain { journalComplete = status.isComplete }
+        else { journalComplete = false }
+        // UI completion is irrelevant to the saved transcript. Its bounded
+        // projection may be cancelled after authoritative EOF/drain handling.
+        stdoutTask?.cancel()
         backend?.cleanup()
-        await waitForStdoutDrain(task: stdoutTask, timeoutSeconds: 2.0)
-        synchronizeHandle(transcriptEventsHandle, label: "transcript events log")
         backendLogWriter.synchronize(label: "backend log")
 
         let model = TranscriptModel()
         model.timestampOffset = timestampOffsetSnapshot
         model.segments = transcriptSegmentsSnapshot
         model.speakerNames = speakerNamesSnapshot
-        for line in linesFromTranscriptEvents(in: session.folderURL, startingAt: transcriptEventsStartOffset) {
-            model.ingest(jsonLine: line)
+        let replay: TranscriptEventJournal.Replay
+        if let url = transcriptEventsURL, let status = journalDrain?.status {
+            replay = TranscriptEventJournal.replay(url: url, start: status.journalStartOffset,
+                                                   byteCount: status.durableBytes)
+        } else {
+            replay = TranscriptEventJournal.Replay(error: "No authoritative transcript journal was available.")
         }
+        for line in replay.lines { model.ingest(jsonLine: line) }
+        if let error = replay.error { appendBackendLog(error, toTail: false, handle: backendLogHandle) }
 
         let finalizedSegments = model.segments.filter { !$0.isPartial }
         saveTranscriptFiles(
@@ -2941,7 +2884,9 @@ final class AppModel: ObservableObject {
             logToTail: false,
             logHandle: backendLogHandle
         )
-        finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments)
+        finalizeMeetingMetadata(for: session, finalizedSegments: finalizedSegments,
+                                sourceManifest: sourceManifest,
+                                incomplete: inferenceFailed || exitStatus != 0 || !journalComplete || replay.error != nil)
         if let updatedItem = buildMeetingHistoryItem(for: session.folderURL),
            let idx = meetingHistory.firstIndex(where: { $0.folderURL == session.folderURL }) {
             meetingHistory[idx] = updatedItem
@@ -2988,30 +2933,6 @@ final class AppModel: ObservableObject {
             }
         }
         return nil
-    }
-
-    private func waitForStdoutDrain(task: Task<Void, Never>?, timeoutSeconds: Double) async {
-        guard let task else { return }
-        let finished = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                await task.value
-                return true
-            }
-            group.addTask {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                } catch {
-                    return false
-                }
-                return false
-            }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
-        }
-        if !finished {
-            task.cancel()
-        }
     }
 
     static func defaultMeetingTitle() -> String {
@@ -3218,7 +3139,9 @@ final class AppModel: ObservableObject {
 
     private func finalizeMeetingMetadata(
         for session: MeetingSession,
-        finalizedSegments: [TranscriptSegment]
+        finalizedSegments: [TranscriptSegment],
+        sourceManifest: LocalAudioRecorder.Manifest? = nil,
+        incomplete: Bool = false
     ) {
         do {
             var metadata = try readMeetingMetadata(from: session.folderURL)
@@ -3227,14 +3150,17 @@ final class AppModel: ObservableObject {
                 finalizedSegments.map { $0.t1 ?? $0.t0 }.max() ?? 0
             )
             let segmentCount = max(metadata.segmentCount, finalizedSegments.count)
-            let durationFromStart = Date().timeIntervalSince(metadata.createdAt)
-            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, durationFromStart)
+            let savedDuration = sourceManifest.map { manifest in
+                Double(manifest.timeline_offset_us) / 1_000_000
+                + Double(manifest.streams.values.map { $0.committed_bytes }.max() ?? 0) / 32_000
+            } ?? metadata.durationSeconds
+            let durationSeconds = max(metadata.durationSeconds, lastTimestamp, savedDuration)
 
             metadata.updatedAt = Date()
             metadata.durationSeconds = durationSeconds
             metadata.lastTimestamp = lastTimestamp
             metadata.segmentCount = segmentCount
-            metadata.status = .completed
+            metadata.status = incomplete || sourceManifest?.completed != true ? .degraded : .completed
             if let lastIndex = metadata.sessions.indices.last {
                 var lastSession = metadata.sessions[lastIndex]
                 if lastSession.endedAt == nil {
@@ -3630,7 +3556,8 @@ final class AppModel: ObservableObject {
             metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
             metadata.durationSeconds = max(metadata.durationSeconds, durationSeconds, lastTimestamp)
             metadata.speakerNames = [:]
-            metadata.status = .completed
+            // Reprocessing cannot certify or repair capture integrity.
+
             try writeMeetingMetadata(metadata, to: folderURL)
         } catch {
             appendBackendLog("Failed to update meeting.json after reprocess: \(error.localizedDescription)", toTail: true)
@@ -3669,9 +3596,12 @@ final class AppModel: ObservableObject {
 
     private func prepareResumeSession(for meeting: MeetingHistoryItem) throws -> (metadata: MeetingMetadata, sessionID: Int, audioFolderURL: URL) {
         let metadata = try readMeetingMetadata(from: meeting.folderURL)
-        let nextSessionID = (metadata.sessions.map(\.sessionID).max() ?? 0) + 1
-        let folderName = "audio-session-\(nextSessionID)"
-        let audioURL = meeting.folderURL.appendingPathComponent(folderName, isDirectory: true)
+        var nextSessionID = (metadata.sessions.map(\.sessionID).max() ?? 0) + 1
+        var audioURL = meeting.folderURL.appendingPathComponent("audio-session-\(nextSessionID)", isDirectory: true)
+        while FileManager.default.fileExists(atPath: audioURL.path) {
+            nextSessionID += 1
+            audioURL = meeting.folderURL.appendingPathComponent("audio-session-\(nextSessionID)", isDirectory: true)
+        }
         try FileManager.default.createDirectory(at: audioURL, withIntermediateDirectories: true)
         return (metadata, nextSessionID, audioURL)
     }
