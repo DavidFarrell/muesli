@@ -6,6 +6,9 @@ nonisolated private final class CaptureTestSender: FrameSending, @unchecked Send
     struct Frame: Sendable { let stream: StreamID; let pts: Int64; let data: Data }
     private let lock = NSLock()
     private var frames: [Frame] = []
+    private var failures: [String] = []
+    private var losses: [(Int64, Int64)] = []
+    let failureComplete = DispatchSemaphore(value: 0)
     let complete: DispatchSemaphore?
     let expectedCount: Int
     init(expectedCount: Int = 0, complete: DispatchSemaphore? = nil) {
@@ -17,6 +20,14 @@ nonisolated private final class CaptureTestSender: FrameSending, @unchecked Send
             if frames.count == expectedCount { complete?.signal() }
         }
     }
+    func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {
+        lock.withLock { losses.append((ptsUs, frames)) }
+    }
+    func reportFailure(stream: StreamID, message: String) {
+        lock.withLock { failures.append(message) }
+        failureComplete.signal()
+    }
+    func failureSnapshot() -> (Int, [(Int64, Int64)]) { lock.withLock { (failures.count, losses) } }
     func snapshot() -> [Frame] { lock.withLock { frames } }
 }
 
@@ -75,6 +86,58 @@ final class CaptureIngressTests: XCTestCase {
         XCTAssertEqual(sender.snapshot().map(\.pts), (0..<400).map { Int64($0) * 10_000 })
         await ingress.finish()
         XCTAssertEqual(ingress.snapshot().droppedFrames, 0)
+    }
+
+    @MainActor
+    func testFinalUnknownTimestampFailureReachesSinkWhileMainActorIsBlocked() async throws {
+        let sender = CaptureTestSender()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        await forwarder.beginMeeting(epoch: CaptureTimeline(epochMicroseconds: 1_000_000))
+        await forwarder.beginGeneration(1, writer: sender)
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: MicDeliveryDisplayMailbox { _ in },
+                                                onProblem: await forwarder.captureFailureHandler())
+        DispatchQueue.global().async {
+            let processor = MicCaptureProcessor(generation: 1, onProblem: ingress.problemCallback(), output: ingress.callback())
+            let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!
+            buffer.frameLength = 160
+            processor.receive(buffer, captureTimeUs: nil)
+            processor.finish()
+        }
+        XCTAssertEqual(sender.failureComplete.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(sender.failureSnapshot().0, 1)
+        XCTAssertTrue(sender.failureSnapshot().1.isEmpty, "An unknown timestamp must not invent a range")
+        await ingress.finish()
+        XCTAssertEqual(ingress.snapshot().sourceProblemCount, 1, "Evidence survives final retirement")
+        XCTAssertNil(ingress.snapshot().latestSourceProblem?.captureTimeUs)
+    }
+
+    func testFinalUnsupportedFormatReportsItsOwnNativeRangeWithoutFollowingPacket() async throws {
+        let sender = CaptureTestSender()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        await forwarder.beginMeeting(epoch: CaptureTimeline(epochMicroseconds: 1_000_000))
+        await forwarder.beginGeneration(9, writer: sender)
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: MicDeliveryDisplayMailbox { _ in },
+                                                onProblem: await forwarder.captureFailureHandler())
+        let processor = MicCaptureProcessor(generation: 9, onProblem: ingress.problemCallback(), output: ingress.callback())
+        let goodFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+        let good = AVAudioPCMBuffer(pcmFormat: goodFormat, frameCapacity: 160)!
+        good.frameLength = 160
+        good.floatChannelData![0].update(repeating: 0, count: 160)
+        processor.receive(good, captureTimeUs: 1_000_000)
+        let unsupportedFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat64, sampleRate: 48000, channels: 1, interleaved: false))
+        let bad = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: unsupportedFormat, frameCapacity: 480))
+        bad.frameLength = 480
+        processor.receive(bad, captureTimeUs: 2_000_000)
+        processor.finish()
+        await ingress.finish()
+        let failure = sender.failureSnapshot()
+        XCTAssertEqual(failure.0, 1)
+        XCTAssertEqual(failure.1.count, 1)
+        XCTAssertEqual(failure.1.first?.0, 1_000_000)
+        XCTAssertEqual(failure.1.first?.1, 160)
+        XCTAssertEqual(ingress.snapshot().latestSourceProblem?.nativeFrameCount, 480)
+        XCTAssertEqual(ingress.snapshot().latestSourceProblem?.generation, 9)
     }
 
     func testDelayedBunchedDeliveryRetainsCaptureTimesAndRestartEpoch() async {

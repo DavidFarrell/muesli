@@ -20,6 +20,7 @@ nonisolated protocol MicCapturing: Actor {
         preferredInputDeviceID: UInt32?,
         pinned: Bool,
         onConfigurationChange: (@Sendable () -> Void)?,
+        onCaptureProblem: (@Sendable (CapturedSourceProblem) -> Void)?,
         onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) async throws
 
