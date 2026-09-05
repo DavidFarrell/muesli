@@ -1,0 +1,11 @@
+# Reproducible verification and remaining release gates
+
+`scripts/verify.sh <fresh-output-directory>` uses uv 0.11.3, Python 3.12.13 and Xcode 26.6 on Apple Silicon. It creates a separate locked environment, verifies no lock mutation, runs model-free backend and Swift regression tests, compiles an ad-hoc Release build and retains logs plus a source/runtime manifest. It does not read meetings or change the user's selected environment. Runtime model imports are lazy so protocol/recovery tests do not require Metal initialization; real model qualification is separate.
+
+The tracked GitHub workflow runs the same script on `macos-26`, with action dependencies pinned to reviewed upstream commits and read-only repository permissions. It retains test/build diagnostics on failure. A green CI run does not establish audio-device permissions, actual route recovery, model accuracy, all-day soak or distribution signing.
+
+Local clean bootstrap was exercised using a new Python 3.12.13 environment with `uv sync --locked --extra dev`; all locked dependencies installed without changing the lock. Existing local cache was reused, so this is an isolated environment test, not a cache-empty/clean-machine claim. Real model inference under OS network denial passed on the installed runtime using a generated speech fixture. The exact resulting packaged runtime must be qualified separately.
+
+Still required before a distributable release: packaged and identified Python/native/model assets; a separately enforced whole-process network policy; signed/notarized binaries and permissions; clean-machine install/update/rollback; retained license notices and model provenance; the actual eight-hour/100-route hardware acceptance matrix. Current empty entitlements and external selected environment do not certify these. Signing credentials and physical route controls are external inputs; no such qualification is claimed by an ad-hoc build.
+
+Runner references: [GitHub standard runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), [macOS 26 Arm64 image](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md). Apple scope: [App Sandbox inheritance](https://developer.apple.com/library/archive/documentation/Miscellaneous/Reference/EntitlementKeyReference/Chapters/EnablingAppSandbox.html).
