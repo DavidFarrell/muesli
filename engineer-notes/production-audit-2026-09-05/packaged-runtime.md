@@ -19,7 +19,7 @@ The minimal decoder supports local file/pipe PCM workflows, WAV and AIFF inputs,
 4. `runtime-notices.py` inventories each installed distribution's exact shipped license/notice files and hashes without importing model code. It distinguishes declared metadata from missing notice evidence; this is not a legal redistribution conclusion. Model cards and conversion provenance remain separate from Python package licenses.
 5. `sign-runtime.py` signs and verifies native leaves, then records post-sign payload hashes outside the payload. It does not disable library validation. Enclosing bundles must be signed afterwards. Ad-hoc signing is qualification only; distribution identity/notarization remain separate.
 
-The six small packaging regressions compile real native fixtures. They prove relocation with the original directory removed, reject escaping links/rpaths and missing libraries, reject newer minimum OS requirements, and reject altered source archives before creating output. The normal verification script runs them without model downloads.
+The nine small packaging regressions compile real native fixtures. They prove relocation with the original directory removed, reject escaping links/rpaths and missing libraries, reject newer minimum OS requirements, Intel-only binaries, malformed universal containers and disguised system-path escapes, and reject altered source archives before creating output. The normal verification script runs them without model downloads.
 
 ## Execution evidence, 5 September 2026
 

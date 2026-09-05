@@ -5,9 +5,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import posixpath
 import subprocess
 
-MAGIC = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'}
+MAGIC = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce',
+         b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}
 SYSTEM = ('/usr/lib/', '/System/Library/')
 
 
@@ -16,12 +18,20 @@ def inside(path, root):
 
 
 def load_commands(path):
+    architectures = subprocess.check_output(['/usr/bin/lipo', '-archs', str(path)], text=True).split()
+    if 'arm64' not in architectures:
+        raise ValueError(f'Runtime binary has no arm64 slice: {path.name}')
+    header = subprocess.check_output(['/usr/bin/otool', '-arch', 'arm64', '-hv', str(path)], text=True)
+    if 'ARM64' not in header or 'MH_MAGIC_64' not in header:
+        raise ValueError(f'Runtime binary has no valid arm64 Mach-O header: {path.name}')
     text = subprocess.check_output(['/usr/bin/otool', '-arch', 'arm64', '-l', str(path)], text=True)
     commands = []
     for block in text.split('Load command ')[1:]:
         match = re.search(r'\n\s*cmd (\S+)', block)
         if match:
             commands.append((match.group(1), block))
+    if not commands or not any(kind == "LC_SEGMENT_64" for kind, _ in commands):
+        raise ValueError(f"Runtime binary has no valid arm64 load commands: {path.name}")
     return commands
 
 
@@ -83,6 +93,9 @@ def audit(root, executable, minimum=(26, 2)):
         dependencies = []
         for kind, block in commands:
             if kind == 'LC_BUILD_VERSION':
+                platform_id = re.search(r'\n\s*platform (\S+)', block).group(1)
+                if platform_id not in {'1', 'macos'}:
+                    raise ValueError(f'{owner.relative_to(root)} is not a macOS binary')
                 version = re.search(r'\n\s*minos ([0-9.]+)', block).group(1)
                 parts = tuple(int(x) for x in version.split('.'))
                 if (parts + (0, 0))[:2] > minimum:
@@ -90,7 +103,7 @@ def audit(root, executable, minimum=(26, 2)):
             if kind not in {'LC_LOAD_DYLIB', 'LC_LOAD_WEAK_DYLIB', 'LC_REEXPORT_DYLIB', 'LC_LOAD_UPWARD_DYLIB'}:
                 continue
             value = re.search(r'\n\s*name (.+?) \(offset', block).group(1)
-            if value.startswith(SYSTEM):
+            if value == posixpath.normpath(value) and value.startswith(SYSTEM):
                 dependencies.append(value)
                 continue
             if value.startswith('/'):

@@ -72,6 +72,30 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'requires macOS'):
             runtime.audit(self.root, self.host)
 
+    def test_system_prefix_cannot_hide_path_traversal(self):
+        self.run_command('install_name_tool', '-change', '@rpath/libprobe.dylib',
+                         '/usr/lib/../../private/tmp/unbundled-library.dylib', str(self.host))
+        with self.assertRaisesRegex(ValueError, 'absolute dependency'):
+            runtime.audit(self.root, self.host)
+
+    def test_intel_only_host_and_dependency_are_rejected(self):
+        self.run_command('clang', '-arch', 'x86_64', '-mmacosx-version-min=26.2',
+                         str(self.base / 'library.c'), '-dynamiclib', '-o', str(self.library))
+        with self.assertRaisesRegex(ValueError, 'arm64 slice'):
+            runtime.audit(self.root, self.host)
+        self.library.unlink()
+        (self.base / 'intel.c').write_text('int main(void) { return 0; }\n')
+        self.run_command('clang', '-arch', 'x86_64', '-mmacosx-version-min=26.2',
+                         str(self.base / 'intel.c'), '-o', str(self.host))
+        with self.assertRaisesRegex(ValueError, 'arm64 slice'):
+            runtime.audit(self.root, self.host)
+
+    def test_unsupported_fat64_container_is_not_silently_treated_as_data(self):
+        bad = self.root / 'lib/bad.dylib'
+        bad.write_bytes(b'\xca\xfe\xba\xbf' + b'\0' * 40)
+        with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+            runtime.audit(self.root, self.host)
+
     def test_wrong_download_hash_fails_before_output_creation(self):
         archive = self.base / 'wrong-archive'
         archive.write_bytes(b'wrong archive')
