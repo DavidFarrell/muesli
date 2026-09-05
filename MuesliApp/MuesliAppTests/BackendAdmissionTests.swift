@@ -79,6 +79,9 @@ final class BackendAdmissionTests: XCTestCase {
         // No MainActor continuation is allowed to claim the ready result.
         XCTAssertEqual(probe.scopeClosed.wait(timeout: .now() + 4), .success)
         XCTAssertThrowsError(try attempt.claim())
+        if case .timedOut = await attempt.waitUntilReady() {} else {
+            XCTFail("An owner deadline must not become a user cancellation while MainActor is blocked")
+        }
         XCTAssertFalse(probe.backend?.isRunning ?? true)
         XCTAssertTrue(probe.backend?.stdoutStatus().closed ?? false)
     }
@@ -291,6 +294,25 @@ final class BackendAdmissionTests: XCTestCase {
         XCTAssertTrue(alreadyClosed)
         XCTAssertLessThan(immediate.duration(to: .now), .milliseconds(100))
         XCTAssertEqual(writer.stdinCloseSnapshot.enqueued, 1)
+    }
+
+    func testBatchBlockedJournalDeadlineReportsFailureRatherThanUserCancellation() async throws {
+        let folder = try folder(), probe = AdmissionProbe(), runner = BatchRediarizer(timeoutSeconds: 0.2)
+        let task = Task {
+            try await runner.runCommand(["/usr/bin/true"], backendRoot: folder,
+                eventJournalURL: folder.appendingPathComponent("events"), beforeEventJournalIO: { hit in
+                    if case .prepare = hit { probe.block() }
+                })
+        }
+        defer { probe.release.signal(); task.cancel() }
+        let entered = await Task.detached { probe.waitForEntry() }.value
+        XCTAssertEqual(entered, .success)
+        do { _ = try await task.value; XCTFail("Blocked setup must time out") }
+        catch {
+            XCTAssertFalse(error is CancellationError, "The user did not cancel this request")
+            XCTAssertTrue(error.localizedDescription.contains("timed out"))
+        }
+        probe.release.signal()
     }
 
     func testBatchProductionAdmissionCancellationDuringPrepareIsBoundedAndBusy() async throws {

@@ -30,6 +30,7 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         private var phase = Phase.preparing
         private var resources: Resources?
         private var error: String?
+        private var expired = false
         private var timer: DispatchSourceTimer?
         private let deadline: DispatchTime
         private let ready = TaskCompletion()
@@ -41,7 +42,7 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         }
         fileprivate func arm() {
             let source = DispatchSource.makeTimerSource(queue: BackendAdmissionOwner.deadlines)
-            source.setEventHandler { [weak self] in self?.abandon(onlyUnclaimed: true) }
+            source.setEventHandler { [weak self] in self?.abandon(onlyUnclaimed: true, expired: true) }
             source.schedule(deadline: deadline)
             lock.withLock { timer = source }
             source.resume()
@@ -82,11 +83,12 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
             return value
         }
         fileprivate var abandoned: Bool { lock.withLock { phase == .abandoned || phase == .failed } }
-        fileprivate func abandon(onlyUnclaimed: Bool) {
+        fileprivate func abandon(onlyUnclaimed: Bool, expired: Bool = false) {
             let changed = lock.withLock {
                 if onlyUnclaimed && phase == .claimed { return false }
                 guard phase != .abandoned && phase != .failed else { return false }
                 phase = .abandoned
+                self.expired = expired
                 return true
             }
             guard changed else { return }
@@ -104,14 +106,16 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
                 return .cancelled
             }
             if outcome == .timedOut {
-                abandon(onlyUnclaimed: true)
+                abandon(onlyUnclaimed: true, expired: true)
                 return .timedOut
             }
-            return lock.withLock {
-                if phase == .ready && DispatchTime.now() < deadline { return .ready }
+            let result: Outcome = lock.withLock {
+                if phase == .ready { return DispatchTime.now() < deadline ? .ready : .timedOut }
                 if phase == .failed, let error { return .failed(error) }
-                return .cancelled
+                return expired ? .timedOut : .cancelled
             }
+            if case .timedOut = result { abandon(onlyUnclaimed: true, expired: true) }
+            return result
         }
         @concurrent func waitUntilClosed(timeoutSeconds: Double) async -> TaskCompletion.Outcome {
             await finished.wait(timeoutSeconds: timeoutSeconds)
