@@ -3267,6 +3267,7 @@ final class AppModel: ObservableObject {
     /// native stop. Taking it closes screenshot admission immediately; pending
     /// SDK video callbacks continue to address this original session's ledger.
     private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        captureEngine.retireCaptureIntent()
         screenshotScheduler.stop()
         let store = sessionArtifactStore
         sessionArtifactStore = nil

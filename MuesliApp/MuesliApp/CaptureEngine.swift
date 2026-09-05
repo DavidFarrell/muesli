@@ -291,6 +291,12 @@ final class CaptureEngine: NSObject {
         }
     }
 
+    /// Retire desired capture synchronously before another source's teardown
+    /// can suspend. Keep the request's sink until stopCapture owns native stop.
+    func retireCaptureIntent() {
+        desiredIntent.retire()
+    }
+
     private func clearRetiredSource() {
         lastRetiredIngress = relay?.ingressSnapshot() ?? lastRetiredIngress
         nativeSource = nil
