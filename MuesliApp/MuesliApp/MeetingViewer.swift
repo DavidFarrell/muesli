@@ -208,7 +208,7 @@ struct MeetingViewer: View {
                 showRediarizeConfirm = false
             }
         } message: {
-            Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace transcript?")
+            Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace the transcript with the selected audio streams? Reviewed speaker names will be cleared because the new labels may identify different people.")
         }
         .onDisappear {
             identificationTask?.cancel()

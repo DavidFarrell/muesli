@@ -35,6 +35,33 @@ final class BatchRediarizerTests: XCTestCase {
             XCTFail("a result does not supersede a terminal failure")
         } catch { XCTAssertTrue(error.localizedDescription.contains("final failure")) }
     }
+    func testExactlyOneFinalResultIsRequiredIncludingIdenticalDuplicates() async throws {
+        for secondDuration in [1, 2] {
+            let script = "printf '%s\\n' '{\"type\":\"result\",\"turns\":[],\"speakers\":[],\"duration\":1}' '{\"type\":\"result\",\"turns\":[],\"speakers\":[],\"duration\":\(secondDuration)}'"
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 5).runCommand(["/bin/sh", "-c", script], backendRoot: folder())
+                XCTFail("multiple final results cannot silently replace an earlier result")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("more than one final result")) }
+        }
+    }
+    func testInvalidAndOutOfRangeFinalTimesFailThroughActualReader() async throws {
+        let intervals = [(-1.0, 1.0), (2.0, 1.0), (0.0, 2.1)]
+        for (start, end) in intervals {
+            let payload = #"{"type":"result","turns":[{"speaker_id":"mic:0","stream":"mic","t0":START,"t1":END,"text":"bad"}],"speakers":["mic:0"],"duration":2}"#
+                .replacingOccurrences(of: "START", with: String(start)).replacingOccurrences(of: "END", with: String(end))
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 5).runCommand(["/bin/sh", "-c", "printf '%s\\n' '\(payload)'"], backendRoot: folder())
+                XCTFail("invalid interval accepted")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("audio timing")) }
+        }
+        for duration in ["-1", "1e999", "NaN"] {
+            let payload = #"{"type":"result","turns":[],"speakers":[],"duration":VALUE}"#.replacingOccurrences(of: "VALUE", with: duration)
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 5).runCommand(["/bin/sh", "-c", "printf '%s\\n' '\(payload)'"], backendRoot: folder())
+                XCTFail("invalid duration accepted")
+            } catch { /* malformed or invalid timing are both explicit failures */ }
+        }
+    }
     func testMalformedEOFTailCannotLeaveAnEarlierResultSuccessful() async throws {
         let runner = BatchRediarizer(timeoutSeconds: 10)
         for tail in ["{\"type\":", "{\"type\":\"result\"}"] {

@@ -501,7 +501,12 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let url = directory.appendingPathComponent(manifestName)
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= 1024 * 1024 else { throw RecorderError.invalidManifest }
-        let result = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
+        return try decodeManifest(Data(contentsOf: url))
+    }
+
+    static func decodeManifest(_ data: Data) throws -> Manifest {
+        guard data.count <= 1024 * 1024 else { throw RecorderError.invalidManifest }
+        let result = try JSONDecoder().decode(Manifest.self, from: data)
         guard result.schema_version == 1, !result.session_id.isEmpty,
               result.timeline_offset_us >= 0,
               result.streams.count == Source.allCases.count else { throw RecorderError.invalidManifest }

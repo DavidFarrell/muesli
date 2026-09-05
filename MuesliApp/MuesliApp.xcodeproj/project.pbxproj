@@ -45,6 +45,7 @@
 				BuildIdentity.swift,
 				ByteEditEvidence.swift,
 				BatchRediarizer.swift,
+				BatchSourceSnapshot.swift,
 				BackendLogWriter.swift,
 				BackendOutputReader.swift,
 				BackendStartupGate.swift,

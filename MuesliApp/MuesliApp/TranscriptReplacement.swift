@@ -17,7 +17,13 @@ nonisolated struct TranscriptReplacement: Sendable {
         metadata.segmentCount = segments.count
         let lastTimestamp = segments.map { $0.t1 ?? $0.t0 }.max() ?? 0
         metadata.lastTimestamp = max(metadata.lastTimestamp, lastTimestamp)
-        metadata.durationSeconds = max(result.duration, result.sources?.map { $0.timelineOffsetSeconds + $0.durationSeconds }.max() ?? 0)
+        // Audio reprocessing cannot shorten an independently verified video or
+        // capture extent already saved in this meeting.
+        let artifactEnd = previous.sessions.compactMap { $0.artifactFinalization }
+            .flatMap { [$0.captureEndSeconds, $0.mediaEndSeconds].compactMap { $0 } }
+            .filter { $0.isFinite && $0 >= 0 }.max() ?? 0
+        metadata.durationSeconds = max(artifactEnd, result.duration,
+            result.sources?.map { $0.timelineOffsetSeconds + $0.durationSeconds }.max() ?? 0)
         metadata.speakerNames = [:]
         metadata.lastReprocessIdentity = result.runtimeIdentity?.isSafeDiagnosticValue == true ? result.runtimeIdentity : nil
         // Reprocessing cannot certify or repair capture integrity.
@@ -85,7 +91,11 @@ extension TranscriptModel {
                           store: TranscriptPersistenceStore = .shared,
                           timeoutSeconds: Double = 5) async throws -> TranscriptReplacement {
         try await applyOwnedReplacement(id: requestID, in: folder, store: store, timeoutSeconds: timeoutSeconds) { context in
-            try TranscriptReplacement(result: result, metadata: context.readMetadata())
+            guard let snapshot = result.sourceSnapshot else {
+                throw BatchSourceSnapshot.failure("This batch result has no verified source snapshot. Reprocess the meeting before replacing its saved transcript.")
+            }
+            try snapshot.validateCurrent(context: context)
+            return try TranscriptReplacement(result: snapshot.validatedResult(result), metadata: context.readMetadata())
         }
     }
 

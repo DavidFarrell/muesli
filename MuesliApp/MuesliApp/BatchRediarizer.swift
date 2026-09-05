@@ -36,18 +36,20 @@ actor BatchRediarizer {
     }
 
     nonisolated struct Result: Codable, Sendable {
-        let turns: [Turn]
+        var turns: [Turn]
         let speakers: [String]
         let duration: Double
         var sources: [SourceInventory]? = nil
         var runtimeIdentity: ObservedRuntimeIdentity? = nil
+        // Deliberately absent from CodingKeys: stdout cannot attest its own input.
+        var sourceSnapshot: BatchSourceSnapshot? = nil
         enum CodingKeys: String, CodingKey {
             case turns, speakers, duration, sources
             case runtimeIdentity = "runtime_identity"
         }
     }
 
-    nonisolated struct SourceInventory: Codable, Sendable {
+    nonisolated struct SourceInventory: Codable, Sendable, Equatable {
         let sourceSessionID: String
         let audioFolder: String
         let timelineOffsetSeconds: Double
@@ -93,6 +95,8 @@ actor BatchRediarizer {
         private var error: String?
         private var stderr: [String] = []
         private var reported: Set<Progress> = []
+        private var sourceSnapshot: BatchSourceSnapshot?
+        func setSourceSnapshot(_ value: BatchSourceSnapshot) { lock.withLock { sourceSnapshot = value } }
         func receive(_ line: String) -> Progress? {
             guard let data = line.data(using: .utf8) else { return nil }
             guard (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else {
@@ -106,8 +110,20 @@ actor BatchRediarizer {
             if let failure = try? JSONDecoder().decode(ErrorEnvelope.self, from: data), failure.type == "error" {
                 lock.withLock { if error == nil { error = failure.message ?? "Batch reprocess failed." } }
             } else if let value = try? JSONDecoder().decode(ResultEnvelope.self, from: data), value.type == "result" {
-                lock.withLock { result = Result(turns: value.turns, speakers: value.speakers,
-                                               duration: value.duration, sources: value.sources, runtimeIdentity: value.runtimeIdentity) }
+                lock.withLock {
+                    guard result == nil else {
+                        if error == nil { error = "Batch stdout contained more than one final result." }
+                        return
+                    }
+                    let candidate = Result(turns: value.turns, speakers: value.speakers,
+                        duration: value.duration, sources: value.sources, runtimeIdentity: value.runtimeIdentity)
+                    do {
+                        try candidate.validateProtocol()
+                        result = try sourceSnapshot?.validatedResult(candidate) ?? candidate
+                    } catch {
+                        if self.error == nil { self.error = error.localizedDescription }
+                    }
+                }
             } else if let status = try? JSONDecoder().decode(StatusEnvelope.self, from: data), status.type == "status" {
                 // A future progress stage is harmless; a malformed result is not.
                 return nil
@@ -142,6 +158,7 @@ actor BatchRediarizer {
     ) async throws -> Result {
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
         return try await execute(protecting: meetingDirectory, progressHandler: progressHandler) { accumulator in
+            accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream))
             let build: (String) throws -> BackendProcess = { python in
                 let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue, "--meeting-lease-required"]
                 let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
@@ -155,16 +172,23 @@ actor BatchRediarizer {
 
     /// Runs the same production admission path with model-free child/IO seams.
     func runCommand(_ command: [String], backendRoot: URL,
+                    sourceMeetingDirectory: URL? = nil, stream: Stream = .both,
+                    beforeSourceSnapshot: @escaping @Sendable () throws -> Void = {},
+                    onResourcesClosed: @escaping @Sendable () -> Void = {},
                     eventJournalURL: URL? = nil,
                     beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
                     launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil,
                     progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil) async throws -> Result {
-        try await execute(protecting: backendRoot, progressHandler: progressHandler) { accumulator in
+        try await execute(protecting: sourceMeetingDirectory ?? backendRoot, progressHandler: progressHandler) { accumulator in
+            if let sourceMeetingDirectory {
+                accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: sourceMeetingDirectory, stream: stream,
+                    beforeRead: beforeSourceSnapshot))
+            }
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot,
                 environment: Self.backendEnvironment(root: backendRoot), eventJournalURL: eventJournalURL,
                 beforeEventJournalIO: beforeEventJournalIO, launchCheckpoint: launchCheckpoint)
             Self.attach(backend, accumulator: accumulator, progressHandler: progressHandler)
-            return BackendAdmissionOwner.Resources(backend: backend)
+            return BackendAdmissionOwner.Resources(backend: backend, onClosed: onResourcesClosed)
         }
     }
 
