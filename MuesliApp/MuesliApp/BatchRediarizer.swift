@@ -43,9 +43,30 @@ actor BatchRediarizer {
         var runtimeIdentity: ObservedRuntimeIdentity? = nil
         // Deliberately absent from CodingKeys: stdout cannot attest its own input.
         var sourceSnapshot: BatchSourceSnapshot? = nil
+        // Native completion cannot be manufactured by decoding stdout/receipts.
+        var nativeProcessingEvidence: CompletedProcessingEvidence? = nil
         enum CodingKeys: String, CodingKey {
             case turns, speakers, duration, sources
             case runtimeIdentity = "runtime_identity"
+        }
+    }
+
+    /// Created only after the native child, stdout and admission resources have
+    /// actually closed. A successful model-written report cannot construct it.
+    nonisolated struct CompletedProcessingEvidence: Sendable {
+        let sourceIdentity: MeetingFileAccess.Identity
+        let events: Data
+        private let observedExitCode: Int32
+        fileprivate init(sourceIdentity: MeetingFileAccess.Identity, events: Data, observedExitCode: Int32) {
+            self.sourceIdentity = sourceIdentity; self.events = events; self.observedExitCode = observedExitCode
+        }
+        /// Call on a retained worker holding the fresh exclusive source gate.
+        /// Final output/source revalidation and move ownership remain separate.
+        func verify(source: ArchiveSourceEligibility.VerifiedSource) throws -> ArchiveProcessingEvidence.Verified {
+            guard source.inventory.access.identity == sourceIdentity else {
+                throw ArchiveProcessingEvidence.Failure(message: "Processing completed for a different physical source folder.")
+            }
+            return try source.verifyProcessing(log: events, observedExitCode: observedExitCode)
         }
     }
 
@@ -96,9 +117,22 @@ actor BatchRediarizer {
         private var stderr: [String] = []
         private var reported: Set<Progress> = []
         private var sourceSnapshot: BatchSourceSnapshot?
+        private let evidenceByteLimit: Int?
+        private var events = Data()
+        init(evidenceByteLimit: Int?) { self.evidenceByteLimit = evidenceByteLimit }
         func setSourceSnapshot(_ value: BatchSourceSnapshot) { lock.withLock { sourceSnapshot = value } }
         func receive(_ line: String) -> Progress? {
             guard let data = line.data(using: .utf8) else { return nil }
+            let accepted = lock.withLock { () -> Bool in
+                guard let limit = evidenceByteLimit else { return true }
+                guard error == nil && data.count < limit - events.count else {
+                    if error == nil { error = "Processing evidence exceeded its bounded event budget." }
+                    return false
+                }
+                events.append(data); events.append(10)
+                return true
+            }
+            guard accepted else { return nil }
             guard (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else {
                 lock.withLock { if error == nil { error = "Batch stdout contained an incomplete or malformed JSON event." } }
                 return nil
@@ -140,6 +174,17 @@ actor BatchRediarizer {
                 if stderr.count > 20 { stderr.removeFirst(stderr.count - 20) }
             }
         }
+        func completedEvidence(observedExitCode: Int32) throws -> CompletedProcessingEvidence? {
+            try lock.withLock {
+                guard evidenceByteLimit != nil else { return nil }
+                guard observedExitCode == 0, error == nil, let sourceSnapshot,
+                      sourceSnapshot.selectedStream == .both, !events.isEmpty else {
+                    throw BatchRediarizer.failure(4, "Native processing evidence lacks a complete source-bound result.")
+                }
+                return CompletedProcessingEvidence(sourceIdentity: sourceSnapshot.folderIdentity,
+                    events: events, observedExitCode: observedExitCode)
+            }
+        }
         func snapshot() -> (Result?, String?, String?) {
             lock.withLock { (result, error, stderr.reversed().first { $0 != "Traceback (most recent call last):" }) }
         }
@@ -154,10 +199,15 @@ actor BatchRediarizer {
         backendPython: String? = nil,
         backendRoot: URL,
         stream: Stream,
+        collectProcessingEvidence: Bool = false,
         progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
     ) async throws -> Result {
+        if collectProcessingEvidence && stream != .both {
+            throw Self.failure(4, "Processing evidence requires both source streams.")
+        }
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
-        return try await execute(protecting: meetingDirectory, progressHandler: progressHandler) { accumulator in
+        return try await execute(protecting: meetingDirectory,
+            evidenceByteLimit: collectProcessingEvidence ? 64 * 1024 * 1024 : nil, progressHandler: progressHandler) { accumulator in
             accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream))
             let build: (String) throws -> BackendProcess = { python in
                 let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue, "--meeting-lease-required"]
@@ -173,13 +223,18 @@ actor BatchRediarizer {
     /// Runs the same production admission path with model-free child/IO seams.
     func runCommand(_ command: [String], backendRoot: URL,
                     sourceMeetingDirectory: URL? = nil, stream: Stream = .both,
+                    collectProcessingEvidence: Bool = false, evidenceByteLimit: Int = 64 * 1024 * 1024,
                     beforeSourceSnapshot: @escaping @Sendable () throws -> Void = {},
                     onResourcesClosed: @escaping @Sendable () -> Void = {},
                     eventJournalURL: URL? = nil,
                     beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
                     launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil,
                     progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil) async throws -> Result {
-        try await execute(protecting: sourceMeetingDirectory ?? backendRoot, progressHandler: progressHandler) { accumulator in
+        if collectProcessingEvidence && (stream != .both || sourceMeetingDirectory == nil) {
+            throw Self.failure(4, "Processing evidence requires an owned meeting and both streams.")
+        }
+        return try await execute(protecting: sourceMeetingDirectory ?? backendRoot,
+            evidenceByteLimit: collectProcessingEvidence ? evidenceByteLimit : nil, progressHandler: progressHandler) { accumulator in
             if let sourceMeetingDirectory {
                 accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: sourceMeetingDirectory, stream: stream,
                     beforeRead: beforeSourceSnapshot))
@@ -192,9 +247,12 @@ actor BatchRediarizer {
         }
     }
 
-    private func execute(protecting folder: URL, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+    private func execute(protecting folder: URL, evidenceByteLimit: Int?, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
                          factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
-        let accumulator = Accumulator()
+        if let evidenceByteLimit, !(1...64 * 1024 * 1024).contains(evidenceByteLimit) {
+            throw Self.failure(4, "Invalid processing evidence budget.")
+        }
+        let accumulator = Accumulator(evidenceByteLimit: evidenceByteLimit)
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
         let attempt = try admission.start(protecting: folder, timeoutSeconds: min(8, timeoutSeconds)) { try factory(accumulator) }
         return try await withTaskCancellationHandler(operation: {
@@ -222,10 +280,16 @@ actor BatchRediarizer {
                 guard exitStatus == 0 else {
                     throw Self.failure(Int(exitStatus), stderr.map { "Batch reprocess failed (\($0))" } ?? "Batch reprocess failed.")
                 }
-                guard let result else { throw Self.failure(3, "No batch reprocess output received.") }
+                guard var result else { throw Self.failure(3, "No batch reprocess output received.") }
                 backend.cleanup()
-                _ = await attempt.waitUntilClosed(timeoutSeconds: 2)
+                let closed = await attempt.waitUntilClosed(timeoutSeconds: 2)
                 try Task.checkCancellation()
+                if evidenceByteLimit != nil {
+                    guard closed == .completed else {
+                        throw Self.failure(4, "Processing finished but its native resources are still closing; originals remain retained.")
+                    }
+                    result.nativeProcessingEvidence = try accumulator.completedEvidence(observedExitCode: exitStatus)
+                }
                 if let progressHandler { await progressHandler(.complete) }
                 return result
             } catch {

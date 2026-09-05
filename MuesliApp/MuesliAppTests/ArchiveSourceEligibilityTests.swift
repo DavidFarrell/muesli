@@ -121,6 +121,51 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
         var bytes = try Data(contentsOf: wav); bytes[bytes.count - 1] ^= 1; try bytes.write(to: wav)
         rejected(root, contains: "compatibility WAV")
     }
+    func testActualNativeCompletionVerifiesOnlyTheOriginalPhysicalSource() async throws {
+        let root = try folder(); try fixture(root)
+        var inspected: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+        let source = inspected!.sessions[0]
+        inspected = nil // Actual exclusive owner retires before native SH admission.
+        let entries: [[String: Any]] = ["mic", "system"].map { name in
+            let pcm = source.streams[name]!, model = source.modelInputs[name]!
+            return ["source_session_id": source.sourceSessionID, "audio_folder": "audio", "stream": name,
+                "status": "processed", "availability": "present", "failure_code": NSNull(),
+                "asr_word_count": 1, "diarization_segment_count": 1, "turn_count": 1,
+                "source_input": ["relative_path": pcm.path, "storage_kind": "committed_pcm", "byte_count": pcm.bytes,
+                    "sha256": pcm.sha256, "manifest_sha256": source.manifest.sha256, "manifest_revision": source.manifestRevision,
+                    "committed_bytes": pcm.bytes, "session_id": source.sourceSessionID, "timeline_offset_us": 0,
+                    "completed": true, "sample_rate": 16000, "channels": 1, "frame_count": pcm.bytes / 2, "encoding": "PCM_16"],
+                "model_input": ["format": "wav_pcm_s16le", "sample_rate": 16000, "channels": 1, "frame_count": pcm.bytes / 2,
+                    "byte_count": model.bytes, "sha256": model.sha256],
+                "recovery": ["outcome": "not_needed", "planned_window_count": 0, "attempted_window_count": 0,
+                    "failed_window_count": 0, "empty_window_count": 0, "recovered_window_count": 0, "recovered_word_count": 0,
+                    "failure_code": NSNull(), "windows": []]]
+        }
+        let event: [String: Any] = ["type": "result", "duration": 0.01, "sources": [["source_session_id": source.sourceSessionID,
+            "audio_folder": "audio", "storage_kind": "committed_pcm", "timeline_offset_seconds": 0, "duration_seconds": 0.01]],
+            "speakers": ["mic:0", "system:0"],
+            "turns": ["mic", "system"].map { ["source_session_id": source.sourceSessionID, "stream": $0,
+                "speaker_id": $0 + ":0", "t0": 0, "t1": 0.005, "text": "Synthetic"] },
+            "processing": ["schema_version": 1, "complete": true, "requested_streams": ["mic", "system"],
+                "recovery_requested": true, "entries": entries]]
+        let encoded = try JSONSerialization.data(withJSONObject: event).base64EncodedString()
+        let script = "import base64; print(base64.b64decode('\(encoded)').decode(),flush=True)"
+        let result = try await BatchRediarizer(timeoutSeconds: 8).runCommand(["/usr/bin/python3", "-c", script], backendRoot: root,
+            sourceMeetingDirectory: root, collectProcessingEvidence: true)
+        let proof = try XCTUnwrap(result.nativeProcessingEvidence)
+        var original: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+        XCTAssertEqual(try proof.verify(source: original!).streamCount, 2)
+        original = nil
+        let clone = try folder()
+        for item in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
+            try FileManager.default.copyItem(at: item, to: clone.appendingPathComponent(item.lastPathComponent))
+        }
+        // Even identical source UUIDs, manifests and PCM cannot transfer native
+        // completion authority to a different physical recording folder.
+        XCTAssertThrowsError(try proof.verify(source: inspect(clone))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("different physical source"), error.localizedDescription)
+        }
+    }
     func testRecoveryRangeHashUsesExactOwnedPCMAndRejectsChangedOriginal() throws {
         let root = try folder(), id = try fixture(root)[0], source = try inspect(root)
         XCTAssertEqual(try source.recoveryWAVHash(sourceID: id, stream: "mic", frames: 40..<120),

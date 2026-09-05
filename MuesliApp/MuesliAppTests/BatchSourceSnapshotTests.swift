@@ -218,6 +218,57 @@ final class BatchSourceSnapshotTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: source).suffix(2), Data([42, 43]))
         XCTAssertEqual(value.sourceSnapshot?.sources.first?.streamDurations["mic"], 2)
     }
+    private func eventScript(_ folder: URL, exitCode: Int = 0) async throws -> String {
+        let output = try result(await snapshot(folder))
+        var event = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(output)) as? [String: Any])
+        event["type"] = "result"
+        let encoded = try JSONSerialization.data(withJSONObject: event, options: .sortedKeys).base64EncodedString()
+        return "import base64,sys; print(base64.b64decode('\(encoded)').decode(),flush=True); sys.exit(\(exitCode))"
+    }
+    func testNativeCompletionEvidenceComesFromActualChildAndCannotDecodeFromStdout() async throws {
+        let folder = try fixture(), expected = try await snapshot(folder), script = try await eventScript(folder)
+        let result = try await BatchRediarizer(timeoutSeconds: 8).runCommand(["/usr/bin/python3", "-c", script], backendRoot: folder,
+            sourceMeetingDirectory: folder, collectProcessingEvidence: true)
+        let evidence = try XCTUnwrap(result.nativeProcessingEvidence)
+        XCTAssertEqual(evidence.sourceIdentity, expected.folderIdentity)
+        XCTAssertEqual(evidence.events.last, 10)
+        XCTAssertEqual(try XCTUnwrap(JSONSerialization.jsonObject(with: evidence.events) as? [String: Any])["type"] as? String, "result")
+        let serialized = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(BatchRediarizer.Result.self, from: serialized)
+        XCTAssertNil(decoded.nativeProcessingEvidence)
+        var forged = try XCTUnwrap(JSONSerialization.jsonObject(with: serialized) as? [String: Any])
+        forged["nativeProcessingEvidence"] = ["observedExitCode": 0, "events": evidence.events.base64EncodedString()]
+        XCTAssertNil(try JSONDecoder().decode(BatchRediarizer.Result.self,
+            from: JSONSerialization.data(withJSONObject: forged)).nativeProcessingEvidence)
+    }
+    func testNonzeroActualExitAndBoundedEvidenceOverflowCannotReturnProof() async throws {
+        for nonzero in [true, false] {
+            let folder = try fixture(), script = try await eventScript(folder, exitCode: nonzero ? 7 : 0)
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 8).runCommand(["/usr/bin/python3", "-c", script], backendRoot: folder,
+                    sourceMeetingDirectory: folder, collectProcessingEvidence: true, evidenceByteLimit: nonzero ? 4096 : 64)
+                XCTFail("An unsuccessful or incomplete native run returned evidence")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains(nonzero ? "failed" : "budget"), error.localizedDescription)
+            }
+        }
+    }
+    func testEvidenceWaitDeadlineDoesNotReleaseActuallyStalledNativeClose() async throws {
+        let folder = try fixture(), script = try await eventScript(folder), closing = TaskCompletion()
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let runner = BatchRediarizer(timeoutSeconds: 8)
+        let task = Task {
+            try await runner.runCommand(["/usr/bin/python3", "-c", script], backendRoot: folder,
+                sourceMeetingDirectory: folder, collectProcessingEvidence: true,
+                onResourcesClosed: { closing.markCompleted(); gate.wait() })
+        }
+        let closeStarted = await closing.wait(timeoutSeconds: 5)
+        XCTAssertEqual(closeStarted, .completed)
+        do { _ = try await task.value; XCTFail("A caller timeout manufactured completed native evidence") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("still closing"), error.localizedDescription) }
+        XCTAssertThrowsError(try MeetingFileAccess.acquire(in: folder, mode: .archive), "Actual closing still owns the source")
+    }
     func testActualSubprocessCapturesBeforeLaunchAndResumeDuringChildWaitCannotPublish() async throws {
         let folder = try fixture(), launched = TaskCompletion()
         let output = try result(await snapshot(folder))
