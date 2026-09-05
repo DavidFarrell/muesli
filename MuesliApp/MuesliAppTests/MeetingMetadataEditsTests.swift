@@ -69,10 +69,11 @@ final class MeetingMetadataEditsTests: XCTestCase {
         let folder = try fixture(), gate = Gate(), before = try await read(folder)
         let store = TranscriptPersistenceStore { if $0 == .stage("meeting.json") { gate.first() } }
         var events: [String] = [], committedNames: [[String: String]] = []
+        let pendingObserved = TaskCompletion()
         let edits = MeetingMetadataEdits(store: store, timeoutSeconds: 0.03) { event in
             switch event {
             case .committed(_, let metadata, _): events.append("saved"); committedNames.append(metadata.speakerNames)
-            case .pending: events.append("pending")
+            case .pending: events.append("pending"); pendingObserved.markCompleted()
             case .failed: events.append("failed")
             }
         }
@@ -80,7 +81,8 @@ final class MeetingMetadataEditsTests: XCTestCase {
         let entered = await gate.entered.wait(timeoutSeconds: 1)
         XCTAssertEqual(entered, .completed)
         for n in 0..<100 { edits.submitNames(["a": "Final \(n)", "b": "Second"], in: folder, contentGeneration: 1) }
-        try await Task.sleep(for: .milliseconds(60))
+        let pending = await pendingObserved.wait(timeoutSeconds: 2)
+        XCTAssertEqual(pending, .completed, "Observe the real deadline publication before checking its state")
         XCTAssertEqual(committedNames.count, 0)
         XCTAssertEqual(events, ["pending"])
         XCTAssertEqual(gate.visits, 1)

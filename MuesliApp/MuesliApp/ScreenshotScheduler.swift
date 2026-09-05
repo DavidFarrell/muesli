@@ -26,6 +26,7 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     private let lock = NSLock()
     private let requestTimeoutSeconds: Double
     private let now: @Sendable () -> Double
+    private let onRequestTimeout: @Sendable () -> Void
     private var currentStore: SessionArtifactStore?
     private var pendingSince: Double?
     private var timer: DispatchSourceTimer?
@@ -37,10 +38,12 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
     private var unavailableReportedForRun: UUID?
 
     init(requestTimeoutSeconds: Double = 10,
-         now: @escaping @Sendable () -> Double = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }) {
+         now: @escaping @Sendable () -> Double = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 },
+         onRequestTimeout: @escaping @Sendable () -> Void = { }) {
         precondition(requestTimeoutSeconds.isFinite && requestTimeoutSeconds > 0)
         self.requestTimeoutSeconds = requestTimeoutSeconds
         self.now = now
+        self.onRequestTimeout = onRequestTimeout
     }
 
     func start(every intervalSeconds: Double, store: SessionArtifactStore,
@@ -52,7 +55,10 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
             currentStore?.stopScreenshots(); currentStore = store
             return pendingSince.map { now() - $0 >= requestTimeoutSeconds } ?? false
         }
-        if unavailable { store.recordScreenshotFailure(ownershipUnavailable: true) }
+        if unavailable {
+            store.recordScreenshotFailure(ownershipUnavailable: true)
+            onRequestTimeout()
+        }
         queue.async { [self] in
             timer?.cancel()
             run = newRun
@@ -77,10 +83,7 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
         guard let run else { return }
         guard outstanding == nil else {
             let unavailable = lock.withLock { pendingSince.map { now() - $0 >= requestTimeoutSeconds } ?? false }
-            if unavailable, unavailableReportedForRun != run.id {
-                unavailableReportedForRun = run.id
-                run.store.recordScreenshotFailure(ownershipUnavailable: true)
-            }
+            if unavailable { reportUnavailable(run) }
             return
         }
         let requestID = UUID()
@@ -90,7 +93,13 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
         lock.withLock { pendingSince = now() }
         let deadline = DispatchSource.makeTimerSource(queue: queue)
         deadline.schedule(deadline: .now() + requestTimeoutSeconds)
-        deadline.setEventHandler { [weak self] in self?.tick() }
+        deadline.setEventHandler { [weak self] in
+            guard let self, self.outstanding == requestID, let activeRun = self.run else { return }
+            // The one-shot timer is the deadline observation. Rechecking a
+            // separate clock here could consume the only event without either
+            // reporting the failure or arranging a replacement deadline.
+            self.reportUnavailable(activeRun)
+        }
         requestDeadlineTimer = deadline
         deadline.resume()
         requestQueue.async { [weak self] in
@@ -111,6 +120,13 @@ nonisolated final class ScreenshotScheduler: @unchecked Sendable {
                 self.releaseResolvedRequest(requestID)
             }
         }
+    }
+
+    private func reportUnavailable(_ activeRun: Run) {
+        guard unavailableReportedForRun != activeRun.id else { return }
+        unavailableReportedForRun = activeRun.id
+        activeRun.store.recordScreenshotFailure(ownershipUnavailable: true)
+        onRequestTimeout()
     }
 
     private func releaseResolvedRequest(_ requestID: UUID) {
