@@ -12,10 +12,9 @@ enum MicEngineError: Error {
 actor MicEngine: MicCapturing {
     private var engine: AVAudioEngine?
     private var isRunning = false
-    private var onAudioData: ((Data) -> Void)?
+    private var processor: MicCaptureProcessor?
     private var onConfigurationChange: (() -> Void)?
     private var configChangeObserver: NSObjectProtocol?
-    private var convertFailures = 0
     private var retiredEngines: [UUID: AVAudioEngine] = [:]
     private let engineRetainDurationNs: UInt64 = 2_000_000_000
 
@@ -29,15 +28,16 @@ actor MicEngine: MicCapturing {
     /// - `onConfigurationChange`: fired when the OS moves the audio route under a
     ///   running engine (e.g. a Bluetooth headset connects). The caller restarts.
     func start(
+        generation: Int,
         enableVoiceProcessing: Bool,
         preferredInputDeviceID: UInt32?,
         pinned: Bool = false,
         onConfigurationChange: (@Sendable () -> Void)? = nil,
-        onAudioData: @escaping (Data) -> Void
+        onAudioData: @escaping @Sendable (CapturedMicAudio) -> Void
     ) throws {
         guard !isRunning else { return }
 
-        self.onAudioData = onAudioData
+        self.processor = MicCaptureProcessor(generation: generation, output: onAudioData)
         self.onConfigurationChange = onConfigurationChange
         do {
             try startEngine(
@@ -52,6 +52,8 @@ actor MicEngine: MicCapturing {
                 "preferredID": preferredInputDeviceID ?? 0,
                 "error": String(describing: error)
             ])
+            processor?.finish()
+            processor = nil
             throw error
         }
         AudioLog.event("engine.start.ok", [
@@ -131,23 +133,10 @@ actor MicEngine: MicCapturing {
                     )
                 }
 
-                inputNode.installTap(
-                    onBus: 0,
-                    bufferSize: 4096,
-                    format: nativeFormat
-                ) { [weak self] buffer, _ in
-                    guard let data = AudioConverterHelper.convertToInt16(buffer: buffer) else {
-                        // A tap that fires but fails to convert looks identical to a dead
-                        // mic from the outside and silently defeats the no-audio health
-                        // check - so count and log it (first failure carries the format).
-                        Task { [weak self] in
-                            await self?.noteConversionFailure(format: "\(nativeFormat)")
-                        }
-                        return
-                    }
-                    Task { [weak self] in
-                        await self?.emitAudio(data)
-                    }
+                guard let processor else { throw AudioConverterHelper.ConversionError.invalidFormat }
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { buffer, time in
+                    processor.receive(buffer, captureTimeUs: time.isHostTimeValid
+                        ? CaptureTimeline.microseconds(hostTime: time.hostTime) : nil)
                 }
 
                 // Fire when the OS moves the route under a running engine (the event we
@@ -182,13 +171,6 @@ actor MicEngine: MicCapturing {
         }
     }
 
-    private func noteConversionFailure(format: String) {
-        convertFailures += 1
-        if convertFailures == 1 {
-            AudioLog.error("tap.convert.fail", ["inputFormat": format])
-        }
-    }
-
     func stop() async {
         guard isRunning else { return }
 
@@ -197,12 +179,10 @@ actor MicEngine: MicCapturing {
             configChangeObserver = nil
         }
         onConfigurationChange = nil
-        convertFailures = 0
 
         let runningEngine = engine
         self.engine = nil
         isRunning = false
-        onAudioData = nil
         AudioLog.event("engine.stop")
 
         guard let runningEngine else {
@@ -212,6 +192,8 @@ actor MicEngine: MicCapturing {
 
         runningEngine.inputNode.removeTap(onBus: 0)
         runningEngine.stop()
+        processor?.finish()
+        processor = nil
 
         // Keep the engine alive briefly after stop; AVFAudio can dispatch late
         // property-listener callbacks during teardown.
@@ -279,7 +261,4 @@ actor MicEngine: MicCapturing {
         print("[MicEngine] Bound input device \(preferredInputDeviceID)")
     }
 
-    private func emitAudio(_ data: Data) {
-        onAudioData?(data)
-    }
 }

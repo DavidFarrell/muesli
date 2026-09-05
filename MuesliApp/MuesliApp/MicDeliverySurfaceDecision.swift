@@ -19,7 +19,7 @@ import Foundation
 /// the persistent mic alert would never clear, even though audio is flowing
 /// fine. Surfacing any post-gap frame, independent of its level, closes that
 /// gap (audit: found by the 2026-07-06 livelock fix's review gate).
-enum MicDeliverySurfaceDecision {
+nonisolated enum MicDeliverySurfaceDecision {
     static func mustSurface(
         isFirstFrame: Bool,
         secondsSinceLastFrame: Double?,

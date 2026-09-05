@@ -1,0 +1,54 @@
+// closure #1 in MicAudioIngress.callback()
+// Isolation: nonisolated
+sil private [ossa] @$s9MuesliApp15MicAudioIngressC8callbackyAA08CapturedcD0VYbcyFyAFYbcfU_ : $@convention(thin) @Sendable (@guaranteed CapturedMicAudio, @guaranteed MicAudioIngress) -> () {
+// %0 "packet"                                    // users: %5, %2
+// %1 "self"                                      // users: %5, %3
+bb0(%0 : @guaranteed $CapturedMicAudio, %1 : @closureCapture @guaranteed $MicAudioIngress):
+  debug_value %0, let, name "packet", argno 1     // id: %2
+  debug_value %1, let, name "self", argno 2       // id: %3
+  // function_ref MicAudioIngress.enqueue(_:)
+  %4 = function_ref @$s9MuesliApp15MicAudioIngressC7enqueueySbAA08CapturedcD0VF : $@convention(method) (@guaranteed CapturedMicAudio, @guaranteed MicAudioIngress) -> Bool // user: %5
+  %5 = apply %4(%0, %1) : $@convention(method) (@guaranteed CapturedMicAudio, @guaranteed MicAudioIngress) -> Bool // user: %6
+  ignored_use %5                                  // id: %6
+  %7 = tuple ()                                   // user: %8
+  return %7                                       // id: %8
+} // end sil function '$s9MuesliApp15MicAudioIngressC8callbackyAA08CapturedcD0VYbcyFyAFYbcfU_'
+
+// closure #1 in static MicAudioIngress.forwarding(to:display:onRejected:)
+// Isolation: caller_isolation_inheriting
+sil private [ossa] @$s9MuesliApp15MicAudioIngressC10forwarding2to7display10onRejectedAcA0cD9ForwarderC_AA0C22DeliveryDisplayMailboxCyAA08CapturedcD0V_AC15RejectionReasonOtYbcSgtFZyAMYaYbYCcfU_ : $@convention(thin) @Sendable @async (@sil_isolated @sil_implicit_leading_param @guaranteed Builtin.ImplicitActor, @guaranteed CapturedMicAudio, @guaranteed MicAudioForwarder, @guaranteed MicDeliveryDisplayMailbox) -> () {
+// %0                                             // users: %11, %7
+// %1 "packet"                                    // users: %10, %4
+// %2 "forwarder"                                 // users: %10, %9, %8, %5
+// %3 "display"                                   // users: %19, %6
+bb0(%0 : @guaranteed $Builtin.ImplicitActor, %1 : @guaranteed $CapturedMicAudio, %2 : @closureCapture @guaranteed $MicAudioForwarder, %3 : @closureCapture @guaranteed $MicDeliveryDisplayMailbox):
+  debug_value %1, let, name "packet", argno 1     // id: %4
+  debug_value %2, let, name "forwarder", argno 2  // id: %5
+  debug_value %3, let, name "display", argno 3    // id: %6
+  hop_to_executor %0                              // id: %7
+  %8 = class_method %2, #MicAudioForwarder.deliver : (isolated MicAudioForwarder) -> (CapturedMicAudio) -> MicAudioForwarder.DeliveryResult?, $@convention(method) (@guaranteed CapturedMicAudio, @sil_isolated @guaranteed MicAudioForwarder) -> Optional<MicAudioForwarder.DeliveryResult> // user: %10
+  hop_to_executor %2                              // id: %9
+  %10 = apply %8(%1, %2) : $@convention(method) (@guaranteed CapturedMicAudio, @sil_isolated @guaranteed MicAudioForwarder) -> Optional<MicAudioForwarder.DeliveryResult> // user: %12
+  hop_to_executor %0                              // id: %11
+  switch_enum %10, case #Optional.some!enumelt: bb2, case #Optional.none!enumelt: bb1 // id: %12
+
+bb1:                                              // Preds: bb0
+  br bb4                                          // id: %13
+
+// %14                                            // user: %15
+bb2(%14 : $MicAudioForwarder.DeliveryResult):     // Preds: bb0
+  %15 = move_value [var_decl] %14                 // users: %20, %19, %16
+  debug_value %15, let, name "result"             // id: %16
+  br bb3                                          // id: %17
+
+bb3:                                              // Preds: bb2
+  // function_ref MicDeliveryDisplayMailbox.publish(_:)
+  %18 = function_ref @$s9MuesliApp25MicDeliveryDisplayMailboxC7publishyyAA0C14AudioForwarderC0D6ResultVF : $@convention(method) (MicAudioForwarder.DeliveryResult, @guaranteed MicDeliveryDisplayMailbox) -> () // user: %19
+  %19 = apply %18(%15, %3) : $@convention(method) (MicAudioForwarder.DeliveryResult, @guaranteed MicDeliveryDisplayMailbox) -> ()
+  extend_lifetime %15                             // id: %20
+  br bb4                                          // id: %21
+
+bb4:                                              // Preds: bb3 bb1
+  %22 = tuple ()                                  // user: %23
+  return %22                                      // id: %23
+} // end sil function '$s9MuesliApp15MicAudioIngressC10forwarding2to7display10onRejectedAcA0cD9ForwarderC_AA0C22DeliveryDisplayMailboxCyAA08CapturedcD0V_AC15RejectionReasonOtYbcSgtFZyAMYaYbYCcfU_'

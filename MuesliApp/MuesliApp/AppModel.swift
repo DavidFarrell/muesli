@@ -240,6 +240,9 @@ final class AppModel: ObservableObject {
     // MainActor entirely - see MicAudioForwarder's doc comment (2026-07-06
     // livelock fix, item 1). `micOutputEnabled`/`pendingMicAudio` used to
     // live on AppModel directly; both now live inside the forwarder.
+    private var micAudioIngress: MicAudioIngress?
+    private var previewMicAudioIngress: MicAudioIngress?
+    private var previewMicGeneration = 0
     private let micAudioForwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
     // Owns backend.log file writes + the copy-debug ring buffer off
     // MainActor (2026-07-06 livelock fix, item 5). `nonisolated(unsafe)`:
@@ -247,7 +250,7 @@ final class AppModel: ObservableObject {
     // (see its doc comment), so it is genuinely safe to call from any
     // isolation domain, incl. `AudioLog.sink`'s arbitrary-queue closure -
     // that is the entire point of moving it off MainActor.
-    private nonisolated(unsafe) let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
+    private nonisolated let backendLogWriter = BackendLogWriter(ringBufferLimit: 200)
     // Detects (and logs) a wedged main thread from entirely off-main code -
     // see its doc comment (2026-07-06 livelock fix, item 2). Assigned in
     // init() since it depends on `backendLogWriter`/`micAudioForwarder`.
@@ -808,7 +811,7 @@ final class AppModel: ObservableObject {
         }
 
         micLevel = result.level
-        debugMicBuffers += 1
+        debugMicBuffers = result.totalFrameCount
         debugMicFrames = result.frameSampleCount
         debugMicPTS = result.elapsedSeconds
         // Liveness signals for UI/logging convenience. The frames watchdog's
@@ -816,13 +819,13 @@ final class AppModel: ObservableObject {
         // directly instead (ground truth, updated even when this MainActor
         // hop is delayed) - see `startMicFramesWatchdog`.
         lastMicAudioAt = Date()
-        micFrameCount += 1
+        micFrameCount = result.totalFrameCount
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
         publishMicMeters()
     }
 
-    private func handlePreviewMicAudio(_ data: Data) {
-        micLevel = rmsLevelInt16(data)
+    private func handlePreviewMicAudio(_ result: MicAudioForwarder.DeliveryResult) {
+        micLevel = result.level
         publishMicMeters()
     }
 
@@ -1058,7 +1061,7 @@ final class AppModel: ObservableObject {
                     isPreviewingLevels = false
                     return
                 }
-                captureEngine.setAudioOutputEnabled(false)
+                await captureEngine.setAudioOutputEnabled(false)
                 isPreviewCaptureRunning = true
             } catch {
                 shareableContentError = "Failed to start system audio preview: \(error.localizedDescription)"
@@ -1098,8 +1101,20 @@ final class AppModel: ObservableObject {
     private func attemptPreviewMicEngineStart(usesCaptureSession: Bool, resolvedID: UInt32, pinned: Bool) async throws {
         let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "preview", resolvedID: resolvedID, pinned: pinned)
         previewMicEngine = engine
+        previewMicGeneration += 1
+        let generation = previewMicGeneration
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(generation, writer: nil)
+        let display = MicDeliveryDisplayMailbox { [weak self] result in
+            guard let self, self.previewMicGeneration == generation, self.isStartScreenActive else { return }
+            self.handlePreviewMicAudio(result)
+        }
+        let ingress = MicAudioIngress.forwarding(to: forwarder, display: display)
+        previewMicAudioIngress = ingress
         do {
             try await engine.start(
+                generation: generation,
                 // CaptureSessionMicEngine has no VPIO equivalent - never request it there.
                 enableVoiceProcessing: usesCaptureSession ? false : shouldEnableVoiceProcessing(),
                 preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
@@ -1113,19 +1128,22 @@ final class AppModel: ObservableObject {
                         // if the resolved device actually moved.
                         self.loadInputDevices()
                     }
-                }
-            ) { [weak self] data in
-                Task { @MainActor in
-                    self?.handlePreviewMicAudio(data)
-                }
-            }
+                },
+                onAudioData: ingress.callback()
+            )
         } catch {
+            await previewMicAudioIngress?.finish()
+            previewMicAudioIngress = nil
+            previewMicGeneration += 1
             previewMicEngine = nil
             throw error
         }
 
         guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
             await engine.stop()
+            await previewMicAudioIngress?.finish()
+            previewMicAudioIngress = nil
+            previewMicGeneration += 1
             previewMicEngine = nil
             previewMicEngineBoundDeviceID = 0
             previewMicEngineUsesCaptureSession = false
@@ -1145,6 +1163,9 @@ final class AppModel: ObservableObject {
     private func stopHomeLevelPreviewNow() async {
         if let engine = previewMicEngine {
             await engine.stop()
+            await previewMicAudioIngress?.finish()
+            previewMicAudioIngress = nil
+            previewMicGeneration += 1
             previewMicEngine = nil
             previewMicEngineBoundDeviceID = 0
             previewMicEngineUsesCaptureSession = false
@@ -1204,6 +1225,8 @@ final class AppModel: ObservableObject {
         guard transcribeMic else {
             micEngine = nil
             micEngineStartedAt = nil
+            await micAudioIngress?.finish()
+            micAudioIngress = nil
             await micAudioForwarder.stop()
             cancelMicStartupHealthCheck()
             return
@@ -1277,9 +1300,16 @@ final class AppModel: ObservableObject {
         // narrow startup race the old MainActor-side `pendingMicAudio`
         // mechanism only papered over: no buffer can arrive before its
         // generation is recognised.
+        await micAudioIngress?.finish()
         await micAudioForwarder.beginGeneration(generation, writer: writer)
+        let display = MicDeliveryDisplayMailbox { [weak self] result in
+            self?.onMicAudioDelivered(result, generation: generation)
+        }
+        let ingress = MicAudioIngress.forwarding(to: micAudioForwarder, display: display)
+        micAudioIngress = ingress
 
         try await engine.start(
+            generation: generation,
             enableVoiceProcessing: enableVPIO,
             preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
             pinned: pinned,
@@ -1291,19 +1321,9 @@ final class AppModel: ObservableObject {
                     // device the engine should be on actually moved.
                     self.loadInputDevices()
                 }
-            }
-        ) { [weak self] data in
-            guard let self else { return }
-            // Deliver directly to the forwarder - NOT `Task { @MainActor in
-            // ... }` - so this never needs a live UI thread. Only a
-            // throttled subset of deliveries (see the forwarder's gating)
-            // hops to MainActor afterwards, purely for metering/recovery-
-            // ladder bookkeeping.
-            Task {
-                guard let result = await self.micAudioForwarder.deliver(data, generation: generation) else { return }
-                await self.onMicAudioDelivered(result, generation: generation)
-            }
-        }
+            },
+            onAudioData: ingress.callback()
+        )
         // Serialization should prevent overlap, but bail if a newer start
         // superseded this one before it completed (audit D2 belt-and-braces).
         guard generation == micEngineGeneration else {
@@ -1367,6 +1387,8 @@ final class AppModel: ObservableObject {
         micEngineStartedAt = nil
         micEngineBoundDeviceID = 0
         micEngineUsesCaptureSession = false
+        await micAudioIngress?.finish()
+        micAudioIngress = nil
         await micAudioForwarder.stop()
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
@@ -1406,6 +1428,8 @@ final class AppModel: ObservableObject {
         // for a fresh generation (see beginGeneration), but stop it
         // explicitly here too so forwarding halts the instant the engine
         // does, rather than lingering until the new generation is armed.
+        await micAudioIngress?.finish()
+        micAudioIngress = nil
         await micAudioForwarder.stop()
         micLevel = 0
         debugMicBuffers = 0
@@ -1421,6 +1445,9 @@ final class AppModel: ObservableObject {
         await runPreviewLifecycleOperation { model in
             if let engine = model.previewMicEngine {
                 await engine.stop()
+                await model.previewMicAudioIngress?.finish()
+                model.previewMicAudioIngress = nil
+                model.previewMicGeneration += 1
                 model.previewMicEngine = nil
                 model.previewMicEngineBoundDeviceID = 0
                 model.previewMicEngineUsesCaptureSession = false
@@ -2458,22 +2485,17 @@ final class AppModel: ObservableObject {
                 recordURL = nil
             }
 
+            let captureTimeline = CaptureTimeline()
+            await micAudioForwarder.beginMeeting(epoch: captureTimeline)
             try await captureEngine.startCapture(
                 contentFilter: audioFilter,
                 writer: writer,
-                recordTo: recordURL
+                recordTo: recordURL,
+                timeline: captureTimeline
             )
 
             resetMicDebugState()
             micStartTime = Date()
-            // Marks meeting-timeline zero for the forwarder's PTS clock,
-            // BEFORE the first startMeetingMicEngine() can arm a generation -
-            // see MicAudioForwarder.beginMeeting's doc comment (2026-07-08
-            // mic-stall fix). Unlike micStartTime, this must survive every
-            // mid-meeting engine rebuild, so it is cleared only by the two
-            // true-end teardown paths (teardownFailedMeetingStart, stopMeeting)
-            // calling endMeeting(), never by restartMeetingMicEngineForInputSwitch.
-            await micAudioForwarder.beginMeeting()
             await startMeetingMicEngine()
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
@@ -2542,7 +2564,7 @@ final class AppModel: ObservableObject {
             }
             appendBackendLog("Backend ready (meeting_started acknowledged)", toTail: true)
 
-            captureEngine.setAudioOutputEnabled(true)
+            await captureEngine.setAudioOutputEnabled(true)
             // Open the mic side too: at first start the engine came up with
             // the gate still closed (see attemptMeetingMicEngineStart), so
             // everything delivered so far sits in the forwarder's pending
@@ -2558,7 +2580,7 @@ final class AppModel: ObservableObject {
                     every: 5.0,
                     contentFilter: screenshotFilter,
                     streamConfig: captureEngine.streamConfigurationForScreenshots(),
-                    meetingStartPTSProvider: { [weak self] in self?.captureEngine.meetingStartPTS },
+                    meetingStartPTSProvider: { captureTimeline.epochPTS },
                     outputDir: screenshotsDir
                 ) { [weak self] tSec, relativePath in
                     guard let self else { return }
@@ -2621,6 +2643,8 @@ final class AppModel: ObservableObject {
             model.micEngineUsesCaptureSession = false
         }
         await micLifecycleTask?.value
+        await micAudioIngress?.finish()
+        micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
         micStartTime = nil
@@ -2734,6 +2758,8 @@ final class AppModel: ObservableObject {
         }
         micEngine = nil
         micEngineStartedAt = nil
+        await micAudioIngress?.finish()
+        micAudioIngress = nil
         await micAudioForwarder.stop()
         await micAudioForwarder.endMeeting()
         micStartTime = nil

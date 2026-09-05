@@ -13,7 +13,7 @@ import Foundation
 /// persistent invalidation driver feeding the storm, even though it wasn't
 /// convicted as the loop-closer itself). Any nonzero reading is still
 /// subject to the plain time-based throttle, same as before.
-struct MeterPublishGate {
+nonisolated struct MeterPublishGate {
     /// Sentinel: nothing published yet, so the very first reading (even a
     /// zero one) is treated as a transition rather than "already at rest".
     private(set) var lastPublishedLevel: Float = -1
