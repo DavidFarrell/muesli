@@ -111,3 +111,15 @@ def test_cache_named_swift_directory_cannot_hide_ignored_compiler_input(tmp_path
     assert after['source_dirty'] is True and after['build_id'] != before['build_id']
     with pytest.raises(ValueError):
         build.identity(tmp_path, {'ACTION': 'install'})
+
+
+def test_generated_bytecode_in_python_roots_does_not_dirty_source(tmp_path):
+    fixture(tmp_path)
+    (tmp_path / '.gitignore').write_text('__pycache__/\n')
+    git(tmp_path, 'init'); git(tmp_path, 'add', '.'); git(tmp_path, 'commit', '-m', 'Fixture')
+    before = build.identity(tmp_path, {'ACTION': 'install'})
+    for relative in ['scripts', build.BACKEND + '/src']:
+        bytecode = tmp_path / relative / '__pycache__/module.cpython-312.pyc'
+        bytecode.parent.mkdir(parents=True, exist_ok=True); bytecode.write_bytes(b'generated cache')
+    after = build.identity(tmp_path, {'ACTION': 'install'})
+    assert after['source_dirty'] is False and after['build_id'] == before['build_id']
