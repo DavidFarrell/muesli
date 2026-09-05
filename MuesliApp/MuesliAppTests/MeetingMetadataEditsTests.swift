@@ -16,6 +16,36 @@ final class MeetingMetadataEditsTests: XCTestCase {
             }
         }
     }
+    /// Hold real worker/deadline deliveries so successor publication can be
+    /// ordered ahead of either callback without relying on scheduler timing.
+    nonisolated private final class PublicationMailbox: @unchecked Sendable {
+        let first = TaskCompletion(), second = TaskCompletion()
+        private let lock = NSLock()
+        private var publications: [MeetingMetadataEdits.Publication] = []
+        private var deliveries = 0
+        func enqueue(_ publication: @escaping MeetingMetadataEdits.Publication) {
+            let count = lock.withLock { publications.append(publication); deliveries += 1; return deliveries }
+            if count == 1 { first.markCompleted() }
+            if count == 2 { second.markCompleted() }
+        }
+        @MainActor func runFirst() {
+            let publication = lock.withLock { publications.removeFirst() }
+            publication()
+        }
+        @MainActor func runLast() {
+            let publication = lock.withLock { publications.removeLast() }
+            publication()
+        }
+    }
+    private func commitSuccessor(in folder: URL, names: [String: String]) async throws -> MeetingMetadata {
+        try await TranscriptPersistenceStore.shared.start(in: folder) { context in
+            var metadata = try context.readMetadata()
+            metadata.speakerNames.merge(names) { _, latest in latest }
+            metadata.status = .completed
+            try MeetingCatalogOwner.commit(metadata, context: context)
+            return metadata
+        }.value()
+    }
     private func fixture() throws -> URL {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -164,8 +194,137 @@ final class MeetingMetadataEditsTests: XCTestCase {
         }.value()
         XCTAssertEqual(finalized.speakerNames["source-A"], "Reviewed A")
         XCTAssertEqual(finalized.speakerNames["source-B"], "Reviewed B")
-        edits.completeRetirement(in: folder)
+        edits.completeRetirement(in: folder, successorSucceeded: true)
         try await idle(edits, folder: folder)
+    }
+
+    func testSuccessfulSuccessorSuppressesReversedNameCallbacksAndLateDeadline() async throws {
+        for originalFails in [false, true] {
+            for terminalFirst in [false, true] {
+                let folder = try fixture(), gate = Gate(), mailbox = PublicationMailbox()
+                var events: [MeetingMetadataEdits.Event] = []
+                let edits = MeetingMetadataEdits(store: TranscriptPersistenceStore {
+                    if $0 == .stage("meeting.json") {
+                        gate.first()
+                        if originalFails { throw POSIXError(.ENOSPC) }
+                    }
+                }, timeoutSeconds: 0.01, deliver: mailbox.enqueue) { events.append($0) }
+                edits.submitNames(["source-A": "Older"], in: folder, contentGeneration: 1)
+                let entered = await gate.entered.wait(timeoutSeconds: 1)
+                XCTAssertEqual(entered, .completed)
+                edits.submitNames(["source-A": "Latest"], in: folder, contentGeneration: 1)
+                let accepted = edits.retire(in: folder)
+                let pending = await mailbox.first.wait(timeoutSeconds: 1)
+                XCTAssertEqual(pending, .completed)
+                XCTAssertThrowsError(try TranscriptPersistenceStore.shared.start(in: folder) { _ in 1 })
+                gate.release.signal()
+                let terminal = await mailbox.second.wait(timeoutSeconds: 1)
+                XCTAssertEqual(terminal, .completed)
+                let saved = try await commitSuccessor(in: folder, names: accepted)
+                let transferred = edits.completeRetirement(in: folder, successorSucceeded: true)
+                XCTAssertEqual(transferred.count, 1)
+                XCTAssertTrue(edits.isPending(in: folder), "Original callback still owns its UI slot")
+                if terminalFirst { mailbox.runLast(); mailbox.runFirst() }
+                else { mailbox.runFirst(); mailbox.runFirst() }
+                XCTAssertFalse(edits.isPending(in: folder))
+                XCTAssertTrue(events.isEmpty, "Neither old success/failure nor a delayed timeout may replace successor publication")
+                XCTAssertEqual(saved.speakerNames["source-A"], "Latest")
+                let disk = try await read(folder)
+                XCTAssertEqual(disk.speakerNames["source-A"], "Latest")
+                XCTAssertEqual(gate.visits, 1, "Retired queued names belong to the finalizer, not another edit")
+            }
+        }
+    }
+
+    func testSuccessfulSuccessorClearsOnlyItsTransferredNameNoticeID() async throws {
+        for newerRejectedNotice in [false, true] {
+            let folder = try fixture(), gate = Gate(), mailbox = PublicationMailbox()
+            var noticeID: UUID?
+            let edits = MeetingMetadataEdits(store: TranscriptPersistenceStore {
+                if $0 == .stage("meeting.json") { gate.first(); throw POSIXError(.ENOSPC) }
+            }, timeoutSeconds: 0.01, deliver: mailbox.enqueue) { event in
+                if case .failed(_, _, let id) = event { noticeID = id }
+            }
+            edits.submitNames(["source-A": "Accepted"], in: folder, contentGeneration: 1)
+            let pending = await mailbox.first.wait(timeoutSeconds: 1)
+            XCTAssertEqual(pending, .completed)
+            let accepted = edits.retire(in: folder)
+            gate.release.signal()
+            let terminal = await mailbox.second.wait(timeoutSeconds: 1)
+            XCTAssertEqual(terminal, .completed)
+            mailbox.runLast() // The original failure was already visible.
+            let originalID = try XCTUnwrap(noticeID)
+            if newerRejectedNotice {
+                edits.submitNames(["source-A": "Rejected after Stop"], in: folder, contentGeneration: 1)
+                XCTAssertNotEqual(noticeID, originalID)
+            }
+            _ = try await commitSuccessor(in: folder, names: accepted)
+            let clearable = edits.completeRetirement(in: folder, successorSucceeded: true)
+            XCTAssertTrue(clearable.contains(originalID))
+            XCTAssertEqual(clearable.contains(try XCTUnwrap(noticeID)), !newerRejectedNotice)
+            mailbox.runFirst() // A late deadline must not replace either notice.
+            XCTAssertFalse(edits.isPending(in: folder))
+        }
+    }
+
+    func testFailedSuccessorKeepsOriginalNameFailureAndPendingEvidence() async throws {
+        let folder = try fixture(), gate = Gate(), mailbox = PublicationMailbox()
+        var events: [String] = []
+        let edits = MeetingMetadataEdits(store: TranscriptPersistenceStore {
+            if $0 == .stage("meeting.json") { gate.first(); throw POSIXError(.ENOSPC) }
+        }, timeoutSeconds: 0.01, deliver: mailbox.enqueue) { event in
+            if case .pending = event { events.append("pending") }
+            if case .failed = event { events.append("failed") }
+        }
+        edits.submitNames(["source-A": "Unsaved"], in: folder, contentGeneration: 1)
+        let pending = await mailbox.first.wait(timeoutSeconds: 1)
+        XCTAssertEqual(pending, .completed)
+        _ = edits.retire(in: folder)
+        XCTAssertTrue(edits.completeRetirement(in: folder, successorSucceeded: false).isEmpty)
+        mailbox.runFirst()
+        XCTAssertTrue(edits.isPending(in: folder))
+        XCTAssertEqual(events, ["pending"])
+        gate.release.signal()
+        let terminal = await mailbox.second.wait(timeoutSeconds: 1)
+        XCTAssertEqual(terminal, .completed)
+        mailbox.runFirst()
+        XCTAssertEqual(events, ["pending", "failed"])
+        XCTAssertFalse(edits.isPending(in: folder))
+    }
+
+    func testSuccessfulNameSuccessorPreservesFailedTitleInBothCallbackOrders() async throws {
+        for titleFailureFirst in [false, true] {
+            let folder = try fixture(), gate = Gate(), mailbox = PublicationMailbox()
+            var failureIDs: [UUID] = []
+            let edits = MeetingMetadataEdits(store: TranscriptPersistenceStore {
+                if $0 == .stage("meeting.json") { gate.first(); throw POSIXError(.ENOSPC) }
+            }, timeoutSeconds: 0.01, deliver: mailbox.enqueue) { event in
+                if case .failed(_, _, let id) = event { failureIDs.append(id) }
+            }
+            let rename = Task { try await edits.rename(in: folder, to: "Failed title") }
+            let entered = await gate.entered.wait(timeoutSeconds: 1)
+            XCTAssertEqual(entered, .completed)
+            edits.submitNames(["source-A": "Transferred name"], in: folder, contentGeneration: 1)
+            let accepted = edits.retire(in: folder)
+            let pending = await mailbox.first.wait(timeoutSeconds: 1)
+            XCTAssertEqual(pending, .completed)
+            do { _ = try await rename.value; XCTFail("Expected original rename deadline") }
+            catch { guard case .timedOut = error as? TranscriptPersistenceStore.Failure else { return XCTFail("Wrong rename error") } }
+            gate.release.signal()
+            let terminal = await mailbox.second.wait(timeoutSeconds: 1)
+            XCTAssertEqual(terminal, .completed)
+            if titleFailureFirst { mailbox.runLast() }
+            let saved = try await commitSuccessor(in: folder, names: accepted)
+            let clearable = edits.completeRetirement(in: folder, successorSucceeded: true)
+            XCTAssertTrue(clearable.isEmpty, "Only names were transferred; title failure cannot be cleared")
+            if !titleFailureFirst { mailbox.runLast() }
+            mailbox.runFirst()
+            XCTAssertEqual(failureIDs.count, 1, "Title failure survives either order, with no late pending overwrite")
+            XCTAssertFalse(clearable.contains(try XCTUnwrap(failureIDs.first)))
+            XCTAssertEqual(saved.title, "Original")
+            XCTAssertEqual(saved.speakerNames["source-A"], "Transferred name")
+            XCTAssertFalse(edits.isPending(in: folder))
+        }
     }
 
     func testSourceScopedAssignmentsNeverMatchAnotherResumedSpeaker() {

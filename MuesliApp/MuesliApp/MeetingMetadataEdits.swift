@@ -27,10 +27,12 @@ nonisolated enum MeetingMetadataMutation {
 /// terminal callback, not a waiter deadline, releases this coordinator's owner.
 @MainActor
 final class MeetingMetadataEdits {
+    typealias Publication = @MainActor @Sendable () -> Void
+    typealias Delivery = @Sendable (@escaping Publication) -> Void
     enum Event {
         case committed(URL, MeetingMetadata, MeetingMetadataMutation.Patch)
-        case pending(URL)
-        case failed(URL, String)
+        case pending(URL, UUID)
+        case failed(URL, String, UUID)
     }
     private struct Active {
         let id: UUID
@@ -40,12 +42,17 @@ final class MeetingMetadataEdits {
     private let store: TranscriptPersistenceStore
     private let timeoutSeconds: Double
     private let onEvent: @MainActor (Event) -> Void
+    private let deliver: Delivery
     private var active: [URL: Active] = [:]
     private var desiredNames: [URL: MeetingMetadataMutation.Patch] = [:]
     private var retired: Set<URL> = []
+    private var transferredNameIDs: [URL: Set<UUID>] = [:]
+    private var superseded: Set<UUID> = []
     init(store: TranscriptPersistenceStore = .shared, timeoutSeconds: Double = 5,
+         deliver: @escaping Delivery = { publication in Task { @MainActor in publication() } },
          onEvent: @escaping @MainActor (Event) -> Void) {
         self.store = store; self.timeoutSeconds = timeoutSeconds; self.onEvent = onEvent
+        self.deliver = deliver
     }
     func isPending(in folder: URL) -> Bool { active[folder] != nil || retired.contains(folder) }
 
@@ -54,16 +61,33 @@ final class MeetingMetadataEdits {
     /// must queue behind that owner and apply this patch after reading metadata.
     func retire(in folder: URL) -> [String: String] {
         retired.insert(folder)
-        let current = active[folder]?.patch.names ?? [:]
+        let operation = active[folder]
+        if let operation, operation.patch.title == nil, !operation.patch.names.isEmpty {
+            transferredNameIDs[folder, default: []].insert(operation.id)
+        }
+        let current = operation?.patch.names ?? [:]
         let queued = desiredNames.removeValue(forKey: folder)?.names ?? [:]
         return current.merging(queued) { _, latest in latest }
     }
-    func completeRetirement(in folder: URL) { retired.remove(folder) }
+    /// A successful successor supersedes only the name operations whose intent
+    /// it received. Keep the active slot until its original callback arrives;
+    /// suppress both delayed pending and terminal publication from those IDs.
+    /// Returned IDs authorize clearing only those operations' own notices.
+    @discardableResult
+    func completeRetirement(in folder: URL, successorSucceeded: Bool) -> Set<UUID> {
+        retired.remove(folder)
+        let transferred = transferredNameIDs.removeValue(forKey: folder) ?? []
+        guard successorSucceeded else { return [] }
+        if let current = active[folder], transferred.contains(current.id) {
+            superseded.insert(current.id)
+        }
+        return transferred
+    }
 
     func submitNames(_ names: [String: String], in folder: URL, contentGeneration: UInt64) {
         guard !names.isEmpty else { return }
         guard !retired.contains(folder) else {
-            onEvent(.failed(folder, "This meeting is finishing its saved transcript. Wait for that save before editing speakers."))
+            onEvent(.failed(folder, "This meeting is finishing its saved transcript. Wait for that save before editing speakers.", UUID()))
             return
         }
         if active[folder] != nil {
@@ -75,7 +99,7 @@ final class MeetingMetadataEdits {
             desiredNames[folder] = patch
         } else {
             do { _ = try start(in: folder, patch: .init(names: names, contentGeneration: contentGeneration)) }
-            catch { onEvent(.failed(folder, error.localizedDescription)) }
+            catch { onEvent(.failed(folder, error.localizedDescription, UUID())) }
         }
     }
 
@@ -88,36 +112,46 @@ final class MeetingMetadataEdits {
     @discardableResult
     private func start(in folder: URL, patch: MeetingMetadataMutation.Patch) throws -> TranscriptPersistenceStore.Operation<MeetingMetadata> {
         let id = UUID()
-        let operation = try MeetingMetadataMutation.start(in: folder, patch: patch, store: store) { [weak self] result in
+        let operation = try MeetingMetadataMutation.start(in: folder, patch: patch, store: store) { [weak self, deliver] result in
             guard let self else { return }
-            Task { @MainActor in self.finish(id: id, folder: folder, result: result) }
+            deliver { self.finish(id: id, folder: folder, result: result) }
         }
         active[folder] = Active(id: id, patch: patch, operation: operation)
-        Task { @MainActor [weak self] in
+        Task { @MainActor [weak self, deliver] in
             let outcome = await operation.wait(timeoutSeconds: self?.timeoutSeconds ?? 5)
-            guard let self, self.active[folder]?.id == id else { return }
+            guard let self else { return }
             switch outcome {
-            case .timedOut, .cancelled: self.onEvent(.pending(folder))
+            case .timedOut, .cancelled:
+                deliver { self.publishPending(id: id, folder: folder) }
             case .completed, .failed: break // The original callback publishes once.
             }
         }
         return operation
     }
 
+    private func publishPending(id: UUID, folder: URL) {
+        guard active[folder]?.id == id, !superseded.contains(id) else { return }
+        onEvent(.pending(folder, id))
+    }
+
     private func finish(id: UUID, folder: URL,
                         result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>) {
         guard let current = active[folder], current.id == id else { return }
         active.removeValue(forKey: folder) // Retire before any late timeout UI task.
-        switch result {
-        case .success(let metadata): onEvent(.committed(folder, metadata, current.patch))
-        case .failure(let error): onEvent(.failed(folder, error.localizedDescription))
+        if superseded.remove(id) == nil {
+            switch result {
+            case .success(let metadata):
+                onEvent(.committed(folder, metadata, current.patch))
+            case .failure(let error):
+                onEvent(.failed(folder, error.localizedDescription, id))
+            }
         }
         if var next = desiredNames.removeValue(forKey: folder) {
             if case .failure = result, current.patch.contentGeneration == next.contentGeneration {
                 next.names = current.patch.names.merging(next.names) { _, newer in newer }
             }
             do { _ = try start(in: folder, patch: next) }
-            catch { onEvent(.failed(folder, error.localizedDescription)) }
+            catch { onEvent(.failed(folder, error.localizedDescription, UUID())) }
         }
     }
 }

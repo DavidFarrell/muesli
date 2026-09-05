@@ -340,6 +340,7 @@ final class AppModel: ObservableObject {
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
     @Published private var metadataEditNotices: [String: String] = [:]
+    private var metadataEditNoticeOwners: [String: UUID] = [:]
     @Published private var catalogNotice: String?
     private var pendingDeletes: [String: UUID] = [:]
     var metadataEditNotice: String? {
@@ -2901,16 +2902,19 @@ final class AppModel: ObservableObject {
     private func publishMeetingSave(_ result: Result<MeetingMetadata, TranscriptPersistenceStore.Failure>, folder: URL, id: UUID) {
         guard meetingSavePublication.markTerminal(folder: folder, id: id) else { return }
         meetingCatalog.invalidate()
-        metadataEdits.completeRetirement(in: folder)
         switch result {
         case .success:
+            let transferredIDs = metadataEdits.completeRetirement(in: folder, successorSucceeded: true)
             meetingSaveNotices[folder.path] = nil
-            metadataEditNotices[folder.path] = nil
+            if let noticeID = metadataEditNoticeOwners[folder.path], transferredIDs.contains(noticeID) {
+                setMetadataEditNotice(nil, for: folder)
+            }
             // The terminal result can wait behind a later edit's UI callback.
             // Read the current disk snapshot under ownership instead of putting
             // its older title/count/status snapshot back into history.
             loadMeetingHistory()
         case .failure(let error):
+            metadataEdits.completeRetirement(in: folder, successorSucceeded: false)
             meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
     }
@@ -3108,11 +3112,16 @@ final class AppModel: ObservableObject {
         metadataEdits.submitNames(names, in: folder, contentGeneration: transcriptModel.contentGeneration)
     }
 
+    private func setMetadataEditNotice(_ message: String?, for folder: URL, owner: UUID? = nil) {
+        metadataEditNotices[folder.path] = message
+        metadataEditNoticeOwners[folder.path] = message == nil ? nil : owner
+    }
+
     private func publishMetadataEdit(_ event: MeetingMetadataEdits.Event) {
         switch event {
         case .committed(let folder, let metadata, let patch):
             meetingCatalog.invalidate()
-            metadataEditNotices[folder.path] = nil
+            setMetadataEditNotice(nil, for: folder)
             // Only publish fields this operation edited. A late name/title
             // callback must not roll back newer finalization status or counts.
             if patch.title != nil {
@@ -3137,10 +3146,10 @@ final class AppModel: ObservableObject {
             else if case .viewing(let current) = activeScreen { visible = current.folderURL == folder }
             else { visible = false }
             if visible { transcriptModel.applyCommittedSpeakerNames(patch.names, expectedGeneration: patch.contentGeneration) }
-        case .pending(let folder):
-            metadataEditNotices[folder.path] = "Changes to \(folder.lastPathComponent) are still being saved. The original disk operation remains active."
-        case .failed(let folder, let message):
-            metadataEditNotices[folder.path] = "Changes to \(folder.lastPathComponent) were not saved: \(message)"
+        case .pending(let folder, let id):
+            setMetadataEditNotice("Changes to \(folder.lastPathComponent) are still being saved. The original disk operation remains active.", for: folder, owner: id)
+        case .failed(let folder, let message, let id):
+            setMetadataEditNotice("Changes to \(folder.lastPathComponent) were not saved: \(message)", for: folder, owner: id)
         }
     }
 
@@ -3398,7 +3407,7 @@ final class AppModel: ObservableObject {
         let folder = item.folderURL
         guard !isFinalizing, currentSession?.folderURL != folder,
               !metadataEdits.isPending(in: folder), pendingDeletes[folder.path] == nil else {
-            metadataEditNotices[folder.path] = "This meeting is still in use. Wait for recording and saving to finish before deleting it."
+            setMetadataEditNotice("This meeting is still in use. Wait for recording and saving to finish before deleting it.", for: folder)
             return
         }
         let id = UUID()
@@ -3413,11 +3422,11 @@ final class AppModel: ObservableObject {
                     self.meetingCatalog.invalidate()
                     switch result {
                     case .success:
-                        self.metadataEditNotices[folder.path] = nil
+                        self.setMetadataEditNotice(nil, for: folder)
                         self.meetingHistory.removeAll { $0.id == item.id }
                         if case .viewing(let current) = self.activeScreen, current.id == item.id { self.closeMeetingViewer() }
                     case .failure(let error):
-                        self.metadataEditNotices[folder.path] = "The meeting could not be moved to Trash: \(error.localizedDescription)"
+                        self.setMetadataEditNotice("The meeting could not be moved to Trash: \(error.localizedDescription)", for: folder)
                     }
                 }
             })
@@ -3427,12 +3436,12 @@ final class AppModel: ObservableObject {
                 guard let self, self.pendingDeletes[folder.path] == id else { return }
                 switch outcome {
                 case .timedOut, .cancelled:
-                    self.metadataEditNotices[folder.path] = "Moving the meeting to Trash is still pending. The original disk operation remains active."
+                    self.setMetadataEditNotice("Moving the meeting to Trash is still pending. The original disk operation remains active.", for: folder)
                 default: break
                 }
             }
         } catch {
-            metadataEditNotices[folder.path] = "The meeting could not be moved to Trash: \(error.localizedDescription)"
+            setMetadataEditNotice("The meeting could not be moved to Trash: \(error.localizedDescription)", for: folder)
         }
     }
 
