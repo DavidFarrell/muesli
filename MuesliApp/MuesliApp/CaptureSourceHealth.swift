@@ -76,6 +76,16 @@ nonisolated struct CaptureSourceHealth: Sendable {
         return true
     }
 
+    /// Fresh user intent resets retry allowance without retiring a still-valid
+    /// native generation (for example Follow -> Pin on the same device).
+    mutating func resetRecoveryBudget(now: Date = Date()) {
+        attempts = 0
+        if phase == .failed || phase == .recovering {
+            phase = .recovering
+            retryAt = now
+        }
+    }
+
     mutating func reset() { self = CaptureSourceHealth(maximumAttempts: maximumAttempts) }
 }
 
@@ -92,5 +102,22 @@ nonisolated struct AudioRefreshResult: Sendable {
         if system == .failed { parts.append("System audio unavailable") }
         if system == .unverified { parts.append("System audio has no verified samples yet") }
         return parts.joined(separator: ". ")
+    }
+}
+
+/// Desired source ownership is distinct from a native generation. Stop retires
+/// intent immediately, even if a framework call cannot finish yet.
+nonisolated struct CaptureRequestIntent: Sendable {
+    private(set) var revision = 0
+    private(set) var active = false
+    mutating func begin() -> Int { revision += 1; active = true; return revision }
+    mutating func retire() { revision += 1; active = false }
+    func matches(_ revision: Int) -> Bool { active && self.revision == revision }
+}
+
+nonisolated enum CapturePreviewPolicy {
+    static func wantsPreview(isCapturing: Bool, isStarting: Bool, isFinalizing: Bool,
+                             isStartScreenActive: Bool, onboarding: Bool) -> Bool {
+        !isCapturing && !isStarting && !isFinalizing && isStartScreenActive && !onboarding
     }
 }

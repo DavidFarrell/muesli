@@ -34,7 +34,10 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
                  operation: @escaping @Sendable () async throws -> Void,
                  cleanupIfAbandoned: @escaping @Sendable () async -> Void = {}) async throws {
         let state = Operation()
-        guard lock.withLock({ if active != nil { return false }; active = state; return true }) else { throw Failure.busy }
+        guard lock.withLock({ if active != nil { return false }; active = state; return true }) else {
+            onFailure(Failure.busy)
+            throw Failure.busy
+        }
         Task.detached(priority: .userInitiated) { [self] in
             let result: Result<Void, Error>
             do { try await operation(); result = .success(()) } catch {

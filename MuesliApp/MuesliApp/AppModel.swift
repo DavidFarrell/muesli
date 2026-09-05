@@ -148,8 +148,8 @@ final class AppModel: ObservableObject {
             UserDefaults.standard.set(aecMode.rawValue, forKey: aecModeKey)
             // A mode change is a fresh chance for VPIO; restart so it takes effect.
             micVoiceProcessingDowngraded = false
-            micHealth.reset()
-            previewMicHealth.reset()
+            micHealth.resetRecoveryBudget()
+            previewMicHealth.resetRecoveryBudget()
             if isCapturing {
                 enqueueMicLifecycle("aec-change") { await $0.restartMeetingMicEngineForInputSwitch() }
             } else if isStartScreenActive {
@@ -818,6 +818,12 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    private var wantsHomeLevelPreview: Bool {
+        CapturePreviewPolicy.wantsPreview(isCapturing: isCapturing, isStarting: isStartingMeeting,
+                                         isFinalizing: isFinalizing, isStartScreenActive: isStartScreenActive,
+                                         onboarding: shouldShowOnboarding)
+    }
+
     private func runPreviewLifecycleOperation(
         _ operation: @escaping @MainActor (AppModel) async -> Void
     ) async {
@@ -827,7 +833,10 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 while let operation = pendingPreviewOperation {
                     pendingPreviewOperation = nil
-                    await operation(self)
+                    // Meeting start/stop/navigation wins over a delayed start
+                    // notification that replaced a pending preview teardown.
+                    if wantsHomeLevelPreview { await operation(self) }
+                    else { await stopHomeLevelPreviewNow() }
                 }
                 previewLifecycleTask = nil
             }
@@ -1047,8 +1056,8 @@ final class AppModel: ObservableObject {
             // it the system default output so playback actually moves there.
             _ = AudioDeviceManager.setDefaultOutputDevice(id)
         }
-        micHealth.reset()
-        previewMicHealth.reset()
+        micHealth.resetRecoveryBudget()
+        previewMicHealth.resetRecoveryBudget()
         loadOutputDevices()
         // An output change is a fresh chance for VPIO; let the engine re-evaluate.
         if isCapturing {
@@ -1063,8 +1072,8 @@ final class AppModel: ObservableObject {
     /// Apply an input policy change: re-resolve + (if capturing) restart the
     /// meeting engine when the device actually differs, else refresh the preview.
     private func applyInputSelectionChange() {
-        micHealth.reset()
-        previewMicHealth.reset()
+        micHealth.resetRecoveryBudget()
+        previewMicHealth.resetRecoveryBudget()
         micVoiceProcessingDowngraded = false
         // A manual device pick is fresh user intent - same rationale as
         // Refresh. But requestMicRecovery's own fallback step calls
@@ -1108,8 +1117,8 @@ final class AppModel: ObservableObject {
             let audioFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
             do {
                 try await captureEngine.startCapture(contentFilter: audioFilter, writer: nil, recordTo: nil)
-                guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
-                    await captureEngine.stopCapture()
+                guard wantsHomeLevelPreview else {
+                    if captureEngine.isPreviewSource { _ = await captureEngine.stopCapture() }
                     isPreviewCaptureRunning = false
                     isPreviewingLevels = false
                     return
@@ -1124,6 +1133,7 @@ final class AppModel: ObservableObject {
             }
         }
 
+        guard wantsHomeLevelPreview else { await stopHomeLevelPreviewNow(); return }
         if previewMicEngine == nil, micOperationOwner.isBusy {
             previewMicHealth.fail("The previous microphone operation is still owned by macOS.", quarantined: true)
         }
@@ -1189,7 +1199,7 @@ final class AppModel: ObservableObject {
             throw error
         }
 
-        guard !isCapturing, !isStartingMeeting, isStartScreenActive else {
+        guard wantsHomeLevelPreview else {
             guard await stopNativeMicrophone(engine, ingress: previewMicAudioIngress, preview: true) else { return }
             await previewMicAudioIngress?.finish()
             lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
@@ -1231,7 +1241,7 @@ final class AppModel: ObservableObject {
         }
 
         if isCapturing {
-            // Never stop captureEngine here during a live meeting.
+            if captureEngine.isPreviewSource { _ = await captureEngine.stopCapture() }
             isPreviewCaptureRunning = false
             isPreviewingLevels = false
             return
@@ -1547,13 +1557,16 @@ final class AppModel: ObservableObject {
 
                 let recoverSystem = captureEngine.supervise()
                 if preview, captureEngine.health.phase == .healthy { isPreviewCaptureRunning = true }
-                if recoverSystem, !systemRecoveryPending {
+                if recoverSystem, !systemRecoveryPending, let requestToken = captureEngine.requestToken {
                     systemRecoveryPending = true
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         defer { systemRecoveryPending = false }
-                        let recovered = await captureEngine.restartCapture()
-                        if preview { isPreviewCaptureRunning = recovered }
+                        guard captureEngine.requestToken == requestToken else { return }
+                        _ = await captureEngine.restartCapture(expectedRequest: requestToken)
+                        if preview, !isCapturing, !isStartingMeeting, !isFinalizing, isStartScreenActive {
+                            isPreviewCaptureRunning = captureEngine.isPreviewSource && captureEngine.hasNativeSource
+                        }
                     }
                 }
 
@@ -1704,13 +1717,13 @@ final class AppModel: ObservableObject {
         }
         _ = captureEngine.supervise(allowRecovery: false)
         if preview {
-            previewMicHealth.reset()
+            previewMicHealth.resetRecoveryBudget()
             previewVoiceProcessingDowngraded = false
             captureEngine.resetRecoveryBudget()
             await refreshHomeLevelPreview()
         } else if isCapturing {
             if transcribeMic, micHealth.phase != .healthy {
-                micHealth.reset()
+                micHealth.resetRecoveryBudget()
                 micVoiceProcessingDowngraded = false
                 enqueueMicLifecycle("user-refresh-microphone") { await $0.restartMeetingMicEngineForInputSwitch() }
             }
@@ -1764,8 +1777,8 @@ final class AppModel: ObservableObject {
         let outputID = AudioDeviceManager.defaultOutputDeviceID()
         guard outputID != lastObservedOutputDeviceID else { return }
         lastObservedOutputDeviceID = outputID
-        micHealth.reset()
-        previewMicHealth.reset()
+        micHealth.resetRecoveryBudget()
+        previewMicHealth.resetRecoveryBudget()
         micVoiceProcessingDowngraded = false
         previewVoiceProcessingDowngraded = false
         if isCapturing, transcribeMic {
@@ -2035,8 +2048,8 @@ final class AppModel: ObservableObject {
         let configuration = "\(desiredID):\(pinned):\(desiredUsesCaptureSession)"
         if lastResolvedInputConfiguration != configuration {
             lastResolvedInputConfiguration = configuration
-            micHealth.reset()
-            previewMicHealth.reset()
+            micHealth.resetRecoveryBudget()
+            previewMicHealth.resetRecoveryBudget()
         }
 
         // Restart only when capturing and EITHER the device the engine SHOULD

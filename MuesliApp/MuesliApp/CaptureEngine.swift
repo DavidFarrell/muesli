@@ -98,6 +98,7 @@ final class CaptureEngine: NSObject {
     private var relay: SystemAudioCaptureRelay?
     private var forwarder: MicAudioForwarder?
     private var generation = 0
+    private var desiredIntent = CaptureRequestIntent()
     private let operationOwner = CaptureOperationOwner()
     private var retirementPending = false
     private var stopping = false
@@ -113,6 +114,8 @@ final class CaptureEngine: NSObject {
     }
     private var request: Request?
     var isPreviewSource: Bool { request != nil && request?.writer == nil }
+    var requestToken: Int? { desiredIntent.active ? desiredIntent.revision : nil }
+    var hasNativeSource: Bool { nativeSource != nil && !retirementPending && !stopping }
     private var recordingOutput: SCRecordingOutput?
     private var recordingDelegate: RecordingDelegate?
     private var retainedRecordingDelegates: [UUID: RecordingDelegate] = [:]
@@ -135,6 +138,7 @@ final class CaptureEngine: NSObject {
             writer?.reportFailure(stream: .system, message: "The requested system source could not start while a previous capture was still owned by macOS.")
             throw CaptureOperationOwner.Failure.busy
         }
+        let intent = desiredIntent.begin()
         if request?.timeline.epochMicroseconds != timeline.epochMicroseconds { health.reset() }
         request = Request(filter: contentFilter, writer: writer, recordingURL: url, timeline: timeline, outputEnabled: audioOutputEnabled)
         generation += 1
@@ -146,6 +150,10 @@ final class CaptureEngine: NSObject {
         let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, stream: .system)
         await forwarder.beginMeeting(epoch: timeline)
         await forwarder.beginGeneration(currentGeneration, writer: writer, outputEnabled: audioOutputEnabled)
+        guard desiredIntent.matches(intent) else {
+            await forwarder.stop()
+            throw CaptureOperationOwner.Failure.cancelled
+        }
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             guard let self, self.generation == currentGeneration else { return }
             guard !self.health.invalidated else { return }
@@ -162,6 +170,10 @@ final class CaptureEngine: NSObject {
                                           format: self.debugSystemFormat)
         }
         let reportProblem = await forwarder.captureFailureHandler()
+        guard desiredIntent.matches(intent) else {
+            await forwarder.stop()
+            throw CaptureOperationOwner.Failure.cancelled
+        }
         let relay = SystemAudioCaptureRelay(generation: currentGeneration, forwarder: forwarder, display: display,
             onRejected: { packet, reason in
                 writer?.reportLoss(stream: .system, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
@@ -214,7 +226,20 @@ final class CaptureEngine: NSObject {
             try await operationOwner.perform(onFailure: { error in
                 reportProblem(.unknown(generation: currentGeneration, message: "System audio start failed: \(error.localizedDescription)"))
             }, operation: { try await native.start() }, cleanupIfAbandoned: { try? await native.stop() })
+            guard desiredIntent.matches(intent) else { throw CaptureOperationOwner.Failure.cancelled }
         } catch {
+            if !desiredIntent.matches(intent) {
+                // A public Stop superseded this start. The same native owner
+                // must finish cleanup; an old continuation cannot restore intent.
+                if !native.isRetired, !operationOwner.isBusy {
+                    try? await operationOwner.perform { try await native.stop() }
+                }
+                if nativeSource === native {
+                    if native.isRetired { clearRetiredSource(); if request == nil { health.reset() } }
+                    else { retirementPending = true; health.fail("The stopped system source is awaiting macOS cleanup.", quarantined: true) }
+                }
+                throw error
+            }
             if !(error is CaptureOperationOwner.Failure) {
                 attemptedRecordingDelegate?.recordingSetupFailed(error)
                 reportProblem(.unknown(generation: currentGeneration, message: "System audio setup failed: \(error.localizedDescription)"))
@@ -237,16 +262,27 @@ final class CaptureEngine: NSObject {
 
     @discardableResult
     func stopCapture(preserveRequest: Bool = false) async -> Bool {
-        guard let native = nativeSource else { return !operationOwner.isBusy }
-        guard !operationOwner.isBusy else { return false }
-        stopping = true
         let writer = request?.writer
+        if !preserveRequest {
+            desiredIntent.retire()
+            request = nil
+        }
+        guard let native = nativeSource else {
+            if !operationOwner.isBusy, !preserveRequest { health.reset() }
+            return !operationOwner.isBusy
+        }
+        stopping = true
+        guard !operationOwner.isBusy else {
+            if !preserveRequest { writer?.reportFailure(stream: .system, message: "System capture retirement is waiting for an earlier native operation.") }
+            return false
+        }
         do {
             try await operationOwner.perform(onFailure: { error in
                 writer?.reportFailure(stream: .system, message: "System audio stop failed: \(error.localizedDescription)")
             }) { try await native.stop() }
             clearRetiredSource()
-            if !preserveRequest { request = nil; health.reset() }
+            if !preserveRequest { request = nil }
+            if request == nil { health.reset() }
             return true
         } catch {
             retirementPending = true
@@ -273,7 +309,8 @@ final class CaptureEngine: NSObject {
     func supervise(allowRecovery: Bool = true) -> Bool {
         if retirementPending, !operationOwner.isBusy, nativeSource?.isRetired == true {
             clearRetiredSource()
-            health.fail("The previous system capture operation has finished.")
+            if request == nil { health.reset() }
+            else { health.fail("The previous system capture operation has finished.") }
         }
         if let snapshot = relay?.snapshot() {
             if snapshot.conversionFailures > lastConversionFailures {
@@ -290,11 +327,14 @@ final class CaptureEngine: NSObject {
 
     func resetRecoveryBudget() {
         guard !operationOwner.isBusy else { return }
-        health.reset()
+        health.resetRecoveryBudget()
     }
 
-    func restartCapture() async -> Bool {
+    func restartCapture(expectedRequest: Int? = nil) async -> Bool {
+        if let expectedRequest, !desiredIntent.matches(expectedRequest) { return false }
         guard let request, !operationOwner.isBusy else { return false }
+        let intent = desiredIntent.revision
+        guard desiredIntent.matches(intent) else { return false }
         let recordingURL: URL?
         if request.recordingURL != nil {
             guard let nextURL = recoveryRecordingURLProvider?() else {
@@ -303,7 +343,7 @@ final class CaptureEngine: NSObject {
             }
             recordingURL = nextURL
         } else { recordingURL = nil }
-        guard await stopCapture(preserveRequest: true) else { return false }
+        guard await stopCapture(preserveRequest: true), desiredIntent.matches(intent) else { return false }
         do {
             try await startCapture(contentFilter: request.filter, writer: request.writer, recordTo: recordingURL,
                                    timeline: request.timeline, audioOutputEnabled: request.outputEnabled)

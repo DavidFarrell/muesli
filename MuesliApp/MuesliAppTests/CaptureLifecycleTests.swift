@@ -177,6 +177,82 @@ final class CaptureLifecycleTests: XCTestCase {
         await operation.value
     }
 
+    func testUnchangedDevicePolicyChangeKeepsActiveGenerationSupervised() {
+        let now = Date(timeIntervalSince1970: 100)
+        var health = CaptureSourceHealth()
+        health.begin(generation: 42, now: now)
+        XCTAssertTrue(health.progress(frames: 1, generation: 42, at: now))
+        for _ in ["Follow to Pin", "Pin to Follow", "unchanged output intent"] {
+            health.resetRecoveryBudget(now: now)
+            XCTAssertEqual(health.generation, 42)
+            XCTAssertEqual(health.phase, .healthy)
+        }
+        XCTAssertTrue(health.progress(frames: 2, generation: 42, at: now.addingTimeInterval(1)))
+        XCTAssertTrue(health.invalidate(generation: 42, now: now.addingTimeInterval(2)))
+        XCTAssertTrue(health.shouldRecover(now: now.addingTimeInterval(2), requireContinuousCallbacks: true))
+    }
+
+    @MainActor
+    func testStopRetiresDesiredRequestWhileRecoveryStillOwnsNativeStop() async {
+        var intent = CaptureRequestIntent()
+        let original = intent.begin()
+        let owner = CaptureOperationOwner()
+        let stopStarted = TaskCompletion()
+        let stopReturned = TaskCompletion()
+        var restarted = false
+        let recovery = Task { @MainActor in
+            try? await owner.perform {
+                stopStarted.markCompleted()
+                _ = await stopReturned.wait(timeoutSeconds: 10)
+            }
+            if intent.matches(original) { restarted = true }
+        }
+        let started = await stopStarted.wait(timeoutSeconds: 1)
+        XCTAssertEqual(started, .completed)
+        intent.retire()
+        XCTAssertTrue(owner.isBusy)
+        XCTAssertFalse(intent.matches(original))
+        stopReturned.markCompleted()
+        await recovery.value
+        XCTAssertFalse(restarted, "An old recovery continuation cannot restore stopped intent")
+        let next = intent.begin()
+        XCTAssertTrue(intent.matches(next))
+        XCTAssertFalse(intent.matches(original), "Starting preview cannot revive an old meeting recovery")
+    }
+
+    func testMeetingStartRetiresPreviewDespiteDelayedStartNotification() {
+        XCTAssertTrue(CapturePreviewPolicy.wantsPreview(isCapturing: false, isStarting: false,
+                                                       isFinalizing: false, isStartScreenActive: true, onboarding: false))
+        XCTAssertFalse(CapturePreviewPolicy.wantsPreview(isCapturing: false, isStarting: true,
+                                                        isFinalizing: false, isStartScreenActive: true, onboarding: false))
+        XCTAssertFalse(CapturePreviewPolicy.wantsPreview(isCapturing: false, isStarting: false,
+                                                        isFinalizing: true, isStartScreenActive: true, onboarding: false))
+    }
+
+    func testBusyOperationReportsRequestedSourceFailureWithoutTakingOwnership() async {
+        let owner = CaptureOperationOwner()
+        let entered = TaskCompletion()
+        let release = TaskCompletion()
+        let existing = Task {
+            try? await owner.perform {
+                entered.markCompleted()
+                _ = await release.wait(timeoutSeconds: 10)
+            }
+        }
+        let started = await entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(started, .completed)
+        let reported = TaskCompletion()
+        do {
+            try await owner.perform(onFailure: { _ in reported.markCompleted() }) { XCTFail("Competing native start") }
+            XCTFail("Expected busy")
+        } catch { }
+        let failure = await reported.wait(timeoutSeconds: 0.1)
+        XCTAssertEqual(failure, .completed)
+        XCTAssertTrue(owner.isBusy)
+        release.markCompleted()
+        await existing.value
+    }
+
     func testRefreshDoesNotTreatUnverifiedOrFailedSourceAsSuccess() {
         XCTAssertFalse(AudioRefreshResult(microphone: .healthy, system: .unverified).verified)
         XCTAssertFalse(AudioRefreshResult(microphone: .failed, system: .healthy).verified)
