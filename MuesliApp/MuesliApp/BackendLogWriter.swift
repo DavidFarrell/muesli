@@ -19,17 +19,22 @@ import Foundation
 nonisolated final class BackendLogWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "muesli.backend-log", qos: .utility)
     private var handle: FileHandle?
+    private var meetingAccess: MeetingFileAccess?
     private var ringBuffer: [String] = []
     private let ringBufferLimit: Int
+    private let beforeWrite: @Sendable () -> Void
 
-    init(ringBufferLimit: Int) {
+    init(ringBufferLimit: Int, beforeWrite: @escaping @Sendable () -> Void = {}) {
+        self.beforeWrite = beforeWrite
         self.ringBufferLimit = ringBufferLimit
     }
 
     /// Adopt a freshly-opened log file and clear the tail (new meeting).
-    func reset(handle: FileHandle?) {
+    func reset(handle: FileHandle?, access: MeetingFileAccess? = nil) {
         queue.async { [self] in
+            if self.handle !== handle { try? self.handle?.close() }
             self.handle = handle
+            meetingAccess = access
             ringBuffer.removeAll()
         }
     }
@@ -48,6 +53,7 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     private func appendOnQueue(_ line: String, toTail: Bool, handle target: FileHandle?) {
         dispatchPrecondition(condition: .onQueue(queue))
         if let data = (line + "\n").data(using: .utf8), let target {
+            beforeWrite()
             do {
                 try target.write(contentsOf: data)
             } catch {
@@ -85,10 +91,15 @@ nonisolated final class BackendLogWriter: @unchecked Sendable {
     /// never race an in-flight write to the same file (this is why close
     /// must go through the writer's queue rather than a bare
     /// `handle.close()` from MainActor).
-    func close() {
+    func close(handle target: FileHandle? = nil, onClosed: @escaping @Sendable () -> Void = {}) {
         queue.async { [self] in
-            try? handle?.close()
-            handle = nil
+            let closing = target ?? handle
+            try? closing?.close()
+            if target == nil || handle === target {
+                handle = nil
+                meetingAccess = nil
+            }
+            onClosed()
         }
     }
 

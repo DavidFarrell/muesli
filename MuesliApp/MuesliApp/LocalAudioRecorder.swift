@@ -117,6 +117,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     // Queue-owned fields.
     private var handles: [Source: FileHandle] = [:]
     private var sourceLease: FileHandle?
+    private var meetingAccess: MeetingFileAccess? // owned by queue
     private var positions: [Source: Int64] = [:]
     private var manifest: Manifest
     private var dirty = false
@@ -157,6 +158,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.commitIfNeeded() }
         self.timer = timer
         timer.resume()
+    }
+
+    func retainMeetingAccess(_ access: MeetingFileAccess) {
+        queue.async { [self] in meetingAccess = access }
     }
 
     deinit {
@@ -460,6 +465,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         lock.unlock()
         try? sourceLease?.close()
         sourceLease = nil
+        meetingAccess = nil
         closeCompletion.markCompleted()
     }
 

@@ -60,8 +60,11 @@ nonisolated private final class NativeSystemCapture: @unchecked Sendable {
     let relay: SystemAudioCaptureRelay
     private let lock = NSLock()
     private var retired = false
+    private var meetingAccess: MeetingFileAccess?
     var isRetired: Bool { lock.withLock { retired } }
-    init(stream: SCStream, relay: SystemAudioCaptureRelay) { self.stream = stream; self.relay = relay }
+    init(stream: SCStream, relay: SystemAudioCaptureRelay, meetingAccess: MeetingFileAccess?) {
+        self.stream = stream; self.relay = relay; self.meetingAccess = meetingAccess
+    }
     func start() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stream.startCapture { error in
@@ -87,6 +90,7 @@ nonisolated private final class NativeSystemCapture: @unchecked Sendable {
         try? stream.removeStreamOutput(relay, type: .screen)
         await relay.finish()
         lock.withLock { retired = true }
+        meetingAccess = nil
     }
 }
 
@@ -110,6 +114,7 @@ final class CaptureEngine: NSObject {
         let writer: FrameSending?
         let recordingURL: URL?
         let timeline: CaptureTimeline
+        let meetingAccess: MeetingFileAccess?
         var outputEnabled: Bool
     }
     private var request: Request?
@@ -133,14 +138,15 @@ final class CaptureEngine: NSObject {
     var onStreamStopped: ((Error) -> Void)?
 
     func startCapture(contentFilter: SCContentFilter, writer: FrameSending?, recordTo url: URL?,
-                      timeline: CaptureTimeline = CaptureTimeline(), audioOutputEnabled: Bool = false) async throws {
+                      timeline: CaptureTimeline = CaptureTimeline(), audioOutputEnabled: Bool = false,
+                      meetingAccess: MeetingFileAccess? = nil) async throws {
         guard !operationOwner.isBusy, stream == nil else {
             writer?.reportFailure(stream: .system, message: "The requested system source could not start while a previous capture was still owned by macOS.")
             throw CaptureOperationOwner.Failure.busy
         }
         let intent = desiredIntent.begin()
         if request?.timeline.epochMicroseconds != timeline.epochMicroseconds { health.reset() }
-        request = Request(filter: contentFilter, writer: writer, recordingURL: url, timeline: timeline, outputEnabled: audioOutputEnabled)
+        request = Request(filter: contentFilter, writer: writer, recordingURL: url, timeline: timeline, meetingAccess: meetingAccess, outputEnabled: audioOutputEnabled)
         generation += 1
         health.begin(generation: generation)
         lastConversionFailures = 0
@@ -201,7 +207,7 @@ final class CaptureEngine: NSObject {
         let stream = SCStream(filter: contentFilter, configuration: config, delegate: relay)
         self.stream = stream
         var attemptedRecordingDelegate: RecordingDelegate?
-        let native = NativeSystemCapture(stream: stream, relay: relay)
+        let native = NativeSystemCapture(stream: stream, relay: relay, meetingAccess: meetingAccess)
         nativeSource = native
         do {
             try stream.addStreamOutput(relay, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
@@ -352,7 +358,7 @@ final class CaptureEngine: NSObject {
         guard await stopCapture(preserveRequest: true), desiredIntent.matches(intent) else { return false }
         do {
             try await startCapture(contentFilter: request.filter, writer: request.writer, recordTo: recordingURL,
-                                   timeline: request.timeline, audioOutputEnabled: request.outputEnabled)
+                                   timeline: request.timeline, audioOutputEnabled: request.outputEnabled, meetingAccess: request.meetingAccess)
             return true
         } catch { return false }
     }

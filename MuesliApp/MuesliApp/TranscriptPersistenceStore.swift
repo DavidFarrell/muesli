@@ -51,12 +51,12 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     static let shared = TranscriptPersistenceStore()
     static let journalDirectoryName = ".transcript-transaction"
     private final class Registry: @unchecked Sendable {
-        private struct Pending: Sendable { let id: UUID; let work: @Sendable () -> Void }
+        private struct Pending: Sendable { let id: UUID; let work: @Sendable (MeetingFileAccess.Transaction?) -> Void }
         let lock = NSLock()
         var owners: [String: UUID] = [:]
         private var pending: [String: Pending] = [:]
         func admit(_ folder: URL, id: UUID, afterCurrent: Bool,
-                   work: @escaping @Sendable () -> Void) throws -> Bool {
+                   work: @escaping @Sendable (MeetingFileAccess.Transaction?) -> Void) throws -> Bool {
             try lock.withLock {
                 let key = folder.standardizedFileURL.path
                 if owners[key] != nil {
@@ -71,7 +71,7 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
                 return true
             }
         }
-        func release(_ folder: URL, id: UUID) {
+        func release(_ folder: URL, id: UUID, lease: MeetingFileAccess.Transaction?) {
             let next: Pending? = lock.withLock {
                 let key = folder.standardizedFileURL.path
                 guard owners[key] == id else { return nil }
@@ -82,7 +82,7 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
                 owners.removeValue(forKey: key)
                 return nil
             }
-            if let next { DispatchQueue.global(qos: .utility).async(execute: next.work) }
+            if let next { DispatchQueue.global(qos: .utility).async { next.work(lease) } }
         }
         func isBusy(_ folder: URL) -> Bool {
             lock.withLock { owners[folder.standardizedFileURL.path] != nil }
@@ -147,12 +147,20 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
     final class Context: Sendable {
         private let store: TranscriptPersistenceStore
         let folder: URL
-        fileprivate init(store: TranscriptPersistenceStore, folder: URL) {
+        let access: MeetingFileAccess
+        private let transaction: MeetingFileAccess.Transaction
+        fileprivate init(store: TranscriptPersistenceStore, folder: URL, transaction: MeetingFileAccess.Transaction) {
             self.store = store
             self.folder = folder
+            self.transaction = transaction
+            access = transaction.access
         }
-        func commit(files: [String: Data]) throws { try store.commitOwned(files: files, in: folder) }
+        func commit(files: [String: Data]) throws {
+            try access.validate()
+            try store.commitOwned(files: files, in: folder)
+        }
         func readData(named name: String) throws -> Data {
+            try access.validate()
             guard TranscriptPersistenceStore.allowed.contains(name) else { throw Failure.invalidFiles }
             return try Data(contentsOf: folder.appendingPathComponent(name))
         }
@@ -182,27 +190,37 @@ nonisolated final class TranscriptPersistenceStore: Sendable {
         try admit(in: folder, afterCurrent: true, onCompletion: onCompletion, operation: operation)
     }
 
-    private func admit<Output: Sendable>(in folder: URL, afterCurrent: Bool,
+    func startArchive<Output: Sendable>(in folder: URL,
+        onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void = { _ in },
+        operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
+        try admit(in: folder, afterCurrent: false, mode: .archive, onCompletion: onCompletion, operation: operation)
+    }
+
+    private func admit<Output: Sendable>(in folder: URL, afterCurrent: Bool, mode: MeetingFileAccess.Mode = .shared,
                                 onCompletion: @escaping @Sendable (Result<Output, Failure>) -> Void,
                                 operation: @escaping @Sendable (Context) throws -> Output) throws -> Operation<Output> {
         let id = UUID()
         let owner = Operation<Output>()
-        let work: @Sendable () -> Void = { [self] in
+        let work: @Sendable (MeetingFileAccess.Transaction?) -> Void = { [self] inherited in
+            var lease = inherited
             let result: Result<Output, Failure>
             do {
+                if lease == nil { lease = try MeetingFileAccess.acquire(in: folder, mode: mode).transaction() }
+                try lease!.access.validate()
                 try recoverOwned(in: folder)
-                result = .success(try operation(Context(store: self, folder: folder)))
+                result = .success(try operation(Context(store: self, folder: folder, transaction: lease!)))
             } catch let error as Failure {
                 result = .failure(error)
             } catch {
                 result = .failure(.operationFailed(error.localizedDescription))
             }
-            Self.registry.release(folder, id: id)
+            Self.registry.release(folder, id: id, lease: lease)
+            lease = nil // Real close precedes terminal publication; a successor retains the same lease.
             owner.finish(result)
             onCompletion(result)
         }
         if try Self.registry.admit(folder, id: id, afterCurrent: afterCurrent, work: work) {
-            DispatchQueue.global(qos: .utility).async(execute: work)
+            DispatchQueue.global(qos: .utility).async { work(nil) }
         }
         return owner
     }

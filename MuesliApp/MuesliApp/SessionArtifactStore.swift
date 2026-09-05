@@ -51,6 +51,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
     private let pngWriter: PNGWriter
     private var ledger: FileHandle?
     private var ownerLease: FileHandle?
+    private var meetingAccess: MeetingFileAccess?
     private var ledgerFailed = false
     private var closing = false
     private var closed = false
@@ -73,10 +74,11 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
 
     /// Creates a fresh directory; call away from the UI executor.
     init(meetingDirectory: URL, sourceSessionID: String, timeline: CaptureTimeline,
-         timelineOffsetUs: Int64, pngWriter: @escaping PNGWriter = SessionArtifactStore.writePNG) throws {
+         timelineOffsetUs: Int64, meetingAccess: MeetingFileAccess? = nil, pngWriter: @escaping PNGWriter = SessionArtifactStore.writePNG) throws {
         guard UUID(uuidString: sourceSessionID) != nil, timelineOffsetUs >= 0 else {
             throw Self.error("Invalid artifact session identity or offset")
         }
+        self.meetingAccess = meetingAccess
         self.sourceSessionID = sourceSessionID
         self.timeline = timeline
         self.timelineOffsetUs = timelineOffsetUs
@@ -293,6 +295,7 @@ nonisolated final class SessionArtifactStore: @unchecked Sendable {
         // A deadline never reaches here while those owners remain outstanding.
         do { try ownerLease?.close(); ownerLease = nil }
         catch { recordError(error) } // Retain a failed close's handle through deinit.
+        meetingAccess = nil
         completion.markCompleted()
     }
 

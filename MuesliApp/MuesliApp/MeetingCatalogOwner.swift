@@ -156,7 +156,7 @@ nonisolated final class MeetingCatalogOwner: @unchecked Sendable {
                           var destination: NSURL?
                           try FileManager.default.trashItem(at: folder, resultingItemURL: &destination)
                       }) throws -> TranscriptPersistenceStore.Operation<Void> {
-        try store.start(in: folder, onCompletion: onCompletion) { context in
+        try store.startArchive(in: folder, onCompletion: onCompletion) { context in
             let inferenceLease = try BackendMeetingLease.acquire(in: folder, exclusive: true)
             defer { try? inferenceLease.close() }
             let metadata = try context.readMetadata()

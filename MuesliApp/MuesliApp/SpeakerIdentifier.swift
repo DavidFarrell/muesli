@@ -93,12 +93,15 @@ actor SpeakerIdentifier {
 
     func identifySpeakers(
         screenshots: [URL],
+        access: MeetingFileAccess,
         transcript: String,
         speakerIds: [String],
         existingSpeakerNames: [String: String] = [:],
         userHint: String? = nil,
         progressHandler: ((Progress) -> Void)? = nil
     ) async throws -> IdentificationResult {
+        defer { withExtendedLifetime(access) {} }
+        try access.validate()
         // DEBUG: Log inputs
         print("[SpeakerID DEBUG] === Starting speaker identification ===")
         print("[SpeakerID DEBUG] Screenshots count: \(screenshots.count)")

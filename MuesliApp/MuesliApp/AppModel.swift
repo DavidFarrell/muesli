@@ -267,6 +267,7 @@ final class AppModel: ObservableObject {
     private var backend: BackendProcess?
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
+    private var currentMeetingAccess: MeetingFileAccess?
     private let meetingStartPreparation = MeetingStartPreparationOwner()
     private var sourceTimeline: CaptureTimeline?
     private var sessionArtifactStore: SessionArtifactStore?
@@ -567,9 +568,7 @@ final class AppModel: ObservableObject {
     }
 
     private func closeHandle(_ handle: FileHandle?) {
-        if let handle {
-            try? handle.close()
-        }
+        if let handle { backendLogWriter.close(handle: handle) }
     }
 
     /// The actual file write + ring-buffer append happen on
@@ -814,6 +813,7 @@ final class AppModel: ObservableObject {
     private func startNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress,
                                       generation: Int, voiceProcessing: Bool, resolvedID: UInt32,
                                       pinned: Bool, preview: Bool) async throws {
+        let access = preview ? nil : currentMeetingAccess
         let problem = ingress.problemCallback()
         let invalidation = CaptureInvalidationMailbox(onInvalidated: {
             problem(.unknown(generation: generation, message: "The native microphone configuration was invalidated."))
@@ -824,11 +824,13 @@ final class AppModel: ObservableObject {
         try await micOperationOwner.perform(onFailure: { error in
             problem(.unknown(generation: generation, message: "Microphone start failed: \(error.localizedDescription)"))
         }, operation: {
+            defer { withExtendedLifetime(access) {} }
             try await engine.start(generation: generation, enableVoiceProcessing: voiceProcessing,
                                    preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
                                    pinned: pinned, onConfigurationChange: changed,
                                    onCaptureProblem: ingress.problemCallback(), onAudioData: ingress.callback())
         }, cleanupIfAbandoned: {
+            defer { withExtendedLifetime(access) {} }
             await engine.stop()
             await ingress.finish()
         })
@@ -836,12 +838,14 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     private func stopNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress?, preview: Bool) async -> Bool {
+        let access = preview ? nil : currentMeetingAccess
         let generation = preview ? previewMicGeneration : micEngineGeneration
         let problem = ingress?.problemCallback()
         do {
             try await micOperationOwner.perform(onFailure: { error in
                 problem?(.unknown(generation: generation, message: "Microphone stop failed: \(error.localizedDescription)"))
             }) {
+                defer { withExtendedLifetime(access) {} }
                 await engine.stop()
                 await ingress?.finish()
             }
@@ -2202,12 +2206,13 @@ final class AppModel: ObservableObject {
         meetingCatalog.protect(folderURL)
         currentSession = session
         sourceRecorder = recorder
+        currentMeetingAccess = prepared.access
         sessionArtifactStore = prepared.artifacts
         sourceTimeline = captureTimeline
         inferenceFailure = nil
         backendLogURL = prepared.logURL
         backendLogHandle = prepared.logHandle
-        backendLogWriter.reset(handle: prepared.logHandle)
+        backendLogWriter.reset(handle: prepared.logHandle, access: prepared.access)
         transcriptEventsURL = prepared.eventsURL
         currentTranscriptEventsStartOffset = 0
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
@@ -2256,7 +2261,7 @@ final class AppModel: ObservableObject {
                 writer: recorder,
                 recordTo: recordURL,
                 timeline: captureTimeline,
-                audioOutputEnabled: true
+                audioOutputEnabled: true, meetingAccess: prepared.access
             )
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
 
@@ -2445,6 +2450,8 @@ final class AppModel: ObservableObject {
         wasResume: Bool,
         priorMetadata: MeetingMetadata?
     ) async {
+        let stoppingAccess = currentMeetingAccess
+        defer { currentMeetingAccess = nil; withExtendedLifetime(stoppingAccess) {} }
         let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
@@ -2514,11 +2521,11 @@ final class AppModel: ObservableObject {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
             await finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
-                                    artifactResult: artifactResult, incomplete: true)
+                                    artifactResult: artifactResult, incomplete: true, access: stoppingAccess)
         } else {
             // Preserve the prepared session index even if no recorder reached
             // this defensive path. The owned finalizer reports missing sources.
-            await finalizeMeetingMetadata(for: session, finalizedSegments: [], incomplete: true)
+            await finalizeMeetingMetadata(for: session, finalizedSegments: [], incomplete: true, access: stoppingAccess)
         }
 
         clearAttachments()
@@ -2527,6 +2534,7 @@ final class AppModel: ObservableObject {
 
     func stopMeeting() async {
         guard isCapturing, !isFinalizing else { return }
+        let stoppingAccess = currentMeetingAccess
 
         isFinalizing = true
         // Retire edit admission before any suspension. The retained finalizer
@@ -2622,6 +2630,7 @@ final class AppModel: ObservableObject {
         clearAttachments()
 
         isCapturing = false
+        currentMeetingAccess = nil
         currentSession = nil
         activeScreen = .start
 
@@ -2647,7 +2656,8 @@ final class AppModel: ObservableObject {
                 writer: stoppingWriter,
                 sourceManifest: sourceResult,
                 artifactResult: artifactResult,
-                inferenceFailed: stoppingInferenceFailed
+                inferenceFailed: stoppingInferenceFailed,
+                access: stoppingAccess
             )
         }
     }
@@ -2666,13 +2676,15 @@ final class AppModel: ObservableObject {
         writer: FramedWriter? = nil,
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
         artifactResult: SessionArtifactFinishResult? = nil,
-        inferenceFailed: Bool = false
+        inferenceFailed: Bool = false,
+        access: MeetingFileAccess? = nil
     ) async {
+        defer { withExtendedLifetime(access) {} }
         defer {
             // Ordered after any writes still queued on the writer's own
             // serial queue - see BackendLogWriter.close's doc comment for
             // why this must not be a bare `handle.close()` here.
-            backendLogWriter.close()
+            backendLogWriter.close(handle: backendLogHandle)
             isFinalizing = false
             // The home-level preview was blocked from (re)starting while
             // isFinalizing (see startHomeLevelPreviewNow's guard, item 4) -
@@ -2755,7 +2767,8 @@ final class AppModel: ObservableObject {
                 onCompletion: { [weak self] result in
                     Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
-                try TranscriptReplacement.commitStoppedMeeting(context: context,
+                defer { withExtendedLifetime(access) {} }
+                return try TranscriptReplacement.commitStoppedMeeting(context: context,
                     timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
                     speakerNames: speakerNamesSnapshot, journalURL: transcriptEventsURL,
                     journalStatus: journalStatus, sourceManifest: sourceManifest,
@@ -2944,14 +2957,17 @@ final class AppModel: ObservableObject {
         finalizedSegments: [TranscriptSegment],
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
         artifactResult: SessionArtifactFinishResult? = nil,
-        incomplete: Bool = false
+        incomplete: Bool = false,
+        access: MeetingFileAccess? = nil
     ) async {
+        defer { withExtendedLifetime(access) {} }
         let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
             let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
                     Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
+                defer { withExtendedLifetime(access) {} }
                 let prior = try context.readMetadata()
                 let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
                 let metadata = prior.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,

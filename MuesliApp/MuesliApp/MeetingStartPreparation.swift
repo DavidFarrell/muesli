@@ -23,6 +23,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
 
     struct Prepared: Sendable {
         let title: String
+        let access: MeetingFileAccess
         let folderURL: URL
         let audioDirectory: URL
         let startedAt: Date
@@ -186,6 +187,7 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
             try attempt.check()
             let source = try createRecorder(audio, sourceID, Int64(offset * 1_000_000))
             recorder = source
+            source.retainMeetingAccess(context.access)
             var updated = prior ?? MeetingMetadata(version: 1, title: title, createdAt: startedAt,
                 updatedAt: startedAt, durationSeconds: 0, lastTimestamp: 0, status: .recording,
                 sessions: [], segmentCount: 0, speakerNames: [:])
@@ -213,14 +215,14 @@ nonisolated final class MeetingStartPreparationOwner: @unchecked Sendable {
             let timeline = CaptureTimeline()
             if request.video {
                 artifacts = try SessionArtifactStore(meetingDirectory: folder, sourceSessionID: sourceID,
-                    timeline: timeline, timelineOffsetUs: Int64(offset * 1_000_000))
+                    timeline: timeline, timelineOffsetUs: Int64(offset * 1_000_000), meetingAccess: context.access)
                 updated.sessions[updated.sessions.count - 1].artifactsFolder = artifacts?.relativeDirectory
                 metadata = updated
                 try commit(updated, context: context)
             }
             try checkpoint(.beforeHandoff)
             try attempt.check()
-            let prepared = Prepared(title: title, folderURL: folder, audioDirectory: audio,
+            let prepared = Prepared(title: title, access: context.access, folderURL: folder, audioDirectory: audio,
                 startedAt: startedAt, priorMetadata: prior, timestampOffset: offset, sourceID: sourceID,
                 recorder: source, artifacts: artifacts, timeline: timeline, logURL: logURL,
                 logHandle: handle, eventsURL: eventsURL, transcriptData: transcript, attachmentsData: attachments)

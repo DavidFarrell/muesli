@@ -235,12 +235,16 @@ final class BackendAdmissionTests: XCTestCase {
         let alias = folder.deletingLastPathComponent().appendingPathComponent("backend-alias-" + UUID().uuidString)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: folder)
         defer { try? FileManager.default.removeItem(at: alias) }
-        let deletion = try MeetingCatalogOwner.trash(in: alias, onCompletion: { _ in }, move: { _ in
+        let deletion = try MeetingCatalogOwner.trash(in: folder, onCompletion: { _ in }, move: { _ in
             XCTFail("The retained native launch must prevent moving its original source path")
         })
         if case .failed(let error) = await deletion.wait(timeoutSeconds: 2) {
-            XCTAssertTrue(error.localizedDescription.contains("still owns"))
+            XCTAssertTrue(error.localizedDescription.contains("still in use"))
         } else { XCTFail("Stop completion cannot release backend deletion protection") }
+        let aliasDeletion = try MeetingCatalogOwner.trash(in: alias, onCompletion: { _ in }, move: { _ in
+            XCTFail("A symlink cannot bypass meeting ownership")
+        })
+        guard case .failed = await aliasDeletion.wait(timeoutSeconds: 2) else { return XCTFail("alias admission") }
         probe.release.signal()
         let closed = await attempt.waitUntilClosed(timeoutSeconds: 3)
         XCTAssertEqual(closed, .completed)

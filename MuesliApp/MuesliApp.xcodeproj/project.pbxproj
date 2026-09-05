@@ -51,6 +51,7 @@
 				TranscriptEventJournal.swift,
 				MeetingData.swift,
 				MeetingFileAccess.swift,
+				MeetingScreenshotInput.swift,
 				MeetingStartPreparation.swift,
 				MeetingRenamer.swift,
 				MeetingCatalogOwner.swift,

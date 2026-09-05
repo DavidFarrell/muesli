@@ -465,15 +465,20 @@ struct MeetingViewer: View {
 
         let transcript = transcriptForIdentification()
         let speakerIds = speakerIdsForIdentification()
-        let screenshots = loadScreenshots(for: meeting)
 
         identificationTask = Task {
             do {
                 try Task.checkCancellation()
+                let inputOwner = try TranscriptPersistenceStore.shared.start(in: meeting.folderURL) { context in
+                    try MeetingScreenshotInput.snapshot(context: context)
+                }
+                let input = try await inputOwner.value(timeoutSeconds: 5)
+                try Task.checkCancellation()
                 let identifier = SpeakerIdentifier()
                 let hint = speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines)
                 let result = try await identifier.identifySpeakers(
-                    screenshots: screenshots,
+                    screenshots: input.urls,
+                    access: input.access,
                     transcript: transcript,
                     speakerIds: speakerIds,
                     existingSpeakerNames: self.transcript.speakerNames,
@@ -513,20 +518,6 @@ struct MeetingViewer: View {
     private func cancelSpeakerIdentification() {
         identificationTask?.cancel()
         identificationTask = nil
-    }
-
-    private func loadScreenshots(for meeting: MeetingHistoryItem) -> [URL] {
-        let folder = meeting.folderURL.appendingPathComponent("screenshots", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: folder,
-            includingPropertiesForKeys: nil
-        )) ?? []
-        let imageURLs = urls.filter { url in
-            let ext = url.pathExtension.lowercased()
-            return ext == "png" || ext == "jpg" || ext == "jpeg"
-        }
-        return imageURLs.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     private func speakerIdsForIdentification() -> [String] {
