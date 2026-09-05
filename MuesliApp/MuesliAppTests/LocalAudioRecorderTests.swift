@@ -9,6 +9,11 @@ final class LocalAudioRecorderTests: XCTestCase {
         return url
     }
 
+    private func finish(_ recorder: LocalAudioRecorder) async throws -> LocalAudioRecorder.Manifest {
+        let result = await recorder.finish(timeoutSeconds: 5)
+        return try XCTUnwrap(result)
+    }
+
     private func samples(_ count: Int, value: Int16 = 9) -> Data {
         var sample = value.littleEndian
         let frame = withUnsafeBytes(of: &sample) { Data($0) }
@@ -23,7 +28,7 @@ final class LocalAudioRecorderTests: XCTestCase {
             XCTAssertTrue(recorder.record(source: .mic, ptsUs: Int64(i * 100_000), payload: data))
             XCTAssertTrue(recorder.record(source: .system, ptsUs: Int64(i * 100_000), payload: data))
         }
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertTrue(result.completed)
         for source in ["mic", "system"] {
             XCTAssertEqual(result.streams[source]?.committed_bytes, 9600)
@@ -69,7 +74,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         }
         XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
         await ingress.finish()
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertTrue(result.completed)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 64_000)
         XCTAssertEqual(result.streams["system"]?.committed_bytes, 64_000)
@@ -82,8 +87,8 @@ final class LocalAudioRecorderTests: XCTestCase {
         for i in 0..<200 {
             XCTAssertTrue(recorder.record(source: .mic, ptsUs: Int64(i * 1000), payload: samples(16)))
         }
-        let one = await recorder.finish()
-        let two = await recorder.finish()
+        let one = try await finish(recorder)
+        let two = try await finish(recorder)
         XCTAssertEqual(one.streams["mic"]?.committed_bytes, 6400)
         XCTAssertEqual(one.revision, two.revision)
         XCTAssertFalse(recorder.record(source: .mic, ptsUs: 200_000, payload: samples(16)))
@@ -94,7 +99,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         recorder.record(source: .mic, ptsUs: 0, payload: samples(1600))
         recorder.record(source: .mic, ptsUs: 200_000, payload: samples(1600))
         recorder.record(source: .mic, ptsUs: 250_000, payload: samples(1600))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertEqual(result.streams["mic"]?.gap_frames, 1600)
         XCTAssertEqual(result.streams["mic"]?.overlap_frames, 800)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 11_200)
@@ -105,7 +110,7 @@ final class LocalAudioRecorderTests: XCTestCase {
     func testOversizedPacketIsRejectedAndPersistedAsLoss() async throws {
         let recorder = try LocalAudioRecorder(directory: folder(), maxPendingBytes: 32)
         XCTAssertFalse(recorder.record(source: .mic, ptsUs: 0, payload: samples(17)))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertEqual(result.streams["mic"]?.dropped_frames, 17)
         XCTAssertFalse(result.completed)
         XCTAssertEqual(result.losses.first?.reason, "ingress_overflow")
@@ -115,7 +120,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         let recorder = try LocalAudioRecorder(directory: folder())
         XCTAssertFalse(recorder.record(source: .system, ptsUs: Int64.max, payload: samples(16)))
         XCTAssertFalse(recorder.record(source: .system, ptsUs: -1, payload: samples(16)))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertEqual(result.streams["system"]?.committed_bytes, 0)
         XCTAssertEqual(result.streams["system"]?.dropped_frames, 32)
     }
@@ -125,7 +130,7 @@ final class LocalAudioRecorderTests: XCTestCase {
             if case .write(.mic) = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: 28) }
         })
         recorder.record(source: .mic, ptsUs: 0, payload: samples(1600))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 0)
         XCTAssertEqual(result.streams["mic"]?.dropped_frames, 1600)
         XCTAssertFalse(result.completed)
@@ -139,7 +144,7 @@ final class LocalAudioRecorderTests: XCTestCase {
             if case .manifest = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: 28) }
         })
         recorder.record(source: .system, ptsUs: 0, payload: samples(1600))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertFalse(result.completed)
         XCTAssertEqual(try LocalAudioRecorder.readManifest(directory: url).streams["system"]?.committed_bytes, 0)
         XCTAssertEqual(recorder.status().committedBytes, 0)
@@ -153,11 +158,34 @@ final class LocalAudioRecorderTests: XCTestCase {
             if case .sync(.mic) = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: 28) }
         })
         recorder.record(source: .mic, ptsUs: 0, payload: samples(160))
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertFalse(result.completed)
         XCTAssertNotNil(result.last_problem)
         XCTAssertGreaterThan(result.problem_count, 0)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 0)
+    }
+
+    func testBlockedDiskCloseExpiresWithoutClosingAnotherOwnersHandle() async throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let recorder = try LocalAudioRecorder(directory: folder(), beforeIO: { checkpoint in
+            if case .sync(.mic) = checkpoint {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 3)
+            }
+        })
+        recorder.record(source: .mic, ptsUs: 0, payload: samples(160))
+        let result = await recorder.finish(timeoutSeconds: 0.05)
+        XCTAssertNil(result)
+        XCTAssertFalse(recorder.status().accepting)
+        XCTAssertNotNil(recorder.status().error)
+        XCTAssertEqual(recorder.status().committedBytes, 0)
+        XCTAssertEqual(recorder.status().uncommittedPackets, 1)
+        release.signal()
+        release.signal()
+        let later = await recorder.finish(timeoutSeconds: 5)
+        XCTAssertNotNil(later)
+        XCTAssertFalse(later?.completed ?? true, "The failed close deadline remains part of the outcome")
     }
 
     func testWAVFailurePreservesPCMAndMarksCompatibilityIncomplete() async throws {
@@ -167,7 +195,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         })
         let data = samples(1600)
         recorder.record(source: .mic, ptsUs: 0, payload: data)
-        let result = await recorder.finish()
+        let result = try await finish(recorder)
         XCTAssertFalse(result.completed)
         XCTAssertEqual(result.streams["mic"]?.committed_bytes, 3200)
         XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("mic.pcm")), data)
@@ -182,7 +210,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         let recorder = try LocalAudioRecorder(directory: url)
         let data = samples(160)
         recorder.record(source: .mic, ptsUs: 0, payload: data)
-        _ = await recorder.finish()
+        _ = try await finish(recorder)
         let handle = try FileHandle(forWritingTo: url.appendingPathComponent("mic.pcm"))
         try handle.seekToEnd()
         try handle.write(contentsOf: samples(100, value: 77))
@@ -195,7 +223,7 @@ final class LocalAudioRecorderTests: XCTestCase {
         let url = try folder()
         let recorder = try LocalAudioRecorder(directory: url)
         recorder.record(source: .mic, ptsUs: 0, payload: samples(160))
-        _ = await recorder.finish()
+        _ = try await finish(recorder)
         XCTAssertThrowsError(try LocalAudioRecorder(directory: url))
         XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("mic.pcm")).count, 320)
     }

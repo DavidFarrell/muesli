@@ -53,6 +53,8 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let rejectedFrames: Int64
         let error: String?
         let secondsSinceCommit: TimeInterval
+        let uncommittedPackets: Int64
+        let secondsWithoutCommitProgress: TimeInterval
     }
 
     enum RecorderError: Error, LocalizedError {
@@ -96,6 +98,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     // adversarial producer of 2-byte buffers cannot queue millions of objects.
     private var pending: [Packet] = []
     private var pendingBytes = 0
+    private var acceptedPackets: Int64 = 0
+    private var committedPackets: Int64 = 0
+    private var workStartedAt = ProcessInfo.processInfo.systemUptime
     private var drainScheduled = false
     private var accepting = true
     private var closeRequested = false
@@ -106,13 +111,14 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var rejectedLosses: [Loss] = []
     private var omittedLosses: Int64 = 0
     private var closedManifest: Manifest?
-    private var closeWaiters: [CheckedContinuation<Manifest, Never>] = []
+    private let closeCompletion = TaskCompletion()
 
     // Queue-owned fields.
     private var handles: [Source: FileHandle] = [:]
     private var positions: [Source: Int64] = [:]
     private var manifest: Manifest
     private var dirty = false
+    private var processedPackets: Int64 = 0
     private var failedSources: [Source: String] = [:]
     private var timer: DispatchSourceTimer?
 
@@ -178,6 +184,8 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             lock.unlock()
             return false
         }
+        if acceptedPackets == committedPackets { workStartedAt = ProcessInfo.processInfo.systemUptime }
+        acceptedPackets += 1
         pending.append(Packet(source: source, ptsUs: ptsUs, payload: payload))
         pendingBytes += payload.count
         let schedule = !drainScheduled
@@ -214,29 +222,35 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     func status() -> Status {
         lock.lock()
         defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        let uncommitted = acceptedPackets - committedPackets
+        let stalledFor = uncommitted > 0 ? max(0, now - max(lastCommitUptime, workStartedAt)) : 0
         return Status(accepting: accepting, queuedBytes: pendingBytes,
                       committedBytes: committedBytes,
-                      rejectedFrames: rejectedFrames.values.reduce(0, +), error: latestError,
-                      secondsSinceCommit: max(0, ProcessInfo.processInfo.systemUptime - lastCommitUptime))
+                      rejectedFrames: rejectedFrames.values.reduce(0, +),
+                      error: latestError ?? (stalledFor > 5 ? "Source audio has not made commit progress for over five seconds." : nil),
+                      secondsSinceCommit: max(0, now - lastCommitUptime),
+                      uncommittedPackets: uncommitted, secondsWithoutCommitProgress: stalledFor)
     }
 
     /// Idempotent stop. Admission closes synchronously; all already accepted
     /// packets finish before final commit and compatibility WAV generation.
-    func finish() async -> Manifest {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if let result = closedManifest {
-                lock.unlock()
-                continuation.resume(returning: result)
-                return
-            }
-            closeWaiters.append(continuation)
+    /// Expiry leaves the file owner and queued close intact; it never grants
+    /// permission to close its handles from another queue or claim completion.
+    func finish(timeoutSeconds: Double = 10) async -> Manifest? {
+        let schedule = lock.withLock {
             accepting = false
             let schedule = !closeRequested
             closeRequested = true
-            lock.unlock()
-            if schedule { queue.async { [self] in closeOnQueue() } }
+            return schedule
         }
+        if schedule { queue.async { [self] in closeOnQueue() } }
+        let outcome = await closeCompletion.wait(timeoutSeconds: timeoutSeconds)
+        guard outcome == .completed else {
+            lock.withLock { latestError = "Source recording close did not complete; the committed prefix remains recoverable." }
+            return nil
+        }
+        return lock.withLock { closedManifest }
     }
 
     private func drain() {
@@ -265,6 +279,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
                 dirty = true
             }
             lock.lock()
+            processedPackets += 1
             pendingBytes -= packet.payload.count
             lock.unlock()
         }
@@ -337,6 +352,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             }
         }
         if let error, manifest.last_problem != error {
+            manifest.completed = false
             manifest.last_problem = error
             manifest.problem_count += 1
             dirty = true
@@ -358,6 +374,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             manifest = committed
             dirty = false
             lock.lock()
+            committedPackets = processedPackets
             committedBytes = committed.streams.values.reduce(0) { $0 + $1.committed_bytes }
             lastCommitUptime = ProcessInfo.processInfo.systemUptime
             lock.unlock()
@@ -407,14 +424,15 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         // durable clean close merely because the in-memory bool was set.
         if dirty { manifest.completed = false }
         closedManifest = manifest
-        let waiters = closeWaiters
-        closeWaiters.removeAll()
         lock.unlock()
-        for waiter in waiters { waiter.resume(returning: manifest) }
+        closeCompletion.markCompleted()
     }
 
     static func readManifest(directory: URL) throws -> Manifest {
-        let result = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: directory.appendingPathComponent(manifestName)))
+        let url = directory.appendingPathComponent(manifestName)
+        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size <= 1024 * 1024 else { throw RecorderError.invalidManifest }
+        let result = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
         guard result.schema_version == 1, !result.session_id.isEmpty,
               result.timeline_offset_us >= 0,
               result.streams.count == Source.allCases.count else { throw RecorderError.invalidManifest }
