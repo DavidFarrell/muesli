@@ -9,7 +9,9 @@ app forwards those bytes; it never resolves or regenerates the bookmark.
 The source-access service is sandboxed with only user-selected read-only access.
 The inference service is sandboxed with the separately qualified JIT and unsigned
 executable-memory exceptions. The main app and archive command have no sandbox or
-JIT exceptions. The decoder retains only sandbox inheritance. Runtime and model
+JIT exceptions. The hardened main app has the audio-input entitlement required
+for its microphone capture; the archive command has no entitlements. The decoder
+retains only sandbox inheritance. Runtime and model
 bytes are copied from the qualified package, checked against their full manifests
 and current Python source, and sealed by the enclosing development signature.
 Distribution signing, notarization and redistribution remain deferred.
@@ -99,3 +101,13 @@ Evidence is retained at `/private/tmp/muesli-final-app-tests-authorized.log`,
 `/private/tmp/muesli-app-final-corrections-astra-evidence.json`. These are source
 and generated-fixture results; signed assembly and user hardware validation are
 separate qualifications.
+
+Claude Fable 5.1 identified a packaging defect in the first signed candidate:
+hardening the main app without `com.apple.security.device.audio-input` prevents
+its microphone capture. The Release entitlement and both package verification
+checks now require exactly that audio-input entitlement for the main app. The
+inference, broker, decoder and archive entitlements are unchanged. Apple documents
+this resource permission at
+https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.device.audio-input.
+The previous package is a negative audit control; the corrected package must be
+rebuilt from its new clean source identity and audited before installation.

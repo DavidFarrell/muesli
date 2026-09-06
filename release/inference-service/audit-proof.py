@@ -23,6 +23,8 @@ expected_service = {'com.apple.security.app-sandbox': True, 'com.apple.security.
                     'com.apple.security.cs.allow-unsigned-executable-memory': True}
 expected_child = {'com.apple.security.app-sandbox': True, 'com.apple.security.inherit': True}
 expected_host = {'com.apple.security.app-sandbox': True, 'com.apple.security.files.user-selected.read-only': True} if args.picker_host else {}
+if args.application_host:
+    expected_host = {'com.apple.security.device.audio-input': True}
 host_executable = 'Contents/MacOS/MuesliApp' if args.application_host else 'Contents/MacOS/InferenceProof'
 broker_executable = 'Contents/XPCServices/paidiaconsulting.MuesliApp.SourceAccessService.xpc/Contents/MacOS/SourceAccessService'
 expected_broker = {'com.apple.security.app-sandbox': True, 'com.apple.security.files.user-selected.read-only': True}

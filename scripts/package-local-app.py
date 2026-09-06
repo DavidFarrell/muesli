@@ -197,7 +197,7 @@ def main():
          root / 'MuesliApp/MuesliApp/MuesliApp.entitlements', app])
     with (output / 'signed-app-audit.json').open('w') as report:
         run(['python3', src / 'audit-proof.py', app, '--team', args.team, '--application-host'], stdout=report)
-    signed_details(app, args.team, 'paidiaconsulting.MuesliApp', {})
+    signed_details(app, args.team, 'paidiaconsulting.MuesliApp', {'com.apple.security.device.audio-input': True})
     signed_details(broker, args.team, 'paidiaconsulting.MuesliApp.SourceAccessService', broker_entitlements)
     signed_details(service, args.team, 'paidiaconsulting.MuesliApp.InferenceService', service_entitlements)
     print(json.dumps({'app': str(app), 'source_commit': before['source_commit'], 'app_build_id': app_identity['build_id'],
