@@ -41,7 +41,29 @@ nonisolated enum ArchiveSourceEligibility {
         /// Verify on a retained file worker: the process exit must come from
         /// its actual native owner. This method never launches or deletes.
         func verifyProcessing(log: Data, observedExitCode: Int32) throws -> ArchiveProcessingEvidence.Verified {
-            let expected = try sessions.map { session in
+            let expected = try processingSessions()
+            try reader.validate()
+            let result = try ArchiveProcessingEvidence.validate(log: log, observedExitCode: observedExitCode, expected: expected,
+                recoveryInputHash: { [self] source, stream, frames in
+                    try recoveryWAVHash(sourceID: source, stream: stream, frames: frames)
+                })
+            try reader.validate()
+            return result
+        }
+        func verifyProcessing(log: Data, completion: BackendCompletionEvidence,
+                              sourceSnapshotSHA256: String) throws -> ArchiveProcessingEvidence.Verified {
+            let expected = try processingSessions()
+            try reader.validate()
+            let result = try ArchiveProcessingEvidence.validate(log: log, completion: completion,
+                sourceIdentity: inventory.access.identity, sourceSnapshotSHA256: sourceSnapshotSHA256, expected: expected,
+                recoveryInputHash: { [self] source, stream, frames in
+                    try recoveryWAVHash(sourceID: source, stream: stream, frames: frames)
+                })
+            try reader.validate()
+            return result
+        }
+        private func processingSessions() throws -> [ArchiveProcessingEvidence.Session] {
+            try sessions.map { session in
                 var streams: [String: ArchiveProcessingEvidence.Stream] = [:]
                 for name in ["mic", "system"] {
                     guard let pcm = session.streams[name], let model = session.modelInputs[name] else {
@@ -53,13 +75,6 @@ nonisolated enum ArchiveSourceEligibility {
                     offsetUs: session.timelineOffsetUs, manifestSHA256: session.manifest.sha256,
                     manifestRevision: session.manifestRevision, streams: streams)
             }
-            try reader.validate()
-            let result = try ArchiveProcessingEvidence.validate(log: log, observedExitCode: observedExitCode, expected: expected,
-                recoveryInputHash: { [self] source, stream, frames in
-                    try recoveryWAVHash(sourceID: source, stream: stream, frames: frames)
-                })
-            try reader.validate()
-            return result
         }
         /// Only indexed, source-scoped ledger observations can be read. The
         /// copier consumes these on its retained worker, before releasing EX.

@@ -7,6 +7,141 @@ import Foundation
 /// or stdout delivery depends on the UI actor.
 nonisolated enum BackendLaunchCheckpoint: Sendable { case beforeRun, afterRun }
 
+/// An in-memory native observation, never decoded from stdout or an archive
+/// receipt. Only the native owner in this file can construct this evidence.
+nonisolated struct BackendCompletionEvidence: Sendable {
+    enum OSTermination: Sendable, Equatable {
+        case exited(Int32)
+        case signalled(Int32)
+    }
+    enum Operation: String, Sendable { case preflight, live, reprocess }
+    enum Stream: String, Sendable { case mic, system, both }
+    struct ProcessIdentity: Sendable, Equatable {
+        let pid: Int32
+        let startSeconds: UInt64
+        let startMicroseconds: UInt64
+    }
+    /// Retained from the original native reservation/request, not supplied by
+    /// Python or copied from its terminal reply. The request digest binds the
+    /// typed lease, including both fixed lock identities, and configuration.
+    struct XPCBinding: Sendable, Equatable {
+        let jobID: UUID
+        let instanceID: UUID
+        let requestSHA256: String
+        let process: ProcessIdentity
+        let sourceIdentity: MeetingFileAccess.Identity
+        let sourceSnapshotSHA256: String?
+        let operation: Operation
+        let stream: Stream
+        let runtimeManifestSHA256: String
+        let modelSetSHA256: String
+    }
+    struct XPCReply: Sendable {
+        let jobID: UUID
+        let instanceID: UUID
+        let requestSHA256: String
+        let operationStatus: Int32
+    }
+    struct KernelExit: Sendable {
+        let process: ProcessIdentity
+        let rawWaitStatus: Int32
+        let observedExit: Bool
+        let observedExitStatus: Bool
+    }
+    struct XPCOutcome: Sendable, Equatable {
+        let operationStatus: Int32
+        let termination: OSTermination
+        let rawWaitStatus: Int32
+    }
+    struct Failure: Error, LocalizedError, Sendable {
+        let message: String
+        var errorDescription: String? { message }
+    }
+    private enum Observation: Sendable {
+        case process(OSTermination)
+        case xpc(XPCBinding, XPCOutcome)
+    }
+    private let observation: Observation
+
+    fileprivate init(legacyTermination: OSTermination) {
+        observation = .process(legacyTermination)
+    }
+    /// Reserved for the native XPC owner after its authenticated reply and
+    /// independently registered kernel observer have both completed.
+    fileprivate init(xpcBinding: XPCBinding, reply: XPCReply, kernel: KernelExit) throws {
+        observation = .xpc(xpcBinding, try Self.validateSuccessfulXPC(binding: xpcBinding, reply: reply, kernel: kernel))
+    }
+
+    var osTermination: OSTermination {
+        switch observation {
+        case .process(let termination): return termination
+        case .xpc(_, let outcome): return outcome.termination
+        }
+    }
+    var operationStatus: Int32 {
+        switch observation {
+        case .process(.exited(let code)): return code
+        // Match Foundation.Process.terminationStatus for legacy callers;
+        // osTermination retains that this value is a signal, not exit(code).
+        case .process(.signalled(let signal)): return signal
+        case .xpc(_, let outcome): return outcome.operationStatus
+        }
+    }
+
+    /// This validates candidate observations but cannot mint native evidence.
+    /// The real owner must establish the provenance of all three arguments.
+    static func validateSuccessfulXPC(binding: XPCBinding, reply: XPCReply, kernel: KernelExit) throws -> XPCOutcome {
+        try require(binding.process.pid > 1 && binding.process.startSeconds > 0
+                    && binding.process.startMicroseconds < 1_000_000
+                    && binding.sourceIdentity.directoryInode > 0 && binding.sourceIdentity.lockInode > 0,
+                    "Native completion has an invalid process or source identity.")
+        try require(hash(binding.requestSHA256) && hash(binding.runtimeManifestSHA256) && hash(binding.modelSetSHA256)
+                    && (binding.sourceSnapshotSHA256 == nil || hash(binding.sourceSnapshotSHA256!)),
+                    "Native completion has an invalid request, runtime, model or source digest.")
+        try require(reply.jobID == binding.jobID && reply.instanceID == binding.instanceID
+                    && reply.requestSHA256 == binding.requestSHA256,
+                    "The inference reply belongs to a different job, service instance or request.")
+        try require(kernel.observedExit && kernel.observedExitStatus && kernel.process == binding.process,
+                    "The original inference process has no matching kernel exit observation.")
+        try require(reply.operationStatus == 0, "The inference operation did not complete successfully.")
+        let termination: OSTermination
+        // These are wait(2) status bits delivered with NOTE_EXITSTATUS, not a
+        // service-reported status. Preserve the actual normal exit 125 or
+        // SIGKILL; exit 126 denotes failed group signalling and is rejected.
+        if kernel.rawWaitStatus == 125 << 8 { termination = .exited(125) }
+        else if kernel.rawWaitStatus == SIGKILL { termination = .signalled(SIGKILL) }
+        else { throw Failure(message: "The inference process did not follow its qualified cleanup exit policy.") }
+        return XPCOutcome(operationStatus: reply.operationStatus, termination: termination, rawWaitStatus: kernel.rawWaitStatus)
+    }
+
+    func requireSuccessfulArchive(sourceIdentity: MeetingFileAccess.Identity, snapshotSHA256: String) throws {
+        switch observation {
+        case .process(let termination):
+            try Self.require(termination == .exited(0), "Reprocessing did not actually exit successfully.")
+        case .xpc(let binding, _):
+            try Self.validateArchiveBinding(binding, sourceIdentity: sourceIdentity, snapshotSHA256: snapshotSHA256)
+        }
+    }
+
+    /// A testable binding check, deliberately separate from the restricted
+    /// native-evidence constructor and the source-byte protocol verifier.
+    static func validateArchiveBinding(_ binding: XPCBinding, sourceIdentity: MeetingFileAccess.Identity,
+                                       snapshotSHA256: String) throws {
+        try require(binding.operation == .reprocess && binding.stream == .both,
+                    "Automatic archiving requires native reprocessing of both streams.")
+        try require(binding.sourceIdentity == sourceIdentity && hash(snapshotSHA256)
+                    && binding.sourceSnapshotSHA256 == snapshotSHA256,
+                    "Native completion belongs to a different physical source or input snapshot.")
+    }
+
+    private static func hash(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+    private static func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw Failure(message: message) }
+    }
+}
+
 nonisolated final class BackendProcess: @unchecked Sendable {
     private let process = Process()
     private let stdinPipe = Pipe()
@@ -21,6 +156,7 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     private let callbackQueue = DispatchQueue(label: "muesli.backend-exit", qos: .utility)
     private var started = false
     private var exitStatus: Int32?
+    private var observedCompletion: BackendCompletionEvidence?
     private var exitCallback: (@Sendable (Int32) -> Void)?
 
     let stdoutLines: BackendEventLines
@@ -124,6 +260,8 @@ nonisolated final class BackendProcess: @unchecked Sendable {
                     let status = process.terminationStatus
                     let callback = self.processLock.withLock {
                         self.exitStatus = status
+                        self.observedCompletion = BackendCompletionEvidence(legacyTermination:
+                            process.terminationReason == .exit ? .exited(status) : .signalled(status))
                         return self.exitCallback
                     }
                     self.exitCompletion.markCompleted()
@@ -165,6 +303,9 @@ nonisolated final class BackendProcess: @unchecked Sendable {
 
     var hasStarted: Bool { processLock.withLock { started } }
     var isRunning: Bool { processLock.withLock { started && exitStatus == nil } }
+    /// Available only after the actual native termination callback. An exit
+    /// wait timeout, model-written result or caller cancellation cannot mint it.
+    func completionEvidence() -> BackendCompletionEvidence? { processLock.withLock { observedCompletion } }
 
     func forceKill() {
         processQueue.async { [self] in

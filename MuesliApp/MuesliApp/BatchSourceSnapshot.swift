@@ -22,6 +22,35 @@ nonisolated struct BatchSourceSnapshot: Sendable, Equatable {
     let sources: [Source]
     let reviewedNames: [String: String]
 
+    /// Bind native batch completion to the original ordered source inventory
+    /// and byte fingerprints. Speaker display names are not inference inputs.
+    func completionSHA256() throws -> String {
+        struct BoundSession: Encodable {
+            let number: Int
+            let folder: String
+            let sourceID: String?
+        }
+        struct BoundSource: Encodable {
+            let inventory: BatchRediarizer.SourceInventory
+            let streamDurations: [String: Double]
+            let fingerprints: [String: String]
+        }
+        struct Binding: Encodable {
+            let version: Int
+            let folder: MeetingFileAccess.Identity
+            let selectedStream: String
+            let sessions: [BoundSession]
+            let sources: [BoundSource]
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let value = Binding(version: 1, folder: folderIdentity, selectedStream: selectedStream.rawValue,
+            sessions: sessions.map { BoundSession(number: $0.number, folder: $0.folder, sourceID: $0.sourceID) },
+            sources: sources.map { BoundSource(inventory: $0.inventory, streamDurations: $0.streamDurations,
+                                              fingerprints: $0.fingerprints) })
+        return SHA256.hash(data: try encoder.encode(value)).map { String(format: "%02x", $0) }.joined()
+    }
+
     static func failure(_ message: String) -> TranscriptPersistenceStore.Failure {
         .operationFailed(message)
     }

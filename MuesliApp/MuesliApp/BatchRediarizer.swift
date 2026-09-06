@@ -56,9 +56,12 @@ actor BatchRediarizer {
     nonisolated struct CompletedProcessingEvidence: Sendable {
         let sourceIdentity: MeetingFileAccess.Identity
         let events: Data
-        private let observedExitCode: Int32
-        fileprivate init(sourceIdentity: MeetingFileAccess.Identity, events: Data, observedExitCode: Int32) {
-            self.sourceIdentity = sourceIdentity; self.events = events; self.observedExitCode = observedExitCode
+        private let completion: BackendCompletionEvidence
+        private let sourceSnapshotSHA256: String
+        fileprivate init(sourceIdentity: MeetingFileAccess.Identity, events: Data,
+                         completion: BackendCompletionEvidence, sourceSnapshotSHA256: String) {
+            self.sourceIdentity = sourceIdentity; self.events = events
+            self.completion = completion; self.sourceSnapshotSHA256 = sourceSnapshotSHA256
         }
         /// Call on a retained worker holding the fresh exclusive source gate.
         /// Final output/source revalidation and move ownership remain separate.
@@ -66,7 +69,7 @@ actor BatchRediarizer {
             guard source.inventory.access.identity == sourceIdentity else {
                 throw ArchiveProcessingEvidence.Failure(message: "Processing completed for a different physical source folder.")
             }
-            return try source.verifyProcessing(log: events, observedExitCode: observedExitCode)
+            return try source.verifyProcessing(log: events, completion: completion, sourceSnapshotSHA256: sourceSnapshotSHA256)
         }
     }
 
@@ -174,15 +177,17 @@ actor BatchRediarizer {
                 if stderr.count > 20 { stderr.removeFirst(stderr.count - 20) }
             }
         }
-        func completedEvidence(observedExitCode: Int32) throws -> CompletedProcessingEvidence? {
+        func completedEvidence(completion: BackendCompletionEvidence) throws -> CompletedProcessingEvidence? {
             try lock.withLock {
                 guard evidenceByteLimit != nil else { return nil }
-                guard observedExitCode == 0, error == nil, let sourceSnapshot,
+                guard error == nil, let sourceSnapshot,
                       sourceSnapshot.selectedStream == .both, !events.isEmpty else {
                     throw BatchRediarizer.failure(4, "Native processing evidence lacks a complete source-bound result.")
                 }
+                let digest = try sourceSnapshot.completionSHA256()
+                try completion.requireSuccessfulArchive(sourceIdentity: sourceSnapshot.folderIdentity, snapshotSHA256: digest)
                 return CompletedProcessingEvidence(sourceIdentity: sourceSnapshot.folderIdentity,
-                    events: events, observedExitCode: observedExitCode)
+                    events: events, completion: completion, sourceSnapshotSHA256: digest)
             }
         }
         func snapshot() -> (Result?, String?, String?) {
@@ -311,7 +316,10 @@ actor BatchRediarizer {
                     guard closed == .completed else {
                         throw Self.failure(4, "Processing finished but its native resources are still closing; originals remain retained.")
                     }
-                    result.nativeProcessingEvidence = try accumulator.completedEvidence(observedExitCode: exitStatus)
+                    guard let completion = backend.completionEvidence() else {
+                        throw Self.failure(4, "Actual native termination evidence is unavailable.")
+                    }
+                    result.nativeProcessingEvidence = try accumulator.completedEvidence(completion: completion)
                 }
                 if let progressHandler { await progressHandler(.complete) }
                 return result

@@ -41,11 +41,26 @@ nonisolated enum ArchiveProcessingEvidence {
     private static let maximumLineBytes = 4 * 1024 * 1024
     private static let maximumLogBytes = 64 * 1024 * 1024
 
-    /// Complete JSONL only. Partial tails, stdout noise, errors, multiple
-    /// results and any records after the final result all retain the source.
+    /// Compatibility for actual legacy Process termination and protocol tests.
+    /// XPC callers must use typed native completion, never its operation status
+    /// as an integer assertion of OS exit zero.
     static func validate(log: Data, observedExitCode: Int32, expected: [Session],
                          recoveryInputHash: RecoveryInputHash? = nil) throws -> Verified {
         try require(observedExitCode == 0, "Reprocessing did not actually exit successfully.")
+        return try validateRecords(log: log, expected: expected, recoveryInputHash: recoveryInputHash)
+    }
+
+    static func validate(log: Data, completion: BackendCompletionEvidence,
+                         sourceIdentity: MeetingFileAccess.Identity, sourceSnapshotSHA256: String,
+                         expected: [Session], recoveryInputHash: RecoveryInputHash? = nil) throws -> Verified {
+        try completion.requireSuccessfulArchive(sourceIdentity: sourceIdentity, snapshotSHA256: sourceSnapshotSHA256)
+        return try validateRecords(log: log, expected: expected, recoveryInputHash: recoveryInputHash)
+    }
+
+    /// Complete JSONL only. Partial tails, stdout noise, errors, multiple
+    /// results and any records after the final result all retain the source.
+    private static func validateRecords(log: Data, expected: [Session],
+                                        recoveryInputHash: RecoveryInputHash?) throws -> Verified {
         try require(!log.isEmpty && log.count <= maximumLogBytes && log.last == 10,
                     "The processing journal is empty, incomplete or exceeds its size limit.")
         let decoder = JSONDecoder()
