@@ -14,6 +14,8 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     private let onStopped: @Sendable (Error) -> Void
     private let stoppedLock = NSLock()
     private var nativeStopError: Error?
+    private var nativeStopObserver: (@Sendable () -> Void)?
+    private var nativeStopObserverInstalled = false
     var stopError: Error? { stoppedLock.withLock { nativeStopError } }
     var hasStopped: Bool { stopError != nil }
     let generation: Int
@@ -46,12 +48,31 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     /// Retain terminal native evidence before scheduling any UI notification.
     /// Duplicate framework callbacks cannot repeatedly notify or rearm recovery.
     func recordNativeStop(_ error: Error) {
-        guard stoppedLock.withLock({
-            guard nativeStopError == nil else { return false }
+        let delivery: (Bool, (@Sendable () -> Void)?) = stoppedLock.withLock {
+            guard nativeStopError == nil else { return (false, nil) }
             nativeStopError = error
-            return true
-        }) else { return }
+            let observer = nativeStopObserver
+            nativeStopObserver = nil
+            return (true, observer)
+        }
+        guard delivery.0 else { return }
+        // Admit source-failure evidence before cleanup can close its lease.
         onStopped(error)
+        delivery.1?()
+    }
+
+    /// The native owner receives terminal evidence independently of UI tasks.
+    /// Registration and delivery share the evidence lock, including a callback
+    /// that arrived before the native owner was installed.
+    func observeNativeStop(_ observer: @escaping @Sendable () -> Void) {
+        let callNow = stoppedLock.withLock {
+            precondition(!nativeStopObserverInstalled)
+            nativeStopObserverInstalled = true
+            if nativeStopError != nil { return true }
+            nativeStopObserver = observer
+            return false
+        }
+        if callNow { observer() }
     }
 
     func finish() async {
@@ -64,23 +85,64 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     func ingressSnapshot() -> MicAudioIngress.Snapshot { ingress.snapshot() }
 }
 
+/// The narrow framework boundary keeps tests on the production native owner
+/// without creating a real SCStream or accessing capture hardware.
+nonisolated protocol NativeSystemStream: Sendable {
+    func startCapture(completionHandler: @escaping @Sendable (Error?) -> Void)
+    func stopCapture(completionHandler: @escaping @Sendable (Error?) -> Void)
+    func removeOutputs(_ relay: SystemAudioCaptureRelay)
+}
+
+nonisolated private final class ScreenCaptureKitStream: NativeSystemStream, @unchecked Sendable {
+    private let stream: SCStream
+    init(_ stream: SCStream) { self.stream = stream }
+    func startCapture(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        stream.startCapture(completionHandler: completionHandler)
+    }
+    func stopCapture(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        stream.stopCapture(completionHandler: completionHandler)
+    }
+    func removeOutputs(_ relay: SystemAudioCaptureRelay) {
+        try? stream.removeStreamOutput(relay, type: .audio)
+        try? stream.removeStreamOutput(relay, type: .screen)
+    }
+}
+
 /// Immutable handle whose framework operations are serialized by a
 /// CaptureOperationOwner; ownership survives a caller's deadline.
-nonisolated private final class NativeSystemCapture: @unchecked Sendable {
-    let stream: SCStream
+nonisolated final class NativeSystemCapture: @unchecked Sendable {
+    let stream: any NativeSystemStream
     let relay: SystemAudioCaptureRelay
     private let lock = NSLock()
+    private var startAttempted = false
+    private var nativeCallInFlight = false
+    private var nativeStopped = false
+    private var retirementRequested = false
+    private var retirementTask: Task<Void, Never>?
     private var retired = false
     private let quitWork: ShutdownWorkRegistry.Token?
     let preservesRecording: Bool
     private var meetingAccess: MeetingFileAccess?
     var isRetired: Bool { lock.withLock { retired } }
-    init(stream: SCStream, relay: SystemAudioCaptureRelay, meetingAccess: MeetingFileAccess?, preservesRecording: Bool) throws {
+    init(stream: any NativeSystemStream, relay: SystemAudioCaptureRelay, meetingAccess: MeetingFileAccess?, preservesRecording: Bool,
+         shutdown: ShutdownWorkRegistry = .shared) throws {
         self.preservesRecording = preservesRecording
-        quitWork = preservesRecording ? try ShutdownWorkRegistry.shared.begin("Retiring native system recording") : nil
+        quitWork = preservesRecording ? try shutdown.begin("Retiring native system recording") : nil
         self.stream = stream; self.relay = relay; self.meetingAccess = meetingAccess
+        relay.observeNativeStop { [weak self] in self?.recordNativeStop() }
     }
     func start() async throws {
+        try lock.withLock {
+            guard !startAttempted, !retirementRequested, !nativeStopped else { throw CaptureOperationOwner.Failure.cancelled }
+            startAttempted = true
+            nativeCallInFlight = true
+        }
+        defer {
+            lock.withLock { nativeCallInFlight = false }
+            _ = retirementIfReady()
+        }
+        // A failed start is not sufficient evidence about partial framework
+        // setup. Cleanup still obtains a successful stop or terminal evidence.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stream.startCapture { error in
                 if let error { continuation.resume(throwing: error) }
@@ -89,23 +151,64 @@ nonisolated private final class NativeSystemCapture: @unchecked Sendable {
         }
     }
     func stop() async throws {
-        if !relay.hasStopped {
-            do {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    stream.stopCapture { error in
-                        if let error { continuation.resume(throwing: error) }
-                        else { continuation.resume() }
-                    }
-                }
-            } catch {
-                guard relay.hasStopped else { throw error }
+        let needsNativeStop = try lock.withLock {
+            guard !nativeCallInFlight else { throw CaptureOperationOwner.Failure.busy }
+            retirementRequested = true
+            // Setup can throw before startCapture was ever invoked. There is
+            // no native capture to stop in that case, but outputs still retire.
+            if !startAttempted { nativeStopped = true }
+            guard !nativeStopped else { return false }
+            nativeCallInFlight = true
+            return true
+        }
+        var stopError: Error?
+        if needsNativeStop {
+            stopError = await withCheckedContinuation { continuation in
+                stream.stopCapture { error in continuation.resume(returning: error) }
+            }
+            lock.withLock {
+                nativeCallInFlight = false
+                if stopError == nil || Self.isAlreadyStopped(stopError) { nativeStopped = true }
             }
         }
-        try? stream.removeStreamOutput(relay, type: .audio)
-        try? stream.removeStreamOutput(relay, type: .screen)
+        if let retirement = retirementIfReady() {
+            await retirement.value
+            return
+        }
+        // An arbitrary stop error can leave capture running. Preserve the
+        // original source, file lease and Quit token until genuine terminal
+        // evidence arrives or a later explicit stop succeeds.
+        throw stopError ?? CaptureOperationOwner.Failure.busy
+    }
+
+    private static func isAlreadyStopped(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else { return false }
+        // Apple documents this exact domain/code as already stopped or absent.
+        // A matching numeric code from another domain proves nothing.
+        return error.domain == SCStreamErrorDomain
+            && error.code == SCStreamError.Code.attemptToStopStreamState.rawValue
+    }
+    private func recordNativeStop() {
+        lock.withLock { nativeStopped = true }
+        _ = retirementIfReady()
+    }
+    private func retirementIfReady() -> Task<Void, Never>? {
+        lock.withLock {
+            if let retirementTask { return retirementTask }
+            guard retirementRequested, nativeStopped, !nativeCallInFlight else { return nil }
+            let task = Task.detached { await self.retire() }
+            retirementTask = task
+            return task
+        }
+    }
+    private func retire() async {
+        stream.removeOutputs(relay)
         await relay.finish()
-        lock.withLock { retired = true; quitWork?.finish() }
+        // Resource disposal precedes published retirement and Quit completion;
+        // neither a deadline nor the UI releasing its references can close it.
         meetingAccess = nil
+        lock.withLock { retired = true }
+        quitWork?.finish()
     }
 }
 
@@ -209,19 +312,29 @@ final class CaptureEngine: NSObject {
                 _ = self.observeSystemSourceProblems()
             }
         }
-        self.forwarder = forwarder
-        self.relay = relay
-
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.sampleRate = 16000
         config.channelCount = 1
         config.excludesCurrentProcessAudio = true
         let stream = SCStream(filter: contentFilter, configuration: config, delegate: relay)
+        let native: NativeSystemCapture
+        do {
+            native = try NativeSystemCapture(stream: ScreenCaptureKitStream(stream), relay: relay, meetingAccess: meetingAccess,
+                                             preservesRecording: writer != nil || url != nil)
+        } catch {
+            await forwarder.stop()
+            health.fail(error.localizedDescription)
+            reportProblem(.unknown(generation: currentGeneration, message: "System audio setup failed: \(error.localizedDescription)"))
+            throw error
+        }
+        // Publish only after native admission succeeds. A sealed Quit can
+        // reject that admission without leaving a phantom busy stream.
+        self.forwarder = forwarder
+        self.relay = relay
         self.stream = stream
-        var attemptedRecordingDelegate: RecordingDelegate?
-        let native = try NativeSystemCapture(stream: stream, relay: relay, meetingAccess: meetingAccess, preservesRecording: writer != nil || url != nil)
         nativeSource = native
+        var attemptedRecordingDelegate: RecordingDelegate?
         do {
             try stream.addStreamOutput(relay, type: .audio, sampleHandlerQueue: DispatchQueue(label: "muesli.audio.system", qos: .userInitiated))
             try stream.addStreamOutput(relay, type: .screen, sampleHandlerQueue: DispatchQueue(label: "muesli.video.drop", qos: .userInitiated))

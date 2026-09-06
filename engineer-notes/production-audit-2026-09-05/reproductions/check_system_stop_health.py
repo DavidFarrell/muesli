@@ -36,6 +36,10 @@ store = '''private var nativeStopError: Error?
  var stopError: Error? { stoppedLock.withLock { nativeStopError } }
  var hasStopped: Bool { stopError != nil }''' if modern else '''private var stoppedByFramework = false
  var hasStopped: Bool { stoppedLock.withLock { stoppedByFramework } }'''
+# Keep the current relay method intact when it also notifies the independent
+# native retirement owner. This health probe does not install that observer.
+if 'private var nativeStopObserver:' in text:
+    store += '\n private var nativeStopObserver: (@Sendable () -> Void)?'
 display = block(text, 'let display = MicDeliveryDisplayMailbox').split('result in', 1)[1]
 notification = block(text, 'Task { @MainActor [weak self] in').split('[weak self] in', 1)[1]
 program = r'''
