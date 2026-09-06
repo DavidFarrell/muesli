@@ -13,6 +13,8 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         let sourceIdentity: MeetingFileAccess.Identity
         let sourceSessionIDs: [String]
         let receipt: ArchiveReceipt.FileRecord
+        let plannedStagingPath: String?
+        let validationSnapshot: ArchiveReceipt.FileRecord?
         let phase: Phase
         let destination: String?
         let diagnosticCode: String?
@@ -20,6 +22,7 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         enum CodingKeys: String, CodingKey {
             case schemaVersion = "schema_version", operationID = "operation_id", sourceFolder = "source_folder"
             case sourceIdentity = "source_identity", sourceSessionIDs = "source_session_ids", receipt, phase, destination
+            case plannedStagingPath = "planned_staging_path", validationSnapshot = "validation_snapshot"
             case diagnosticCode = "diagnostic_code", observedAt = "observed_at"
         }
     }
@@ -46,7 +49,8 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
     /// An existing source marker of ANY type/outcome blocks automatic reuse.
     /// It must be reconciled explicitly; no retry/overwrite/cleanup is inferred.
     init(rootURL: URL, source: MeetingFileAccess, sessionIDs: [String], receipt: ArchiveReceipt.FileRecord,
-         operationID: UUID = UUID(), checkpoint: (@Sendable (Checkpoint) throws -> Void)? = nil) throws {
+         operationID: UUID = UUID(), plannedStagingURL: URL? = nil, validationSnapshot: ArchiveReceipt.FileRecord? = nil,
+         checkpoint: (@Sendable (Checkpoint) throws -> Void)? = nil) throws {
         try Self.require(source.mode == .archive, "Move intent requires exclusive source ownership.")
         try source.validate()
         try Self.require(!sessionIDs.isEmpty && sessionIDs.count <= 128
@@ -54,6 +58,34 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
                          "Move intent requires distinct source UUIDs.")
         try Self.require(Self.absolute(receipt.path) && receipt.path.utf8.count <= 16_384 && receipt.bytes > 0
                          && receipt.bytes <= 8 * 1024 * 1024 && Self.hash(receipt.sha256), "Invalid receipt fingerprint.")
+        if let validationSnapshot {
+            try Self.require(Self.absolute(validationSnapshot.path) && validationSnapshot.path.utf8.count <= 16_384
+                             && validationSnapshot.bytes > 0 && validationSnapshot.bytes <= 8 * 1024 * 1024
+                             && Self.hash(validationSnapshot.sha256), "Invalid native validation snapshot fingerprint.")
+            let parent = try Root.openDirectory(URL(fileURLWithPath: validationSnapshot.path).deletingLastPathComponent())
+            try Self.require(!parent.handles.contains { handle in
+                guard let state = try? Self.state(handle.fileDescriptor) else { return true }
+                return DirectoryIdentity(state) == DirectoryIdentity(source.identity)
+            }, "Native validation snapshots must survive outside the source.")
+            try Self.require(try ArchiveReceipt.readFingerprint(at: URL(fileURLWithPath: validationSnapshot.path), maximumBytes: 8 * 1024 * 1024) == validationSnapshot,
+                             "The native validation snapshot changed before pending intent.")
+            try Root.validateLinks(parent.links)
+        }
+        if let plannedStagingURL {
+            try Self.require(Self.absolute(plannedStagingURL.path) && plannedStagingURL.path.utf8.count <= 16_384,
+                             "Invalid planned staging path.")
+            let parent = try Root.openDirectory(plannedStagingURL.deletingLastPathComponent())
+            let identity = try Self.state(parent.handles.last!.fileDescriptor)
+            try Self.require(UInt64(UInt32(bitPattern: identity.st_dev)) == source.identity.directoryDevice
+                             && identity.st_uid == geteuid() && identity.st_mode & 0o777 == 0o700,
+                             "Staging must be a private directory on the original source volume.")
+            try Self.require(!parent.handles.contains { handle in
+                guard let state = try? Self.state(handle.fileDescriptor) else { return true }
+                return DirectoryIdentity(state) == DirectoryIdentity(source.identity)
+            }, "Staging must survive outside the original source.")
+            try Self.requireAbsent(parent.handles.last!.fileDescriptor, plannedStagingURL.lastPathComponent)
+            try Root.validateLinks(parent.links)
+        }
         let root = try Root(rootURL, excludingSource: DirectoryIdentity(source.identity))
         try Self.require(!root.identities.contains(DirectoryIdentity(source.identity)), "Move intent must survive outside the source.")
         self.root = root; self.source = source; self.checkpoint = checkpoint
@@ -62,7 +94,7 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         try Self.requireAbsent(root.fd, marker)
         try Self.requireAbsent(root.fd, anchor)
         current = Record(schemaVersion: 1, operationID: operationID, sourceFolder: source.folderURL.path,
-            sourceIdentity: source.identity, sourceSessionIDs: sessionIDs, receipt: receipt, phase: .pending,
+            sourceIdentity: source.identity, sourceSessionIDs: sessionIDs, receipt: receipt, plannedStagingPath: plannedStagingURL?.path, validationSnapshot: validationSnapshot, phase: .pending,
             destination: nil, diagnosticCode: nil, observedAt: Date().timeIntervalSince1970)
         currentBytes = try Self.encode(current)
         anchorBytes = currentBytes
@@ -88,6 +120,20 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
     }
 
     var record: Record { lock.withLock { current } }
+    /// Revalidate the actual durable owner immediately before staging; a copy
+    /// of Record alone is never authority to begin a move.
+    func validatePending() throws { try lock.withLock { try requirePending() } }
+
+    /// Admission gate, not retry inference from inspect() failure. Acquires the
+    /// safe root lease (creating only that protocol lock if absent) and accepts
+    /// only exact ENOENT for both source-specific intent names. No intent file
+    /// is created and source ancestry is excluded before even lock creation.
+    static func requireNoPreviousIntent(rootURL: URL, sourceIdentity: MeetingFileAccess.Identity) throws {
+        let root = try Root(rootURL, excludingSource: DirectoryIdentity(sourceIdentity))
+        try requireAbsent(root.fd, anchor(sourceIdentity))
+        try requireAbsent(root.fd, marker(sourceIdentity))
+        try root.validate()
+    }
 
     /// Record only the destination returned by the actual native move. Recheck
     /// that the original name is absent and the returned directory really is
@@ -146,6 +192,7 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
                     && original.schemaVersion == value.schemaVersion && original.operationID == value.operationID
                     && original.sourceFolder == value.sourceFolder && original.sourceIdentity == value.sourceIdentity
                     && original.sourceSessionIDs == value.sourceSessionIDs && original.receipt == value.receipt
+                    && original.plannedStagingPath == value.plannedStagingPath && original.validationSnapshot == value.validationSnapshot
                     && original.observedAt.isFinite, "Archive outcome does not match its immutable intent anchor.")
         if value.phase == .pending { try require(value == original, "Pending archive marker was changed.") }
         try link(root.fd, anchorName, anchorFD)
@@ -167,6 +214,7 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
     private func replace(phase: Phase, destination: String?, diagnosticCode: String?) throws {
         let value = Record(schemaVersion: 1, operationID: current.operationID, sourceFolder: current.sourceFolder,
             sourceIdentity: current.sourceIdentity, sourceSessionIDs: current.sourceSessionIDs, receipt: current.receipt,
+            plannedStagingPath: current.plannedStagingPath, validationSnapshot: current.validationSnapshot,
             phase: phase, destination: destination, diagnosticCode: diagnosticCode, observedAt: Date().timeIntervalSince1970)
         let bytes = try Self.encode(value), temporary = ".outcome-" + UUID().uuidString
         let fd = openat(root.fd, temporary, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)

@@ -15,12 +15,16 @@ nonisolated enum ArchiveSourceInventory {
         var fileBytes: Int64 = 64 * 1024 * 1024 * 1024
         var totalBytes: Int64 = 256 * 1024 * 1024 * 1024
     }
+    struct EntryIdentity: Codable, Equatable, Sendable {
+        let path: String; let device: UInt64; let inode: UInt64; let directory: Bool
+    }
     struct Snapshot: Sendable {
         let access: MeetingFileAccess
         let canonicalFolderURL: URL
         let files: [ArchiveReceipt.FileRecord]
         /// Includes every descendant directory, even an empty unindexed one.
         let directories: [String]
+        let identities: [EntryIdentity]
     }
     struct Failure: Error, LocalizedError {
         let message: String
@@ -35,15 +39,26 @@ nonisolated enum ArchiveSourceInventory {
     static func capture(access: MeetingFileAccess, limits: Limits = Limits(),
                         afterRootResolution: (@Sendable (URL) throws -> Void)? = nil,
                         beforeRead: (@Sendable (String) throws -> Void)? = nil) throws -> Snapshot {
+        try captureImpl(access: access, location: nil, limits: limits, afterRootResolution: afterRootResolution, beforeRead: beforeRead)
+    }
+    /// Same held exclusive lease after the native owner relocates a source to
+    /// private staging. Reuses the complete bounded walker, including empty
+    /// directories; no self-conflicting flock or original-path validation.
+    static func captureRelocated(access: MeetingFileAccess, at location: URL, limits: Limits = Limits()) throws -> Snapshot {
+        try captureImpl(access: access, location: location, limits: limits, afterRootResolution: nil, beforeRead: nil)
+    }
+    private static func captureImpl(access: MeetingFileAccess, location: URL?, limits: Limits,
+                                    afterRootResolution: (@Sendable (URL) throws -> Void)?,
+                                    beforeRead: (@Sendable (String) throws -> Void)?) throws -> Snapshot {
         try require(access.mode == .archive, "Source inventory requires exclusive archive ownership.")
         try require(limits.entries > 0 && limits.depth > 0 && limits.pathBytes > 0
                     && limits.fileBytes >= 0 && limits.totalBytes >= 0, "Invalid source inventory limits.")
-        try access.validate()
+        if let location { try access.validateRelocated(to: location) } else { try access.validate() }
         // Foundation can shorten an existing /private/tmp path back to /tmp.
         // Resolve only the root's spelling, then independently open every
         // canonical component and compare the root to the already-held owner.
         // No descendant data is read until that identity comparison succeeds.
-        guard let resolved = realpath(access.folderURL.path, nil) else {
+        guard let resolved = realpath((location ?? access.folderURL).path, nil) else {
             throw Failure(message: "The owned source folder cannot be resolved.")
         }
         defer { free(resolved) }
@@ -77,10 +92,10 @@ nonisolated enum ArchiveSourceInventory {
         try builder.walk(directory, path: "", depth: 0)
         try requireNoTransaction(directory)
         for (parent, name, child) in links { try validateLink(parent: parent, name: name, child: child) }
-        try access.validate()
+        if let location { try access.validateRelocated(to: location) } else { try access.validate() }
         return Snapshot(access: access, canonicalFolderURL: URL(fileURLWithPath: path),
                         files: builder.files.sorted { $0.path < $1.path },
-                        directories: builder.directories.sorted())
+                        directories: builder.directories.sorted(), identities: builder.identities.sorted { $0.path < $1.path })
     }
 
     private struct Builder {
@@ -88,6 +103,7 @@ nonisolated enum ArchiveSourceInventory {
         let beforeRead: (@Sendable (String) throws -> Void)?
         var files: [ArchiveReceipt.FileRecord] = []
         var directories: [String] = []
+        var identities: [EntryIdentity] = []
         var entries = 0
         var pathBytes = 0
         var totalBytes: Int64 = 0
@@ -116,6 +132,8 @@ nonisolated enum ArchiveSourceInventory {
                 let originalChild = try state(child)
                 try require(originalChild.st_dev == namedChild.st_dev && originalChild.st_ino == namedChild.st_ino
                             && originalChild.st_mode & S_IFMT == kind, "A source entry changed before opening.")
+                identities.append(.init(path: relative, device: UInt64(UInt32(bitPattern: originalChild.st_dev)),
+                                        inode: originalChild.st_ino, directory: kind == S_IFDIR))
                 switch originalChild.st_mode & S_IFMT {
                 case S_IFDIR:
                     try require(depth < limits.depth, "The source directory depth exceeds its limit.")

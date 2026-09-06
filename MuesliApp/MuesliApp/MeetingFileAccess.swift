@@ -68,6 +68,42 @@ nonisolated final class MeetingFileAccess: @unchecked Sendable {
         }
     }
 
+    /// Archive-only relocation of the same still-owned directory. This neither
+    /// acquires a replacement lease nor permits another inode to inherit one.
+    /// The private staging owner separately checks its namespace and inventory.
+    func validateRelocated(to folder: URL) throws {
+        guard mode == .archive else { throw Failure.invalid }
+        let path = folder.path
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst().map(String.init)
+        guard path.hasPrefix("/"), path.utf8.count <= 16_384, !parts.isEmpty, parts.count <= 128,
+              parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") }) else { throw Failure.invalid }
+        let root = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard root >= 0 else { throw Self.posixError() }
+        var held = [FileHandle(fileDescriptor: root, closeOnDealloc: true)], links: [(Int32,String,Int32)] = []
+        for name in parts {
+            let parent = held.last!.fileDescriptor
+            let child = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard child >= 0 else { throw Failure.changed }
+            held.append(FileHandle(fileDescriptor: child, closeOnDealloc: true)); links.append((parent,name,child))
+        }
+        var current = stat(), owned = stat(), namedLock = stat(), ownedLock = stat()
+        guard let target = held.last,
+              fstat(target.fileDescriptor, &current) == 0, fstat(directory.fileDescriptor, &owned) == 0,
+              current.st_dev == owned.st_dev, current.st_ino == owned.st_ino,
+              UInt64(current.st_dev) == identity.directoryDevice, current.st_ino == identity.directoryInode,
+              fstatat(target.fileDescriptor, Self.accessName, &namedLock, AT_SYMLINK_NOFOLLOW) == 0,
+              fstat(handle.fileDescriptor, &ownedLock) == 0,
+              namedLock.st_dev == ownedLock.st_dev, namedLock.st_ino == ownedLock.st_ino,
+              UInt64(namedLock.st_dev) == identity.lockDevice, namedLock.st_ino == identity.lockInode,
+              namedLock.st_mode & S_IFMT == S_IFREG, namedLock.st_nlink == 1, namedLock.st_uid == geteuid() else { throw Failure.changed }
+        for (parent,name,child) in links {
+            var named = stat(), opened = stat()
+            guard fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) == 0, fstat(child, &opened) == 0,
+                  named.st_dev == opened.st_dev, named.st_ino == opened.st_ino,
+                  named.st_mode & S_IFMT == S_IFDIR else { throw Failure.changed }
+        }
+    }
+
     /// Serialization is separate from archive exclusion: capture may keep an
     /// SH access reference while its finalizer owns this EX transaction scope.
     func transaction() throws -> Transaction {

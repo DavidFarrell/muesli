@@ -228,4 +228,52 @@ final class ArchiveMoveJournalTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: XCTUnwrap(retained.first)), unexpected)
     }
 
+    func testAbsentGateRejectsMarkerOnlyAnchorOnlyAndDanglingMaterial() throws {
+        for keep in ["none", "marker", "anchor", "dangling"] {
+            let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+            try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: root, sourceIdentity: source.identity)
+            if keep == "none" { continue }
+            var value: ArchiveMoveJournal? = try journal(root, source)
+            let files = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".json") }
+            XCTAssertEqual(files.count, 2); value = nil
+            _ = value
+            for name in files {
+                let isAnchor = name.contains("anchor")
+                if (keep == "marker" && isAnchor) || (keep == "anchor" && !isAnchor) || keep == "dangling" {
+                    try FileManager.default.removeItem(at: root.appendingPathComponent(name))
+                }
+            }
+            if keep == "dangling" {
+                try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent(files[0]).path, withDestinationPath: "/definitely-missing-archive-fixture")
+            }
+            XCTAssertThrowsError(try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: root, sourceIdentity: source.identity), keep)
+        }
+    }
+    func testAbsentGateRejectsUnsafeRootBeforeCreatingOwnerFile() throws {
+        let source = try MeetingFileAccess.acquire(in: directory(), mode: .archive), root = try directory()
+        let inside = source.folderURL.appendingPathComponent("private")
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        XCTAssertThrowsError(try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: inside, sourceIdentity: source.identity))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: inside.path).isEmpty)
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: inside)
+        XCTAssertThrowsError(try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: alias, sourceIdentity: source.identity))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: inside.path).isEmpty)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: root.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path) }
+        XCTAssertThrowsError(try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: root, sourceIdentity: source.identity))
+    }
+    func testPlannedPrivateStagingSurvivesPendingAndTerminalAndCannotBeOccupied() throws {
+        let root = try directory(), original = try directory(), parent = try directory()
+        let source = try MeetingFileAccess.acquire(in: original, mode: .archive), stage = parent.appendingPathComponent("source")
+        var value: ArchiveMoveJournal? = try .init(rootURL: root, source: source, sessionIDs: [sessionID], receipt: receipt, plannedStagingURL: stage)
+        XCTAssertEqual(value!.record.plannedStagingPath, stage.path)
+        try value!.recordUncertain(code: "synthetic_failure"); value = nil
+        let record = try ArchiveMoveJournal.inspect(rootURL: root, sourceIdentity: source.identity)
+        XCTAssertEqual(record.plannedStagingPath, stage.path); XCTAssertEqual(record.phase, .uncertain)
+        let otherRoot = try directory(); try Data().write(to: stage)
+        XCTAssertThrowsError(try ArchiveMoveJournal(rootURL: otherRoot, source: source, sessionIDs: [sessionID], receipt: receipt, plannedStagingURL: stage))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: otherRoot.path).isEmpty)
+    }
+
 }
