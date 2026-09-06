@@ -450,7 +450,7 @@ final class CaptureLifecycleTests: XCTestCase {
         let start = Task.detached {
             do {
                 try await owner.perform(timeoutSeconds: 0.03, preservesRecording: true,
-                    operation: {}, adoption: try makeOwnedMicOffer(folder: folder, released: released),
+                    operation: {}, adoption: try makeOwnedMicOffer(folder: folder, released: released, registry: registry),
                     cleanupIfAbandoned: { cleanup.signal() })
             } catch { }
             returned.signal()
@@ -474,15 +474,21 @@ nonisolated private enum TestCaptureFailure: Error { case injected }
 nonisolated private final class MicOfferLease: @unchecked Sendable {
     private var access: MeetingFileAccess?
     private let released: DispatchSemaphore
-    init(folder: URL, released: DispatchSemaphore) throws {
+    private let registry: ShutdownWorkRegistry
+    init(folder: URL, released: DispatchSemaphore, registry: ShutdownWorkRegistry) throws {
+        self.registry = registry
         access = try MeetingFileAccess.acquire(in: folder)
         self.released = released
     }
-    deinit { access = nil; released.signal() }
+    deinit {
+        XCTAssertFalse(registry.snapshot().pending.isEmpty, "Actual offer source close must precede its native work token release.")
+        access = nil
+        released.signal()
+    }
 }
 
-nonisolated private func makeOwnedMicOffer(folder: URL, released: DispatchSemaphore) throws
+nonisolated private func makeOwnedMicOffer(folder: URL, released: DispatchSemaphore, registry: ShutdownWorkRegistry) throws
     -> @MainActor @Sendable (CaptureOperationOwner.Claim) -> Void {
-    let lease = try MicOfferLease(folder: folder, released: released)
+    let lease = try MicOfferLease(folder: folder, released: released, registry: registry)
     return { claim in withExtendedLifetime(lease) { _ = claim.claim() } }
 }
