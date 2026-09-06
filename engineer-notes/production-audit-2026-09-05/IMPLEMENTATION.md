@@ -223,9 +223,13 @@ manual testing. This supersedes the unanswered-approval statements above.
   `clock-correction-diagnostics.md` for fidelity, bounded state and uncertainty.
 - Claude's second pass read the previously unreviewed production subsystems and
   found no further P2+ defect. It identified a smaller Resume/Stop/export count
-  mismatch, which is being reproduced and corrected before the final tree review.
-  Its publication verdict remains pending. No code has been published by these
-  follow-up steps.
+  mismatch, corrected in `37aea92` before integration. Root independently passed
+  the unchanged actual Resume/Stop/export regression and metadata-only failed
+  startup control; the baseline had six failed assertions. The exact authoritative
+  save count leaves metadata-only finalization unchanged. Author full Swift,
+  strict Swift 6 and identified Release checks passed. See
+  `finalized-transcript-count.md`. Claude's final publication verdict remains
+  pending; no code has been published by these follow-up steps.
 - The isolated helper experiment is frozen at `fe1a744` with actual inference,
   native network/peer/ownership checks and a bounded independent Astra pass.
   Successful private-home source admission and current-backend/client integration
