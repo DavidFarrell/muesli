@@ -235,3 +235,33 @@ manual testing. This supersedes the unanswered-approval statements above.
   Successful private-home source admission and current-backend/client integration
   remain open, as detailed in `unsigned-memory-proposal.md`. No main-app helper
   integration or installed-app replacement is claimed.
+
+## Claude publication approval and corrected combined verification
+
+6 September 2026. This supersedes the pending Claude publication verdict above.
+
+- Clean source `ce5ea7be6002342fd1e9be68c0b7b6b6e5692056` passed **629 Swift
+  tests, 185 Python tests, nine native packaging tests and optimized Release**
+  after a fresh locked bootstrap with an empty package cache. Release coverage
+  was disabled. Evidence: `/private/tmp/muesli-claude-corrections-combined-verification`.
+- The runtime manifest and embedded Release identity both identify that exact
+  source with `source_dirty=false`; build ID is
+  `fa91cf63b4902daaddb1813cfd8c540817911d367a122ebd329009ab0ede6d3c`.
+  Strict app/CLI signatures and the isolated unsupported-command protocol probe
+  passed. Production and DEBUG whole-app Swift 6/default MainActor/complete
+  concurrency/warnings-as-errors checks passed without diagnostics.
+- Claude Fable 5.1's final read-only review returned **PASS for public publication
+  as a development/testing checkpoint**. It confirmed F-A, F-B and R-1 resolved
+  and found no supported actionable P2 or higher in its reviewed scope. This is
+  an independent model opinion: Claude did not execute tests, relied on the
+  reported verification, and searched rather than fully rereading the whole diff.
+- Claude retained hardware timestamp jitter as a qualification hypothesis and
+  per-keystroke speaker-name persistence as a P4 observation. Actual source
+  manifests must be inspected during manual built-in microphone, Bluetooth and
+  system-audio testing; generated signal tests do not establish device behavior.
+- The user's conditional public-publication authorization is now satisfied.
+  The helper experiment remains separate from this application candidate;
+  current helper/client integration and private-source admission remain open.
+  Local installation and physical endurance/route/sleep qualification are still
+  required. Distribution and notarization are deferred at the user's request.
+  No installed-app replacement, real recording or real Trash action occurred.
