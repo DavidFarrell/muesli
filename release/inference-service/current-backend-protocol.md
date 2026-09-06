@@ -22,3 +22,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun clang -fobjc-arc 
 ```
 
 The pending implementation must still demonstrate actual XPC serialization/peer checks, source-free reservation, native admission-before-import, private-container derived writes, current processing/runtime evidence, and generated framed live controls. No main-app adapter or installation is included in this step.
+
+`SourceLeaseAdmission` now implements the native read-only admission primitive separately from transport activation. It opens only the existing meeting and fixed locks, takes shared exclusion, derives the exact existing Python token from the verified URL, and binds an optional live child directory plus bounded current manifest UUID. `validate` rejects later directory/lock/live-child replacement or UUID change. Its handles close only on owner destruction; service wiring must retain that owner through actual exit. This is admission and UUID binding, not a claim that all PCM/model inputs are already semantically verified. Current backend validation retains that responsibility before consuming inputs.
+
+Actual native primitive tests cover independent exclusive refusal/release, archive winning, foreign root, absent/symlink/hardlinked ownership files, correct/changed live UUID, same-UUID child-directory replacement, and an oversized manifest. The implementation and both native test executables compile with `-Wall -Wextra -Werror`; `/private/tmp/muesli-native-source-admission-tests.log` records the passing run.
