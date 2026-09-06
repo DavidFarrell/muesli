@@ -139,4 +139,19 @@ final class ArchiveSourceInventoryTests: XCTestCase {
         for limits in cases { XCTAssertThrowsError(try ArchiveSourceInventory.capture(access: access, limits: limits)) }
         XCTAssertEqual(try ArchiveSourceInventory.capture(access: access).files.count, 2)
     }
+    func testProcessingInventoryRequiresTransactionWithoutGrantingArchiveAuthority() async throws {
+        let folder = try fixture()
+        try write(folder, "audio/mic.pcm", Data("original".utf8))
+        let operation = try TranscriptPersistenceStore.shared.start(in: folder) { context in
+            XCTAssertThrowsError(try ArchiveSourceInventory.capture(access: context.access))
+            XCTAssertThrowsError(try ArchiveSourceInventory.captureRelocated(access: context.access, at: folder))
+            let observed = try ArchiveSourceInventory.captureForProcessing(context: context)
+            XCTAssertEqual(observed.access.identity, context.access.identity)
+            return observed.files
+        }
+        let files = try await operation.value(timeoutSeconds: 3)
+        XCTAssertEqual(files.first { $0.path == "audio/mic.pcm" }?.bytes, 8)
+        XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("audio/mic.pcm")), Data("original".utf8))
+    }
+
 }

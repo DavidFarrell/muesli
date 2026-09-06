@@ -393,4 +393,156 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
         XCTAssertFalse(try names(f.journal).contains { $0.hasSuffix(".json") })
     }
 
+    func testIndependentReplacementBeforeProcessingNeverReachesActualChild() async throws {
+        let f = try setup()
+        let savedOriginal = f.root.appendingPathComponent("original-selected-source")
+        let replacement = f.root.appendingPathComponent("replacement")
+        let observed = f.root.appendingPathComponent("child-read.pcm")
+        try FileManager.default.copyItem(at: f.source, to: replacement)
+        let foreignBytes = Data(repeating: 73, count: 320)
+        try foreignBytes.write(to: replacement.appendingPathComponent("audio/mic.pcm"))
+        let adapter = ArchiveSemanticAdapter(configuration: f.config, fixtureRoot: f.root,
+            fixtureCommand: ["/bin/sh", "-c", "cat \"$1/audio/mic.pcm\" > \"$2\"; cat \"$3\"", "fixture", f.source.path,
+                             observed.path, f.root.appendingPathComponent("synthetic-event.jsonl").path],
+            fixtureDestination: f.destination, checkpoint: { checkpoint in
+                if case .beforeProcessing = checkpoint {
+                    try FileManager.default.moveItem(at: f.source, to: savedOriginal)
+                    try FileManager.default.moveItem(at: replacement, to: f.source)
+                }
+            })
+        do { _ = try await adapter.prepare(f.begin, operationID: UUID()); XCTFail("Original identity must be rejected") } catch {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: observed.path),
+                       "Native child must not read a replacement folder before original identity rejection")
+        if FileManager.default.fileExists(atPath: observed.path) {
+            XCTAssertEqual(try Data(contentsOf: observed), foreignBytes)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: savedOriginal.path))
+    }
+
+    func testChangedOriginalLockFilesOrCompleteInventoryNeverLaunchChild() async throws {
+        for mutation in ["lock", "pcm-bytes", "pcm-inode", "empty-directory", "completed-resume"] {
+            let f = try setup(), observed = f.root.appendingPathComponent("child-launched")
+            let adapter = ArchiveSemanticAdapter(configuration: f.config, fixtureRoot: f.root,
+                fixtureCommand: ["/bin/sh", "-c", "printf launched > \"$1\"; cat \"$2\"", "fixture", observed.path,
+                                 f.root.appendingPathComponent("synthetic-event.jsonl").path], fixtureDestination: f.destination,
+                checkpoint: { checkpoint in
+                    guard case .beforeProcessing = checkpoint else { return }
+                    switch mutation {
+                    case "lock":
+                        let lock = f.source.appendingPathComponent(MeetingFileAccess.accessName)
+                        try FileManager.default.moveItem(at: lock, to: f.root.appendingPathComponent("original-lock"))
+                        try Data().write(to: lock)
+                    case "pcm-bytes":
+                        try Data(repeating: 73, count: 320).write(to: f.source.appendingPathComponent("audio/mic.pcm"))
+                    case "pcm-inode":
+                        let pcm = f.source.appendingPathComponent("audio/mic.pcm"), bytes = try Data(contentsOf: pcm)
+                        try FileManager.default.moveItem(at: pcm, to: f.root.appendingPathComponent("original-pcm"))
+                        try bytes.write(to: pcm)
+                    case "empty-directory":
+                        try FileManager.default.createDirectory(at: f.source.appendingPathComponent("new-empty"), withIntermediateDirectories: false)
+                    default:
+                        let newAudio = f.source.appendingPathComponent("audio-session-2"), newID = UUID().uuidString
+                        try FileManager.default.copyItem(at: f.source.appendingPathComponent("audio"), to: newAudio)
+                        let manifestURL = newAudio.appendingPathComponent("source-recording.json")
+                        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+                        manifest["session_id"] = newID; manifest["timeline_offset_us"] = 10_000
+                        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+                        let metadataURL = f.source.appendingPathComponent("meeting.json")
+                        var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
+                        var sessions = try XCTUnwrap(metadata["sessions"] as? [[String: Any]])
+                        var added = sessions[0]
+                        added["session_id"] = 2; added["source_session_id"] = newID
+                        added["audio_folder"] = "audio-session-2"; added["timeline_offset_seconds"] = 0.01
+                        sessions.append(added); metadata["sessions"] = sessions; metadata["duration_seconds"] = 0.02
+                        try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
+                    }
+                })
+            do { _ = try await adapter.prepare(f.begin, operationID: UUID()); XCTFail("Changed original must fail: \(mutation)") } catch {}
+            XCTAssertFalse(FileManager.default.fileExists(atPath: observed.path), "Child launched after \(mutation)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: f.source.path))
+        }
+    }
+
+    func testActualBeforeRunSameRootChangesRejectBeforeChildInvocation() async throws {
+        for mutation in ["pcm", "empty-directory", "completed-session"] {
+            let f = try setup(), marker = f.root.appendingPathComponent("child-launched")
+            let original = ArchiveSemanticAdapter.Original(try ArchiveSourceEligibility.inspect(access: MeetingFileAccess.acquire(in: f.source, mode: .archive)))
+            let validate: @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { context in
+                guard context.access.identity == original.identity else { throw MeetingFileAccess.Failure.changed }
+                try original.compare(ArchiveSourceInventory.captureForProcessing(context: context))
+            }
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 10).runCommand(
+                    ["/bin/sh", "-c", "printf launched > \"$1\"; cat \"$2\"", "fixture", marker.path,
+                     f.root.appendingPathComponent("synthetic-event.jsonl").path], backendRoot: f.root,
+                    sourceMeetingDirectory: f.source, collectProcessingEvidence: true, expectedMeetingIdentity: original.identity,
+                    validateSource: validate, launchCheckpoint: { checkpoint in
+                        guard case .beforeRun = checkpoint else { return }
+                        if mutation == "pcm" {
+                            try Data(repeating: 77, count: 320).write(to: f.source.appendingPathComponent("audio/mic.pcm"))
+                        } else if mutation == "empty-directory" {
+                            try FileManager.default.createDirectory(at: f.source.appendingPathComponent("late-empty"), withIntermediateDirectories: false)
+                        } else {
+                            let newAudio = f.source.appendingPathComponent("audio-session-2"), newID = UUID().uuidString
+                            try FileManager.default.copyItem(at: f.source.appendingPathComponent("audio"), to: newAudio)
+                            let manifestURL = newAudio.appendingPathComponent("source-recording.json")
+                            var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+                            manifest["session_id"] = newID; manifest["timeline_offset_us"] = 10_000
+                            try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+                            let metadataURL = f.source.appendingPathComponent("meeting.json")
+                            var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
+                            var sessions = try XCTUnwrap(metadata["sessions"] as? [[String: Any]])
+                            var added = sessions[0]; added["session_id"] = 2; added["source_session_id"] = newID
+                            added["audio_folder"] = "audio-session-2"; added["timeline_offset_seconds"] = 0.01
+                            sessions.append(added); metadata["sessions"] = sessions; metadata["duration_seconds"] = 0.02
+                            try JSONSerialization.data(withJSONObject: metadata).write(to: metadataURL)
+                        }
+                    })
+                XCTFail("Late original-source change must fail: \(mutation)")
+            } catch {}
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "Child launched after late \(mutation)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+        }
+    }
+    func testArchiveLaunchTransactionRemainsOwnedThroughActualInvocationAfterCancellation() async throws {
+        let f = try setup(), entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), closed = TaskCompletion()
+        defer { release.signal() }
+        let original = ArchiveSemanticAdapter.Original(try ArchiveSourceEligibility.inspect(access: MeetingFileAccess.acquire(in: f.source, mode: .archive)))
+        let task = Task.detached {
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 10).runCommand(f.command, backendRoot: f.root,
+                    sourceMeetingDirectory: f.source, collectProcessingEvidence: true, expectedMeetingIdentity: original.identity,
+                    validateSource: { context in
+                        guard context.access.identity == original.identity else { throw MeetingFileAccess.Failure.changed }
+                        try original.compare(ArchiveSourceInventory.captureForProcessing(context: context))
+                    }, onResourcesClosed: { closed.markCompleted() }, launchCheckpoint: { checkpoint in
+                        if case .afterRun = checkpoint {
+                            entered.signal()
+                            XCTAssertEqual(release.wait(timeout: .now() + 8), .success)
+                        }
+                    })
+                return true
+            } catch { return false }
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+        func assertStillOwned() throws {
+            XCTAssertThrowsError(try TranscriptPersistenceStore.shared.start(in: f.source) { _ in 1 })
+            let access = try MeetingFileAccess.acquire(in: f.source)
+            XCTAssertThrowsError(try access.transaction(), "The actual native invocation must retain the OS transaction too")
+        }
+        try assertStillOwned()
+        task.cancel()
+        let succeeded = await task.value
+        XCTAssertFalse(succeeded)
+        try assertStillOwned()
+        release.signal()
+        let didClose = await closed.wait(timeoutSeconds: 3)
+        XCTAssertEqual(didClose, .completed)
+        let next = try TranscriptPersistenceStore.shared.start(in: f.source) { _ in 1 }
+        let value = try await next.value(timeoutSeconds: 3)
+        XCTAssertEqual(value, 1)
+    }
+
 }

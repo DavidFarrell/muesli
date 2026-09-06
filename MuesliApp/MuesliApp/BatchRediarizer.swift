@@ -200,15 +200,17 @@ actor BatchRediarizer {
         backendRoot: URL,
         stream: Stream,
         collectProcessingEvidence: Bool = false,
+        expectedMeetingIdentity: MeetingFileAccess.Identity? = nil,
+        validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { _ in },
         progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
     ) async throws -> Result {
         if collectProcessingEvidence && stream != .both {
             throw Self.failure(4, "Processing evidence requires both source streams.")
         }
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
-        return try await execute(protecting: meetingDirectory,
+        return try await execute(protecting: meetingDirectory, expectedMeetingIdentity: expectedMeetingIdentity, validateSource: validateSource,
             evidenceByteLimit: collectProcessingEvidence ? 64 * 1024 * 1024 : nil, progressHandler: progressHandler) { accumulator in
-            accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream))
+            accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream, validateSource: validateSource))
             let build: (String) throws -> BackendProcess = { python in
                 let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue, "--meeting-lease-required"]
                 let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
@@ -223,8 +225,9 @@ actor BatchRediarizer {
     /// Runs the same production admission path with model-free child/IO seams.
     func runCommand(_ command: [String], backendRoot: URL,
                     sourceMeetingDirectory: URL? = nil, stream: Stream = .both,
-                    collectProcessingEvidence: Bool = false, evidenceByteLimit: Int = 64 * 1024 * 1024,
+                    collectProcessingEvidence: Bool = false, expectedMeetingIdentity: MeetingFileAccess.Identity? = nil, evidenceByteLimit: Int = 64 * 1024 * 1024,
                     beforeSourceSnapshot: @escaping @Sendable () throws -> Void = {},
+                    validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { _ in },
                     onResourcesClosed: @escaping @Sendable () -> Void = {},
                     eventJournalURL: URL? = nil,
                     beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
@@ -233,11 +236,11 @@ actor BatchRediarizer {
         if collectProcessingEvidence && (stream != .both || sourceMeetingDirectory == nil) {
             throw Self.failure(4, "Processing evidence requires an owned meeting and both streams.")
         }
-        return try await execute(protecting: sourceMeetingDirectory ?? backendRoot,
+        return try await execute(protecting: sourceMeetingDirectory ?? backendRoot, expectedMeetingIdentity: expectedMeetingIdentity, validateSource: validateSource,
             evidenceByteLimit: collectProcessingEvidence ? evidenceByteLimit : nil, progressHandler: progressHandler) { accumulator in
             if let sourceMeetingDirectory {
                 accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: sourceMeetingDirectory, stream: stream,
-                    beforeRead: beforeSourceSnapshot))
+                    beforeRead: beforeSourceSnapshot, validateSource: validateSource))
             }
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot,
                 environment: Self.backendEnvironment(root: backendRoot), eventJournalURL: eventJournalURL,
@@ -247,7 +250,8 @@ actor BatchRediarizer {
         }
     }
 
-    private func execute(protecting folder: URL, evidenceByteLimit: Int?, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+    private func execute(protecting folder: URL, expectedMeetingIdentity: MeetingFileAccess.Identity?,
+                         validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void, evidenceByteLimit: Int?, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
                          factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
         guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         if let evidenceByteLimit, !(1...64 * 1024 * 1024).contains(evidenceByteLimit) {
@@ -255,7 +259,24 @@ actor BatchRediarizer {
         }
         let accumulator = Accumulator(evidenceByteLimit: evidenceByteLimit)
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
-        let attempt = try admission.start(protecting: folder, timeoutSeconds: min(8, timeoutSeconds)) { try factory(accumulator) }
+        let launchScope: BackendProcess.LaunchScope
+        if expectedMeetingIdentity != nil {
+            launchScope = { launch in
+                // One original read transaction spans validation AND the real
+                // Process.run invocation. The bounded admission wait cannot
+                // release it while either native operation remains blocked.
+                let finished = DispatchSemaphore(value: 0)
+                let operation = try TranscriptPersistenceStore.shared.start(in: folder, purpose: .previewRead,
+                    onCompletion: { _ in finished.signal() }) { context in
+                        try validateSource(context)
+                        try launch()
+                    }
+                finished.wait()
+                try operation.completedValue()
+            }
+        } else { launchScope = { try $0() } }
+        let attempt = try admission.start(protecting: folder, expectedMeetingIdentity: expectedMeetingIdentity,
+            timeoutSeconds: min(8, timeoutSeconds), withNativeLaunch: launchScope) { try factory(accumulator) }
         return try await withTaskCancellationHandler(operation: {
             do {
                 switch await attempt.waitUntilReady() {

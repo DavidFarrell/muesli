@@ -129,6 +129,23 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
         func take() -> MeetingFileAccess? { lock.withLock { let value = access; access = nil; return value } }
     }
 
+    /// Escaping source-scope callbacks may outlive their invocation by a few
+    /// queue callbacks. Empty this box before leaving launch so those captures
+    /// cannot extend the actual source lease past close publication.
+    private final class LaunchAccess: @unchecked Sendable {
+        private let lock = NSLock()
+        private var access: MeetingFileAccess?
+        init(_ access: MeetingFileAccess?) { self.access = access }
+        func validate() throws {
+            let value = lock.withLock { access }
+            try value?.validate()
+        }
+        func clear() {
+            let old = lock.withLock { let value = access; access = nil; return value }
+            withExtendedLifetime(old) {}
+        }
+    }
+
     private static let deadlines = DispatchQueue(label: "muesli.backend-admission-deadline", qos: .utility)
     private let queue = DispatchQueue(label: "muesli.backend-admission", qos: .utility)
     private let lock = NSLock()
@@ -140,8 +157,10 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
     }
     var isBusy: Bool { lock.withLock { active != nil } }
 
-    func start(protecting meetingFolder: URL? = nil, timeoutSeconds: Double = 8, factory: @escaping @Sendable () throws -> Resources) throws -> Attempt {
+    func start(protecting meetingFolder: URL? = nil, expectedMeetingIdentity: MeetingFileAccess.Identity? = nil,
+               timeoutSeconds: Double = 8, withNativeLaunch: @escaping BackendProcess.LaunchScope = { try $0() }, factory: @escaping @Sendable () throws -> Resources) throws -> Attempt {
         precondition(timeoutSeconds.isFinite && timeoutSeconds >= 0)
+        guard expectedMeetingIdentity == nil || meetingFolder != nil else { throw MeetingFileAccess.Failure.invalid }
         let attempt = Attempt(timeoutSeconds: timeoutSeconds)
         let cancelClaimed = cancelClaimedOnQuit
         let quitWork = try shutdown.begin("Closing transcription process and journal", onQuit: { [weak attempt] in
@@ -160,9 +179,13 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
                 try attempt.checkAdmission()
                 if let meetingFolder {
                     meetingAccess = try MeetingFileAccess.acquire(in: meetingFolder)
+                    if let expectedMeetingIdentity, meetingAccess?.identity != expectedMeetingIdentity {
+                        throw MeetingFileAccess.Failure.changed
+                    }
                     meetingLease = try BackendMeetingLease.acquire(in: meetingFolder, exclusive: false)
                 }
                 try attempt.checkAdmission()
+                try meetingAccess?.validate()
                 let value = try factory()
                 resources = value
                 attempt.installed(value)
@@ -170,7 +193,7 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
                     try value.backend.installMeetingLease(access: meetingAccess, backendLease: meetingLease)
                 }
                 try attempt.checkAdmission()
-                try value.backend.start(checkAdmission: { try attempt.checkAdmission() })
+                try Self.launch(value.backend, attempt: attempt, access: meetingAccess, withNativeLaunch: withNativeLaunch)
                 attempt.offer()
                 attempt.decision.wait()
             } catch { attempt.fail(error) }
@@ -192,6 +215,18 @@ nonisolated final class BackendAdmissionOwner: @unchecked Sendable {
             }
         }
         return attempt
+    }
+
+    /// Scope this borrowed reference to synchronous native launch. It must not
+    /// survive into the actual-close handoff or completion publication.
+    private static func launch(_ backend: BackendProcess, attempt: Attempt, access: MeetingFileAccess?,
+                               withNativeLaunch: BackendProcess.LaunchScope) throws {
+        let borrowed = LaunchAccess(access)
+        defer { borrowed.clear() }
+        try backend.start(checkAdmission: {
+            try attempt.checkAdmission()
+            try borrowed.validate()
+        }, withNativeLaunch: withNativeLaunch)
     }
 
     /// Stop retires an unclaimed startup synchronously. A claimed live backend

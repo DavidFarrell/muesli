@@ -41,6 +41,12 @@ nonisolated enum ArchiveSourceInventory {
                         beforeRead: (@Sendable (String) throws -> Void)? = nil) throws -> Snapshot {
         try captureImpl(access: access, location: nil, limits: limits, afterRootResolution: afterRootResolution, beforeRead: beforeRead)
     }
+    /// Read-only processing admission under an actual folder transaction.
+    /// This permits comparison with a previous native inventory, never archive
+    /// eligibility or a move. Ordinary archive capture still requires EX access.
+    static func captureForProcessing(context: TranscriptPersistenceStore.Context, limits: Limits = Limits()) throws -> Snapshot {
+        try captureImpl(access: context.access, location: nil, limits: limits, afterRootResolution: nil, beforeRead: nil, requiresArchive: false)
+    }
     /// Same held exclusive lease after the native owner relocates a source to
     /// private staging. Reuses the complete bounded walker, including empty
     /// directories; no self-conflicting flock or original-path validation.
@@ -49,8 +55,8 @@ nonisolated enum ArchiveSourceInventory {
     }
     private static func captureImpl(access: MeetingFileAccess, location: URL?, limits: Limits,
                                     afterRootResolution: (@Sendable (URL) throws -> Void)?,
-                                    beforeRead: (@Sendable (String) throws -> Void)?) throws -> Snapshot {
-        try require(access.mode == .archive, "Source inventory requires exclusive archive ownership.")
+                                    beforeRead: (@Sendable (String) throws -> Void)?, requiresArchive: Bool = true) throws -> Snapshot {
+        try require(!requiresArchive || access.mode == .archive, "Source inventory requires exclusive archive ownership.")
         try require(limits.entries > 0 && limits.depth > 0 && limits.pathBytes > 0
                     && limits.fileBytes >= 0 && limits.totalBytes >= 0, "Invalid source inventory limits.")
         if let location { try access.validateRelocated(to: location) } else { try access.validate() }

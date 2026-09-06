@@ -102,7 +102,10 @@ nonisolated final class BackendProcess: @unchecked Sendable {
 
     /// Called by BackendAdmissionOwner's worker. The cheap state lock is never
     /// held across native launch, journal work, or process-control calls.
-    func start(checkAdmission: @Sendable () throws -> Void = {}) throws {
+    typealias LaunchScope = @Sendable (@escaping @Sendable () throws -> Void) throws -> Void
+
+    func start(checkAdmission: @escaping @Sendable () throws -> Void = {},
+               withNativeLaunch: LaunchScope = { try $0() }) throws {
         try processLock.withLock {
             guard !attemptedStart else {
                 throw NSError(domain: "Muesli", code: -1,
@@ -128,10 +131,14 @@ nonisolated final class BackendProcess: @unchecked Sendable {
                     self.callbackQueue.async { callback?(status) }
                 }
                 try launchCheckpoint?(.beforeRun)
-                try checkAdmission()
-                try process.run()
-                processLock.withLock { started = true }
-                try launchCheckpoint?(.afterRun)
+                // An archive-specific source transaction may own this actual
+                // invocation. The process queue stays serialized until return.
+                try withNativeLaunch { [self] in
+                    try checkAdmission()
+                    try process.run()
+                    processLock.withLock { started = true }
+                    try launchCheckpoint?(.afterRun)
+                }
             }
         } catch {
             output.cleanup()

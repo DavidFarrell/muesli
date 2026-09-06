@@ -88,7 +88,7 @@ nonisolated final class ArchiveSemanticAdapter: Sendable {
             #if DEBUG
             try checkpoint?(.beforeProcessing)
             #endif
-            let proof = try await run(source: URL(fileURLWithPath: initial.original.source.folder))
+            let proof = try await run(original: initial.original)
             #if DEBUG
             try checkpoint?(.afterProcessing)
             #endif
@@ -120,19 +120,27 @@ nonisolated final class ArchiveSemanticAdapter: Sendable {
         // source/reader/secondary EX owners all retire before Batch takes SH.
         return Initial(original: original, catalog: catalog, bundle: bundle, journalDirectory: journal)
     }
-    private func run(source: URL) async throws -> BatchRediarizer.CompletedProcessingEvidence {
+    private func run(original: Original) async throws -> BatchRediarizer.CompletedProcessingEvidence {
+        let source = URL(fileURLWithPath: original.source.folder)
+        let validateSource: @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { context in
+            try Self.require(context.access.identity == original.identity, "The original source changed before processing snapshot admission.")
+            try original.compare(ArchiveSourceInventory.captureForProcessing(context: context))
+        }
         let result: BatchRediarizer.Result
         #if DEBUG
         if let fixtureCommand {
             result = try await BatchRediarizer(timeoutSeconds: 10).runCommand(fixtureCommand,
-                backendRoot: configuration.backendRoot, sourceMeetingDirectory: source, stream: .both, collectProcessingEvidence: true)
+                backendRoot: configuration.backendRoot, sourceMeetingDirectory: source, stream: .both, collectProcessingEvidence: true,
+                expectedMeetingIdentity: original.identity, validateSource: validateSource)
         } else {
             result = try await BatchRediarizer().run(meetingDirectory: source, backendRoot: configuration.backendRoot,
-                                                    stream: .both, collectProcessingEvidence: true)
+                                                    stream: .both, collectProcessingEvidence: true,
+                expectedMeetingIdentity: original.identity, validateSource: validateSource)
         }
         #else
         result = try await BatchRediarizer().run(meetingDirectory: source, backendRoot: configuration.backendRoot,
-                                                stream: .both, collectProcessingEvidence: true)
+                                                stream: .both, collectProcessingEvidence: true,
+                expectedMeetingIdentity: original.identity, validateSource: validateSource)
         #endif
         guard let proof = result.nativeProcessingEvidence else { throw Failure(message: "Actual native processing closure was not established.") }
         return proof

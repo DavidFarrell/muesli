@@ -341,6 +341,67 @@ final class BackendAdmissionTests: XCTestCase {
         } catch { XCTAssertTrue(error.localizedDescription.contains("previous transcription")) }
         probe.release.signal()
     }
+    func testExpectedIdentityIsRecheckedAtActualNativeLaunchBeforeChildCanRead() async throws {
+        for replaceRoot in [false, true] {
+            let root = try folder(), source = root.appendingPathComponent("source")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+            let expected = try MeetingFileAccess.acquire(in: source).identity
+            let marker = root.appendingPathComponent("child-launched"), owner = BackendAdmissionOwner()
+            let attempt = try owner.start(protecting: source, expectedMeetingIdentity: expected) {
+                let backend = try BackendProcess(command: ["/bin/sh", "-c", "printf launched > \"$1\"", "fixture", marker.path],
+                    launchCheckpoint: { checkpoint in
+                        guard case .beforeRun = checkpoint else { return }
+                        if replaceRoot {
+                            try FileManager.default.moveItem(at: source, to: root.appendingPathComponent("original-source"))
+                            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+                        } else {
+                            let lock = source.appendingPathComponent(MeetingFileAccess.accessName)
+                            try FileManager.default.moveItem(at: lock, to: root.appendingPathComponent("original-lock"))
+                            try Data().write(to: lock)
+                        }
+                    })
+                return BackendAdmissionOwner.Resources(backend: backend)
+            }
+            defer { attempt.cancel() }
+            let offered = await attempt.waitUntilReady()
+            if case .failed = offered {} else { XCTFail("Replaced source cannot reach native Process.run") }
+            let closed = await attempt.waitUntilClosed(timeoutSeconds: 3)
+            XCTAssertEqual(closed, .completed)
+            XCTAssertFalse(owner.isBusy)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        }
+    }
+    func testExpectedIdentityCannotBeSilentlyIgnoredWithoutProtectedFolder() {
+        let identity = MeetingFileAccess.Identity(directoryDevice: 1, directoryInode: 1, lockDevice: 1, lockInode: 2)
+        XCTAssertThrowsError(try BackendAdmissionOwner().start(expectedMeetingIdentity: identity) {
+            XCTFail("Invalid native admission cannot invoke the factory")
+            throw CancellationError()
+        })
+    }
+
+    nonisolated private final class RetainedLaunchCallback: @unchecked Sendable {
+        private let lock = NSLock()
+        private var callback: (@Sendable () throws -> Void)?
+        func retain(_ value: @escaping @Sendable () throws -> Void) { lock.withLock { callback = value } }
+        var retained: Bool { lock.withLock { callback != nil } }
+    }
+    func testReturnedLaunchCallbackCannotRetainSourceLeasePastActualClose() async throws {
+        let source = try folder(), owner = BackendAdmissionOwner(), retained = RetainedLaunchCallback()
+        let expected = try MeetingFileAccess.acquire(in: source).identity
+        let attempt = try owner.start(protecting: source, expectedMeetingIdentity: expected,
+            withNativeLaunch: { callback in retained.retain(callback); try callback() }) {
+                BackendAdmissionOwner.Resources(backend: try BackendProcess(command: ["/usr/bin/true"]))
+            }
+        defer { attempt.cancel() }
+        if case .ready = await attempt.waitUntilReady() { _ = try attempt.claim() } else { XCTFail("Original launch must succeed") }
+        let closed = await attempt.waitUntilClosed(timeoutSeconds: 3)
+        XCTAssertEqual(closed, .completed)
+        XCTAssertTrue(retained.retained)
+        let archive = try MeetingFileAccess.acquire(in: source, mode: .archive)
+        XCTAssertEqual(archive.identity, expected)
+        withExtendedLifetime(retained) {}
+    }
+
 }
 
 nonisolated private final class AdmissionProbe: @unchecked Sendable {
