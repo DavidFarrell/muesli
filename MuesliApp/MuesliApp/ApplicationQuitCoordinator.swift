@@ -18,6 +18,7 @@ final class ApplicationQuitCoordinator: ObservableObject {
     private(set) var startIntent = UUID()
     private var requestID: UUID?
     private var reply: (@MainActor (Bool) -> Void)?
+    private var accepted: @MainActor () -> Void = {}
     private var prepare: @MainActor () async -> Void = {}
     private var cancelled: @MainActor () -> Void = {}
     private var timer: Task<Void, Never>?
@@ -27,8 +28,8 @@ final class ApplicationQuitCoordinator: ObservableObject {
         self.registry = registry; self.pendingAfter = pendingAfter
         registry.observe { [weak self] in Task { @MainActor [weak self] in self?.refresh() } }
     }
-    func configure(prepare: @escaping @MainActor () async -> Void, cancelled: @escaping @MainActor () -> Void) {
-        self.prepare = prepare; self.cancelled = cancelled
+    func configure(accepted: @escaping @MainActor () -> Void = {}, prepare: @escaping @MainActor () async -> Void, cancelled: @escaping @MainActor () -> Void) {
+        self.accepted = accepted; self.prepare = prepare; self.cancelled = cancelled
     }
     func canContinueStart(_ capturedIntent: UUID) -> Bool {
         registry.acceptsUserWork && startIntent == capturedIntent
@@ -41,6 +42,9 @@ final class ApplicationQuitCoordinator: ObservableObject {
         guard let preparation = try? registry.begin("Stopping and finalizing capture") else { return }
         startIntent = UUID()
         requestID = id; self.reply = reply; isRequested = true
+        // Finite synchronous retirement cannot be skipped by immediate Cancel.
+        accepted()
+        guard requestID == id else { preparation.finish(); return }
         registry.beginQuit()
         let prepare = self.prepare
         Task { @MainActor [weak self] in

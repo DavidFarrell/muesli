@@ -44,6 +44,7 @@
 			membershipExceptions = (
                 ShutdownWorkRegistry.swift,
                 ApplicationQuitCoordinator.swift,
+                ArchiveListenerLifecycle.swift,
                 ArchiveWorkflowProtocol.swift,
                 ArchiveWorkflowOwner.swift,
                 ArchiveWorkflowSocket.swift,

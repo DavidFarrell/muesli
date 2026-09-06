@@ -35,13 +35,19 @@ nonisolated final class ShutdownWorkRegistry: @unchecked Sendable {
     private var deliveryPending = false
     var acceptsUserWork: Bool { lock.withLock { phase == .open } }
 
-    /// Continuations of accepted work may enter while quiescing. Their parent
-    /// owner must retain its token until this successor has been admitted.
-    /// User entry points independently refuse new intent while quiescing.
+    /// New intent is admitted only while open, under the same lock as Quit.
+    func beginUserWork(_ label: String, onQuit: (@Sendable () -> Void)? = nil) throws -> Token {
+        try admit(label, requiresOpen: true, onQuit: onQuit)
+    }
+    /// Accepted successors may enter while quiescing. Their parent must keep
+    /// its token until this successor has been admitted.
     func begin(_ label: String, onQuit: (@Sendable () -> Void)? = nil) throws -> Token {
+        try admit(label, requiresOpen: false, onQuit: onQuit)
+    }
+    private func admit(_ label: String, requiresOpen: Bool, onQuit: (@Sendable () -> Void)?) throws -> Token {
         let id = UUID()
         let quitting = try lock.withLock {
-            guard phase != .sealed else { throw Failure.sealed }
+            guard phase != .sealed && (!requiresOpen || phase == .open) else { throw Failure.sealed }
             entries[id] = Entry(label: label, onQuit: onQuit)
             return phase == .quiescing
         }

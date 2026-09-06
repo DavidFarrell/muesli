@@ -23,6 +23,8 @@ nonisolated enum ArchiveWorkflowSocket {
         let directory: URL
         let fd: Int32
         let identity: Identity
+        private let closeLock = NSLock()
+        private var closed = false
         init(directory: URL, create: Bool) throws {
             try ArchiveWorkflowProtocol.validatePath(directory.path)
             self.directory = directory
@@ -50,7 +52,11 @@ nonisolated enum ArchiveWorkflowSocket {
                 fd = current; identity = Identity(info)
             } catch { Darwin.close(current); throw error }
         }
-        deinit { Darwin.close(fd) }
+        deinit { close() }
+        func close() {
+            let owned = closeLock.withLock { if closed { return false }; closed = true; return true }
+            if owned { Darwin.close(fd) }
+        }
         func validate() throws {
             // Reopen all ancestors rather than following a swapped parent.
             var current = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
@@ -185,6 +191,7 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
     private let leaseIdentity: Socket.Identity
     private let requestTimeoutSeconds: Double
     private let afterClientClose: @Sendable (Int32) -> Void
+    private let onClosed: @Sendable () -> Void
     private let handler: @Sendable (ArchiveWorkflowProtocol.Request) -> ArchiveWorkflowProtocol.Response
     private let lock = NSLock()
     private let clientsClosed = DispatchGroup()
@@ -197,9 +204,11 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
 
     init(directory: URL, requestTimeoutSeconds: Double = Socket.requestSeconds,
          afterClientClose: @escaping @Sendable (Int32) -> Void = { _ in },
+         onClosed: @escaping @Sendable () -> Void = {},
          handler: @escaping @Sendable (ArchiveWorkflowProtocol.Request) -> ArchiveWorkflowProtocol.Response) throws {
         self.handler = handler
         self.afterClientClose = afterClientClose
+        self.onClosed = onClosed
         self.requestTimeoutSeconds = min(max(requestTimeoutSeconds, 0.05), Socket.requestSeconds)
         endpoint = try Socket.Endpoint(directory: directory, create: true)
         let fd = openat(endpoint.fd, Socket.lockName, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
@@ -280,7 +289,9 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
         clientsClosed.wait()
         if (try? endpoint.socketIdentity()) == socketIdentity { _ = unlinkat(endpoint.fd, Socket.socketName, 0) }
         Darwin.close(lease)
+        endpoint.close()
         lock.withLock { closed = true }
+        onClosed()
     }
     private func serve(_ fd: Int32, clientID: UUID, deadline: Double) {
         defer {
