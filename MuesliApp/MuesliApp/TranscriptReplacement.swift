@@ -54,6 +54,9 @@ nonisolated struct TranscriptReplacement: Sendable {
         var metadata = prior.finalized(segments: segments, sourceManifest: sourceManifest,
             artifactResult: artifactResult, incomplete: incomplete || replay.error != nil,
             sourceProblems: problems)
+        // This transaction replaces the canonical transcript with this exact
+        // projection. Metadata-only finalization preserves its existing count.
+        metadata.segmentCount = segments.count
         if let last = metadata.sessions.indices.last, let sourceID = metadata.sessions[last].sourceSessionID {
             // Only the acknowledged durable journal may establish this identity.
             // A lossy UI event is never the authority for persisted provenance.
