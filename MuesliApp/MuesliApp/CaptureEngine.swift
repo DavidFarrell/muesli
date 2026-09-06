@@ -13,8 +13,9 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     private let forwarder: MicAudioForwarder
     private let onStopped: @Sendable (Error) -> Void
     private let stoppedLock = NSLock()
-    private var stoppedByFramework = false
-    var hasStopped: Bool { stoppedLock.withLock { stoppedByFramework } }
+    private var nativeStopError: Error?
+    var stopError: Error? { stoppedLock.withLock { nativeStopError } }
+    var hasStopped: Bool { stopError != nil }
     let generation: Int
 
     init(generation: Int, forwarder: MicAudioForwarder, display: MicDeliveryDisplayMailbox,
@@ -39,7 +40,17 @@ nonisolated final class SystemAudioCaptureRelay: NSObject, SCStreamOutput, SCStr
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        stoppedLock.withLock { stoppedByFramework = true }
+        recordNativeStop(error)
+    }
+
+    /// Retain terminal native evidence before scheduling any UI notification.
+    /// Duplicate framework callbacks cannot repeatedly notify or rearm recovery.
+    func recordNativeStop(_ error: Error) {
+        guard stoppedLock.withLock({
+            guard nativeStopError == nil else { return false }
+            nativeStopError = error
+            return true
+        }) else { return }
         onStopped(error)
     }
 
@@ -110,7 +121,8 @@ final class CaptureEngine: NSObject {
     private let operationOwner = CaptureOperationOwner()
     private var retirementPending = false
     private var stopping = false
-    private var lastConversionFailures = 0
+    private var lastSourceProblemCount = 0
+    private var observedNativeStop = false
     private(set) var health = CaptureSourceHealth()
     var recoveryRecordingURLProvider: (() -> URL?)?
     private struct Request {
@@ -153,7 +165,8 @@ final class CaptureEngine: NSObject {
         request = Request(filter: contentFilter, writer: writer, recordingURL: url, timeline: timeline, meetingAccess: meetingAccess, outputEnabled: audioOutputEnabled)
         generation += 1
         health.begin(generation: generation)
-        lastConversionFailures = 0
+        lastSourceProblemCount = 0
+        observedNativeStop = false
         stopping = false
         let currentGeneration = generation
         meetingStartPTS = timeline.epochPTS
@@ -166,7 +179,7 @@ final class CaptureEngine: NSObject {
         }
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             guard let self, self.generation == currentGeneration else { return }
-            guard !self.health.invalidated else { return }
+            guard !self.observeSystemSourceProblems() else { return }
             _ = self.health.progress(frames: self.relay?.snapshot().convertedFrames ?? 0, generation: currentGeneration)
             self.debugSystemErrorMessage = "-"
             self.metersModel?.setSystemError(message: "-", errorCount: self.debugAudioErrors)
@@ -193,11 +206,7 @@ final class CaptureEngine: NSObject {
             AudioLog.error("stream.stopped", ["generation": currentGeneration, "error": String(describing: error)])
             Task { @MainActor [weak self] in
                 guard let self, self.generation == currentGeneration, !self.stopping else { return }
-                self.health.fail(error.localizedDescription)
-                self.debugAudioErrors += 1
-                self.debugSystemErrorMessage = String(describing: error)
-                self.metersModel?.setSystemError(message: self.debugSystemErrorMessage, errorCount: self.debugAudioErrors)
-                self.onStreamStopped?(error)
+                _ = self.observeSystemSourceProblems()
             }
         }
         self.forwarder = forwarder
@@ -328,17 +337,39 @@ final class CaptureEngine: NSObject {
             if request == nil { health.reset() }
             else { health.fail("The previous system capture operation has finished.") }
         }
-        if let snapshot = relay?.snapshot() {
-            if snapshot.conversionFailures > lastConversionFailures {
-                lastConversionFailures = snapshot.conversionFailures
-                health.fail("System audio conversion failed.")
-                debugSystemErrorMessage = "System audio conversion failed."
-                debugAudioErrors = snapshot.conversionFailures
-                metersModel?.setSystemError(message: debugSystemErrorMessage, errorCount: debugAudioErrors)
-            }
+        if !observeSystemSourceProblems(), let snapshot = relay?.snapshot() {
             _ = health.progress(frames: snapshot.convertedFrames, generation: generation)
         }
         return allowRecovery && !operationOwner.isBusy && health.shouldRecover(requireContinuousCallbacks: false)
+    }
+
+    /// The notification task may be behind Refresh or a meter task on
+    /// MainActor. Inspect the independently recorded source evidence first;
+    /// old successful conversions can never overrule an already-known stop
+    /// or conversion failure. Error publication is once per observation.
+    private func observeSystemSourceProblems() -> Bool {
+        guard let relay else { return health.invalidated }
+        let problems = relay.ingressSnapshot()
+        if problems.sourceProblemCount > lastSourceProblemCount,
+           let problem = problems.latestSourceProblem {
+            lastSourceProblemCount = problems.sourceProblemCount
+            health.fail(problem.message)
+            debugSystemErrorMessage = problem.message
+            debugAudioErrors += 1
+            metersModel?.setSystemError(message: debugSystemErrorMessage, errorCount: debugAudioErrors)
+        }
+        if let error = relay.stopError {
+            if !observedNativeStop {
+                observedNativeStop = true
+                health.fail(error.localizedDescription)
+                debugSystemErrorMessage = error.localizedDescription
+                debugAudioErrors += 1
+                metersModel?.setSystemError(message: debugSystemErrorMessage, errorCount: debugAudioErrors)
+                onStreamStopped?(error)
+            }
+            return true
+        }
+        return health.invalidated
     }
 
     func resetRecoveryBudget() {
