@@ -92,6 +92,9 @@ Four accepted client owners are the maximum. An absolute monotonic five-second
 receive/send deadline begins at admission and cannot be reset by sending
 another byte. A handler must call only the coordinator's finite synchronous
 admission/status API. Business work runs independently of connections.
+Membership uses a UUID for each accepted owner, never the reusable socket
+descriptor number. The UUID stays counted through actual close and its cleanup;
+an older close callback cannot erase a newly accepted owner using the same FD.
 stop is nonblocking; isClosed becomes true only after original FD owners and
 the listener lock close. A filesystem syscall that itself stalls retains its
 owner; shutdown must not pretend that a caller deadline closed its descriptor.

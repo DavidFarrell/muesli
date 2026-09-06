@@ -184,17 +184,22 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
     private let socketIdentity: Socket.Identity
     private let leaseIdentity: Socket.Identity
     private let requestTimeoutSeconds: Double
+    private let afterClientClose: @Sendable (Int32) -> Void
     private let handler: @Sendable (ArchiveWorkflowProtocol.Request) -> ArchiveWorkflowProtocol.Response
     private let lock = NSLock()
     private let clientsClosed = DispatchGroup()
     private var started = false
     private var stopped = false
     private var closed = false
-    private var clients: Set<Int32> = []
+    // Descriptor numbers are reusable as soon as close() returns. Occupancy
+    // belongs to this accepted owner until its entire close path has finished.
+    private var clients: Set<UUID> = []
 
     init(directory: URL, requestTimeoutSeconds: Double = Socket.requestSeconds,
+         afterClientClose: @escaping @Sendable (Int32) -> Void = { _ in },
          handler: @escaping @Sendable (ArchiveWorkflowProtocol.Request) -> ArchiveWorkflowProtocol.Response) throws {
         self.handler = handler
+        self.afterClientClose = afterClientClose
         self.requestTimeoutSeconds = min(max(requestTimeoutSeconds, 0.05), Socket.requestSeconds)
         endpoint = try Socket.Endpoint(directory: directory, create: true)
         let fd = openat(endpoint.fd, Socket.lockName, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
@@ -260,13 +265,14 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
                   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one))) == 0 else {
                 Darwin.close(fd); continue
             }
+            let clientID = UUID()
             let admitted = lock.withLock {
                 guard !stopped && clients.count < Socket.maximumClients else { return false }
-                clients.insert(fd); clientsClosed.enter(); return true
+                clients.insert(clientID); clientsClosed.enter(); return true
             }
             guard admitted else { Darwin.close(fd); continue }
             let deadline = Socket.now() + requestTimeoutSeconds
-            DispatchQueue.global(qos: .utility).async { [self] in serve(fd, deadline: deadline) }
+            DispatchQueue.global(qos: .utility).async { [self] in serve(fd, clientID: clientID, deadline: deadline) }
         }
         lock.withLock { stopped = true }
         Darwin.close(listener)
@@ -276,8 +282,13 @@ nonisolated final class ArchiveWorkflowServer: @unchecked Sendable {
         Darwin.close(lease)
         lock.withLock { closed = true }
     }
-    private func serve(_ fd: Int32, deadline: Double) {
-        defer { Darwin.close(fd); _ = lock.withLock { clients.remove(fd) }; clientsClosed.leave() }
+    private func serve(_ fd: Int32, clientID: UUID, deadline: Double) {
+        defer {
+            Darwin.close(fd)
+            afterClientClose(fd)
+            _ = lock.withLock { clients.remove(clientID) }
+            clientsClosed.leave()
+        }
         do {
             try Socket.verifyPeer(fd)
             let data = try Socket.receive(fd, deadline: deadline, stopping: { self.isStopping })

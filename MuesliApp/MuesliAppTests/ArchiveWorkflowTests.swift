@@ -263,4 +263,40 @@ final class ArchiveWorkflowTests: XCTestCase {
         let response = try ArchiveWorkflowSocket.request(.operation(.finalize, id: UUID(), receiptPath: "/receipt"), directory: directory)
         XCTAssertEqual(response.failure, .unknownOperation)
     }
+    func testActualFDReuseDoesNotEraseNewClientOwnership() throws {
+        let directory = try directory()
+        let closed = DispatchSemaphore(value: 0), releaseOld = DispatchSemaphore(value: 0)
+        let handlerEntered = DispatchSemaphore(value: 0), releaseHandler = DispatchSemaphore(value: 0)
+        let count = Counter()
+        let server = try ArchiveWorkflowServer(directory: directory, afterClientClose: { _ in
+            count.add()
+            if count.value == 1 { closed.signal(); _ = releaseOld.wait(timeout: .now() + 5) }
+        }, handler: { _ in
+            handlerEntered.signal(); _ = releaseHandler.wait(timeout: .now() + 5)
+            return .init()
+        })
+        server.start()
+        defer {
+            releaseOld.signal(); releaseHandler.signal(); server.stop()
+            waitUntil { server.isClosed }
+        }
+        let first = try connect(directory)
+        defer { Darwin.close(first) }
+        waitUntil { server.activeClientCount == 1 }
+        // Keep the first client FD allocated, and allocate the second client
+        // before the server closes its first accepted FD. accept then reuses
+        // exactly that released server descriptor.
+        let second = try ArchiveWorkflowSocket.descriptor()
+        defer { Darwin.close(second) }
+        XCTAssertEqual(shutdown(first, SHUT_WR), 0)
+        XCTAssertEqual(closed.wait(timeout: .now() + 2), .success)
+        var address = try ArchiveWorkflowSocket.address(directory.appendingPathComponent("archive.sock").path)
+        XCTAssertEqual(ArchiveWorkflowSocket.withAddress(&address, { Darwin.connect(second, $0, $1) }), 0)
+        try ArchiveWorkflowSocket.send(second, data: ArchiveWorkflowProtocol.Request.operation(.status, id: UUID()).encode(), deadline: ArchiveWorkflowSocket.now() + 1)
+        XCTAssertEqual(handlerEntered.wait(timeout: .now() + 2), .success)
+        releaseOld.signal()
+        usleep(50_000)
+        XCTAssertEqual(server.activeClientCount, 1, "old closed descriptor cleanup must not erase the live reused descriptor's owner")
+    }
+
 }
