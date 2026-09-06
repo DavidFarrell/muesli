@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("identity")
-    parser.add_argument("--modes", default="0,1,2,3,4,5,6,7,8,9,10,12,13")
+    parser.add_argument("--modes", default="0,1,2,3,4,5,6,7,8,9,10,12,13,14,15,16,17")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     src = Path(__file__).resolve().parent.parent
@@ -52,19 +52,23 @@ def main():
         run(["codesign", "--force", "--sign", args.identity, "--options", "runtime", "--entitlements", sandbox, service])
         run(["codesign", "--force", "--sign", args.identity, "--options", "runtime", app])
         run(["codesign", "--verify", "--deep", "--strict", app])
-        result = run([app / "Contents/MacOS/InferenceProof", mode], capture_output=True, text=True, timeout=20)
+        result = run([app / "Contents/MacOS/InferenceProof", mode], capture_output=True, text=True, timeout=65)
         (args.output / f"case-{mode}.stderr").write_text(result.stderr)
         report = json.loads(result.stdout)
         (args.output / f"case-{mode}.json").write_text(json.dumps(report, indent=2, sort_keys=True))
-        if mode in (1, 12, 13):
+        if mode in (1, 12, 13, 15, 17):
             passed = not report["start_succeeded"] and report["bookmark_calls"] == 0 and not report["actual_observation_started"]
             if mode == 12 and report["actual_observation_started"]:
                 passed = report["completed"] and report["bookmark_calls"] == 0 and report["completion_failure"] is not None
             if mode == 13:
-                passed = passed and 8 <= report["elapsed_seconds"] < 10
+                passed = passed and 45 <= report["elapsed_seconds"] < 47
+            if mode in (15, 17):
+                passed = passed and 0.4 <= report["elapsed_seconds"] < 2
+            if mode == 17:
+                passed = passed and report["start_failure"] == "Original admission owner retired."
         else:
             passed = report["completed"] and report["kernel_pid"] == report["reservation_pid"] and report["exclusive_available_after_actual_exit"]
-            if mode in (0, 3, 5, 7):
+            if mode in (0, 3, 5, 7, 14):
                 passed = passed and report["start_succeeded"] and report["operation_status"] == 0 and report["completion_failure"] is None and not report["exclusive_available_after_start"] and report["stdout_bytes"] > 0 and report["registered_identity_matches_kernel"]
             else:
                 passed = passed and not report["start_succeeded"] and report["completion_failure"] is not None
@@ -76,8 +80,12 @@ def main():
                 passed = passed and report["elapsed_seconds"] >= 0.9
             if mode == 8:
                 passed = passed and report["elapsed_seconds"] >= 0.9
-            if mode in (9, 10):
+            if mode == 14:
+                passed = passed and report["bookmark_calls"] == 1 and 9 <= report["elapsed_seconds"] < 12
+            if mode in (9, 10, 16):
                 passed = passed and report["exclusive_available_after_start"] and report["operation_status"] == -1 and report["stdout_bytes"] == 0 and report["elapsed_seconds"] >= 8
+            if mode == 16:
+                passed = passed and report["bookmark_calls"] == 1 and report["elapsed_seconds"] >= 17
         report["passed"] = bool(passed)
         reports.append(report)
         print(json.dumps({"mode": mode, "passed": bool(passed), "start_failure": report.get("start_failure"), "completion_failure": report.get("completion_failure")} ), flush=True)

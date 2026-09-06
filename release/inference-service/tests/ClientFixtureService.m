@@ -31,9 +31,11 @@ static void Later(double seconds, dispatch_block_t action) {
 - (void)reserveJob:(NSUUID *)job reply:(void (^)(MuesliServiceReservation *,NSString *))reply {
     if(_job){reply(nil,@"already reserved");return;}_job=job;
     if(MUESLI_FIXTURE_MODE==13)return;
-    reply([[MuesliServiceReservation alloc] initWithInstanceID:_instance jobID:job processID:getpid()
+    dispatch_block_t respond=^{reply([[MuesliServiceReservation alloc] initWithInstanceID:self.instance jobID:job processID:getpid()
         runtimeManifestSHA256:Hash(MUESLI_FIXTURE_MODE==1?3:1) modelManifestSHA256:Hash(2)],nil);
-    if(MUESLI_FIXTURE_MODE==12)_exit(125);
+        if(MUESLI_FIXTURE_MODE==12)_exit(125);
+    };
+    if(MUESLI_FIXTURE_MODE>=14 && MUESLI_FIXTURE_MODE<=17)Later(9,respond);else respond();
 }
 - (void)runOperation:(MuesliInferenceOperation)operation instanceID:(NSUUID *)instance jobID:(NSUUID *)job
     sourceBookmark:(NSData *)bookmark sourceLease:(MuesliSourceLease *)lease liveSource:(MuesliLiveSource *)live
@@ -73,4 +75,4 @@ static void Later(double seconds, dispatch_block_t action) {
 }
 - (void)policyProbeToPort:(NSNumber *)port reply:(void (^)(NSDictionary *))reply {(void)port;reply(@{});}
 @end
-int main(void) {@autoreleasepool {alarm(12);Fixture *fixture=[Fixture new];NSXPCListener *listener=[NSXPCListener serviceListener];listener.delegate=fixture;[listener resume];dispatch_main();}}
+int main(void) {@autoreleasepool {alarm(55);Fixture *fixture=[Fixture new];NSXPCListener *listener=[NSXPCListener serviceListener];listener.delegate=fixture;[listener resume];dispatch_main();}}

@@ -120,7 +120,10 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
         let sourceLease: MuesliSourceLease = try lock.withLock {
             guard !attempted, let lease else { throw Failure(message: "Inference requires one original source lease.") }
             attempted = true
-            admissionDeadline = .now() + 8
+            // Full sealed-runtime verification is source-free and measured
+            // 18.6s on the first qualified launch. Keep this phase bounded;
+            // 45s + the later 8s admission stays below the service's 60s timer.
+            admissionDeadline = .now() + 45
             serviceEnds = [input, output, diagnostics]
             return lease
         }
@@ -131,6 +134,13 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
             try wait(checkAdmission: checkAdmission) { $0.reservation != nil }
             let reserved = lock.withLock { reservation! }
             try ensureAdmission(checkAdmission)
+            try lock.withLock {
+                guard !cancelled, !transportEnded, termination == nil, failure == nil,
+                      let deadline = admissionDeadline, DispatchTime.now() < deadline else {
+                    throw Failure(message: "Inference reservation retired before source admission.")
+                }
+                admissionDeadline = .now() + 8
+            }
             // Successful return means the actual peer instance is authenticated
             // and NOTE_EXIT is armed. No source bytes or descriptors preceded it.
             let native = try MuesliNativeProcessObserver.armConnection(connection,
