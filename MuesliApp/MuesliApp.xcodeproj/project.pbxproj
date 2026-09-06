@@ -45,6 +45,7 @@
                 ShutdownWorkRegistry.swift,
                 ApplicationQuitCoordinator.swift,
                 ArchiveListenerLifecycle.swift,
+                ArchiveApplicationDirectories.swift,
                 ArchiveWorkflowProtocol.swift,
                 ArchiveWorkflowOwner.swift,
                 ArchiveWorkflowSocket.swift,
