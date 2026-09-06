@@ -2,6 +2,8 @@ import XCTest
 import Foundation
 import CryptoKit
 import Darwin
+import ImageIO
+import CoreGraphics
 
 final class ArchiveSourceEligibilityTests: XCTestCase {
     private let date = "2026-09-05T12:00:00Z"
@@ -57,7 +59,7 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
             if artifacts {
                 let base = "artifacts/\(source)", screenshot = base + "/screenshots/\(UUID().uuidString).png"
                 let video = base + "/video/\(UUID().uuidString).mp4"
-                let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4d8AAAAASUVORK5CYII=")!
+                let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=")!
                 try write(root, screenshot, png); try write(root, video, Data("synthetic SDK-finished video".utf8))
                 try write(root, base + "/.artifact-owner.lock")
                 let records: [[String: Any]] = [
@@ -566,6 +568,63 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: vault, withDestinationURL: foreign)
         XCTAssertThrowsError(try catalog.validate())
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: foreign.path), [])
+    }
+
+    func testNativeCopyReuseCompletesPreviouslyInterruptedDurabilityBarriers() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        let source = try inspect(root)
+        XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: vault, checkpoint: { phase in
+            if case .afterPublish = phase { throw NSError(domain: "fixture_after_publish", code: 1) }
+        }))
+        for failFile in [true, false] {
+            XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: vault, checkpoint: { phase in
+                switch phase {
+                case .fileSync where failFile: throw NSError(domain: "fixture_file_sync", code: 1)
+                case .directorySync where !failFile: throw NSError(domain: "fixture_directory_sync", code: 1)
+                default: break
+                }
+            }))
+        }
+        try ArchiveAssetCopier.copy(source: source, vaultURL: vault).validate()
+    }
+    func testNativeCopierRejectsBadCRCTruncatedTrailerAndConcatenatedPNGs() throws {
+        let good = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=")!
+        let badCRC = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4d8AAAAASUVORK5CYII=")!
+        for bytes in [badCRC, Data(good.dropLast(12)), good + good, good + Data([0])] {
+            let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+            var source: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+            let shot = source!.screenshots[0], owner = source!.inventory.access
+            source = nil; try write(root, shot.file.path, bytes)
+            source = try ArchiveSourceEligibility.inspect(access: owner)
+            XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source!, vaultURL: vault))
+        }
+    }
+
+    func testNativeCopyReuseRetriesCompletePublicationHierarchy() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        let source = try inspect(root)
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: vault, checkpoint: { phase in
+                if case .hierarchySync = phase { throw NSError(domain: "fixture_hierarchy_sync", code: 1) }
+            }))
+        }
+        try ArchiveAssetCopier.copy(source: source, vaultURL: vault).validate()
+    }
+    func testNativeImageIODestinationPNGPassesTheStrictCopyGate() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let context = try XCTUnwrap(CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(red: 0.2, green: 0.5, blue: 0.8, alpha: 1); context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let pixels = try XCTUnwrap(context.makeImage()), bytes = NSMutableData()
+        let encoder = try XCTUnwrap(CGImageDestinationCreateWithData(bytes, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(encoder, pixels, nil); XCTAssertTrue(CGImageDestinationFinalize(encoder))
+        var source: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+        let shot = source!.screenshots[0], owner = source!.inventory.access
+        source = nil; try write(root, shot.file.path, bytes as Data)
+        source = try ArchiveSourceEligibility.inspect(access: owner)
+        let catalog = try ArchiveAssetCopier.copy(source: source!, vaultURL: vault)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: catalog.images[0].copied.path)), bytes as Data)
     }
 
 }

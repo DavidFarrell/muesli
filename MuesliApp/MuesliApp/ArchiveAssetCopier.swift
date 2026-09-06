@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import CryptoKit
 import ImageIO
+import zlib
 
 /// Native-only copy provenance. Source bytes come exclusively from the closed
 /// source ledger reader; no receipt field or model output can choose an input.
@@ -11,7 +12,7 @@ nonisolated enum ArchiveAssetCopier {
         let message: String
         var errorDescription: String? { message }
     }
-    enum Checkpoint: Sendable { case beforeSourceRead, beforePublish, afterPublish }
+    enum Checkpoint: Sendable { case beforeSourceRead, beforePublish, afterPublish, fileSync, directorySync, hierarchySync }
     struct Identity: Equatable, Sendable {
         let device: UInt64; let inode: UInt64
         init(_ value: stat) { device = UInt64(UInt32(bitPattern: value.st_dev)); inode = value.st_ino }
@@ -65,7 +66,7 @@ nonisolated enum ArchiveAssetCopier {
         for shot in shots {
             try root.validate(); try checkpoint?(.beforeSourceRead)
             let bytes = try source.readScreenshot(shot)
-            try validatePNG(bytes)
+            try autoreleasepool { try validatePNG(bytes) }
             let sourceName = shot.sourceSessionID.uuidString.lowercased()
             let directory = try root.sourceDirectory(sourceName, create: true)
             let directoryIdentity = Identity(try state(directory.fileDescriptor))
@@ -78,7 +79,7 @@ nonisolated enum ArchiveAssetCopier {
             if status == 0 {
                 // Never overwrite even an unrelated same-name file. Exact bytes
                 // may be reused only after independent physical admission.
-                file = try openRegular(directory.fileDescriptor, finalName)
+                file = try openRegular(directory.fileDescriptor, finalName, writable: true)
                 try verify(file.fileDescriptor, record: record)
             } else {
                 try require(errno == ENOENT, "Existing copied image is unreadable.")
@@ -94,8 +95,11 @@ nonisolated enum ArchiveAssetCopier {
                 try require(renameatx_np(directory.fileDescriptor, temporary, directory.fileDescriptor, finalName, UInt32(RENAME_EXCL)) == 0,
                             "Copied-image destination appeared or publication failed. Existing files were preserved.")
                 try checkpoint?(.afterPublish)
-                try synchronize(directory.fileDescriptor)
             }
+            // Reuse may follow an interrupted publication or an external dirty
+            // exact copy. Byte equality is not a completed durability barrier.
+            try checkpoint?(.fileSync); try synchronize(file.fileDescriptor)
+            try checkpoint?(.directorySync); try synchronize(directory.fileDescriptor)
             try verify(file.fileDescriptor, record: record)
             try link(directory.fileDescriptor, finalName, file.fileDescriptor)
             try link(root.assets.fileDescriptor, sourceName, directory.fileDescriptor)
@@ -104,6 +108,8 @@ nonisolated enum ArchiveAssetCopier {
                 directory: directoryIdentity, file: Identity(try state(file.fileDescriptor))))
         }
         try source.inventory.access.validate()
+        try checkpoint?(.hierarchySync)
+        try root.synchronizePublications()
         let catalog = Catalog(root: root, copied: copied)
         try catalog.validate()
         return catalog
@@ -114,6 +120,7 @@ nonisolated enum ArchiveAssetCopier {
     private static func validatePNG(_ data: Data) throws {
         let signature = Data([137,80,78,71,13,10,26,10])
         try require(data.count <= 32 * 1024 * 1024 && data.starts(with: signature), "Indexed image is not a supported PNG.")
+        try validatePNGContainer(data)
         guard let image = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               CGImageSourceGetCount(image) == 1, CGImageSourceGetStatus(image) == .statusComplete,
               let properties = CGImageSourceCopyPropertiesAtIndex(image, 0, nil) as? [CFString: Any],
@@ -126,6 +133,94 @@ nonisolated enum ArchiveAssetCopier {
               decoded.width == w, decoded.height == h, CGImageSourceGetStatusAtIndex(image, 0) == .statusComplete else {
             throw Failure(message: "Indexed PNG could not be decoded completely.")
         }
+    }
+
+    /// ImageIO intentionally tolerates damaged files. Validate the bounded PNG
+    /// container, CRCs and exact non-interlaced zlib raster before asking it to
+    /// decode. Unsupported variants retain the original for explicit review.
+    private static func validatePNGContainer(_ data: Data) throws {
+        func u32(_ offset: Int) -> UInt32 {
+            (UInt32(data[offset]) << 24) | (UInt32(data[offset + 1]) << 16) | (UInt32(data[offset + 2]) << 8) | UInt32(data[offset + 3])
+        }
+        var cursor = 8, chunks = 0, width = 0, height = 0, depth = 0, color = 0, components = 0
+        var seenHeader = false, seenData = false, endedData = false, seenEnd = false, palette = 0
+        var seenAncillary: Set<String> = [], ancillaryBytes = 0
+        var compressed = Data()
+        while cursor < data.count {
+            try require(chunks < 65_536 && data.count - cursor >= 12, "PNG chunks are truncated or exceed their count limit.")
+            chunks += 1
+            let length = Int(u32(cursor)), typeStart = cursor + 4, content = cursor + 8
+            try require(length <= data.count - cursor - 12, "PNG chunk length exceeds the file.")
+            let typeBytes = data[typeStart..<content]
+            try require(typeBytes.allSatisfy { (65...90).contains($0) || (97...122).contains($0) }
+                        && (65...90).contains(data[typeStart + 2]), "PNG chunk type is invalid.")
+            let kind = String(decoding: typeBytes, as: UTF8.self)
+            let checksum = data.withUnsafeBytes { buffer -> UInt32 in
+                UInt32(crc32(0, buffer.baseAddress!.advanced(by: typeStart).assumingMemoryBound(to: Bytef.self), uInt(length + 4)))
+            }
+            try require(checksum == u32(content + length), "PNG chunk checksum is invalid.")
+            try require(seenHeader || kind == "IHDR", "PNG image header is not first.")
+            if seenData && kind != "IDAT" { endedData = true }
+            switch kind {
+            case "IHDR":
+                try require(!seenHeader && length == 13, "PNG header is duplicated or malformed.")
+                width = Int(u32(content)); height = Int(u32(content + 4)); depth = Int(data[content + 8]); color = Int(data[content + 9])
+                let depths: [Int: Set<Int>] = [0: [1,2,4,8,16], 2: [8,16], 3: [1,2,4,8], 4: [8,16], 6: [8,16]]
+                try require(width > 0 && height > 0 && width <= 8192 && height <= 8192 && width * height <= 16_000_000
+                            && depths[color]?.contains(depth) == true && data[content + 10] == 0 && data[content + 11] == 0
+                            && data[content + 12] == 0, "PNG header exceeds the supported non-interlaced image format or pixel budget.")
+                components = [0: 1, 2: 3, 3: 1, 4: 2, 6: 4][color]!
+                seenHeader = true
+            case "PLTE":
+                try require(palette == 0 && !seenData && [2,3,6].contains(color) && length > 0 && length <= 768 && length % 3 == 0,
+                            "PNG palette is malformed or misplaced.")
+                palette = length / 3
+                try require(color != 3 || palette <= (1 << depth), "PNG palette exceeds its indexed bit depth.")
+            case "IDAT":
+                try require(!endedData && (color != 3 || palette > 0), "PNG image data is interrupted or lacks its required palette.")
+                compressed.append(data[content..<(content + length)]); seenData = true
+            case "IEND":
+                try require(seenData && length == 0 && content + 4 == data.count, "PNG trailer is missing, malformed or followed by extra content.")
+                seenEnd = true
+            default:
+                try require(data[typeStart] & 0x20 != 0 && !["acTL", "fcTL", "fdAT", "zTXt", "iTXt"].contains(kind),
+                            "PNG uses unsupported critical, animation or compressed text chunks.")
+                try require(length <= 1024 * 1024 - ancillaryBytes, "PNG ancillary metadata exceeds its byte budget.")
+                ancillaryBytes += length
+                if kind != "tEXt" && kind != "sPLT" { try require(seenAncillary.insert(kind).inserted, "PNG ancillary chunk is duplicated.") }
+                if ["cHRM", "gAMA", "iCCP", "sBIT", "sRGB", "cICP", "mDCV", "cLLI"].contains(kind) {
+                    try require(!seenData && palette == 0, "PNG color metadata is misplaced.")
+                }
+                if ["tRNS", "bKGD", "hIST", "pHYs", "sPLT", "eXIf"].contains(kind) { try require(!seenData, "PNG metadata is misplaced after image data.") }
+                if kind == "tRNS" {
+                    try require((color == 0 && length == 2) || (color == 2 && length == 6)
+                                || (color == 3 && palette > 0 && length > 0 && length <= palette), "PNG transparency is invalid.")
+                }
+                if kind == "iCCP" {
+                    let profile = data[content..<(content + length)]
+                    guard let zero = profile.firstIndex(of: 0), zero > content, zero - content <= 79, zero + 2 < content + length,
+                          data[zero + 1] == 0 else { throw Failure(message: "PNG color profile is malformed.") }
+                    _ = try inflate(Data(data[(zero + 2)..<(content + length)]), limit: 4 * 1024 * 1024, exact: false)
+                }
+            }
+            cursor = content + length + 4
+        }
+        try require(seenHeader && seenData && seenEnd, "PNG is missing required image data or its trailer.")
+        let rowBytes = (width * components * depth + 7) / 8 + 1
+        let raster = try inflate(compressed, limit: rowBytes * height, exact: true)
+        for row in 0..<height { try require(raster[row * rowBytes] <= 4, "PNG contains an invalid scanline filter.") }
+    }
+    private static func inflate(_ compressed: Data, limit: Int, exact: Bool) throws -> Data {
+        try require(limit > 0 && limit <= 128 * 1024 * 1024, "PNG decompression exceeds its raster budget.")
+        var output = Data(count: limit), length = uLongf(limit), consumed = uLong(compressed.count)
+        let result = output.withUnsafeMutableBytes { destination in
+            compressed.withUnsafeBytes { input in
+                uncompress2(destination.baseAddress!.assumingMemoryBound(to: Bytef.self), &length,
+                            input.baseAddress?.assumingMemoryBound(to: Bytef.self), &consumed)
+            }
+        }
+        try require(result == Z_OK && consumed == compressed.count && (!exact || length == limit), "PNG compressed data is invalid, incomplete or exceeds its expected size.")
+        output.count = Int(length); return output
     }
 
     fileprivate final class Root: @unchecked Sendable {
@@ -176,6 +271,13 @@ nonisolated enum ArchiveAssetCopier {
             try link(vault, "MuesliAssets", assets.fileDescriptor); try privateMode(try state(assets.fileDescriptor))
             try link(assets.fileDescriptor, ".copy-owner.lock", lease.fileDescriptor); try regular(try state(lease.fileDescriptor))
         }
+        func synchronizePublications() throws {
+            try validate()
+            // A previous mkdir may have succeeded before its parent sync failed.
+            // Existing names therefore require the same bottom-up barriers.
+            try synchronize(assets.fileDescriptor); try synchronize(vault)
+            try validate()
+        }
         func sourceDirectory(_ name: String, create: Bool) throws -> FileHandle {
             try validate()
             let directory = try privateDirectory(assets.fileDescriptor, name, create: create)
@@ -199,8 +301,8 @@ nonisolated enum ArchiveAssetCopier {
     private static func privateMode(_ value: stat) throws {
         try require(value.st_mode & S_IFMT == S_IFDIR && value.st_uid == geteuid() && value.st_mode & 0o777 == 0o700, "Copied-image directories must be private and owned by this user.")
     }
-    private static func openRegular(_ parent: Int32, _ name: String) throws -> FileHandle {
-        let fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    private static func openRegular(_ parent: Int32, _ name: String, writable: Bool = false) throws -> FileHandle {
+        let fd = openat(parent, name, (writable ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         try require(fd >= 0, "Copied image is missing or unsafe.")
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         try regular(try state(fd)); try link(parent, name, fd); return handle
