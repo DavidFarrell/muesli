@@ -151,6 +151,10 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     private let processLock = NSLock()
     private let processQueue = DispatchQueue(label: "muesli.backend-native", qos: .utility)
     private let launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)?
+    private let xpcConfiguration: BackendXPCJobOwner.Configuration?
+    private let xpcSnapshotSHA256: String?
+    private var xpcOwner: BackendXPCJobOwner?
+    private var xpcSourceIdentity: MeetingFileAccess.Identity?
     private var attemptedStart = false
     private let exitCompletion = TaskCompletion()
     private let callbackQueue = DispatchQueue(label: "muesli.backend-exit", qos: .utility)
@@ -185,6 +189,8 @@ nonisolated final class BackendProcess: @unchecked Sendable {
             throw NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "Empty command"])
         }
         self.launchCheckpoint = launchCheckpoint
+        xpcConfiguration = nil
+        xpcSnapshotSHA256 = nil
         process.executableURL = URL(fileURLWithPath: command[0])
         process.arguments = Array(command.dropFirst())
         process.standardInput = stdinPipe
@@ -203,6 +209,26 @@ nonisolated final class BackendProcess: @unchecked Sendable {
         stdoutLines = output.lines
     }
 
+    /// The packaged transport preserves the same output, journal and writer
+    /// owners as the development process. Its source provider must already
+    /// own a read-only capability; it cannot display a picker during admission.
+    init(inference configuration: BackendXPCJobOwner.Configuration, sourceSnapshotSHA256: String? = nil,
+         eventJournalURL: URL? = nil, maximumStdoutLineBytes: Int = 4 * 1024 * 1024,
+         beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
+         launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil) throws {
+        self.launchCheckpoint = launchCheckpoint
+        xpcConfiguration = configuration
+        xpcSnapshotSHA256 = sourceSnapshotSHA256
+        output = BackendOutputReader(stdoutHandle: stdoutPipe.fileHandleForReading,
+                                     stderrHandle: stderrPipe.fileHandleForReading,
+                                     journalURL: eventJournalURL, maximumLineBytes: maximumStdoutLineBytes,
+                                     beforeJournalIO: beforeEventJournalIO)
+        stdoutLines = output.lines
+        xpcOwner = try BackendXPCJobOwner(configuration: configuration) { [weak self] completion in
+            self?.inferenceCompleted(completion)
+        }
+    }
+
     /// Pass only the fixed source identity contract to package initialization.
     /// Child descriptors are acquired independently; no parent fd inheritance
     /// or app lifetime assumption can authorize recreating a moved source.
@@ -216,6 +242,19 @@ nonisolated final class BackendProcess: @unchecked Sendable {
             throw BackendAdmissionOwner.Failure(message: "The backend ownership file changed before child launch.")
         }
         let identity = access.identity
+        if let xpcOwner {
+            let lease = MuesliSourceLease(directoryDevice: identity.directoryDevice,
+                directoryInode: identity.directoryInode, accessDevice: identity.lockDevice,
+                accessInode: identity.lockInode, backendDevice: UInt64(value.st_dev), backendInode: value.st_ino)
+            try processQueue.sync {
+                guard !processLock.withLock({ attemptedStart }) else {
+                    throw BackendAdmissionOwner.Failure(message: "Cannot change meeting identity after inference admission begins.")
+                }
+                try xpcOwner.installLease(lease.record)
+                processLock.withLock { xpcSourceIdentity = identity }
+            }
+            return
+        }
         let token: [String: Any] = [
             "version": 1,
             "folder": access.folderURL.path,
@@ -253,6 +292,14 @@ nonisolated final class BackendProcess: @unchecked Sendable {
             try checkAdmission()
             try output.prepare()
             try checkAdmission()
+            if let xpcOwner {
+                try launchCheckpoint?(.beforeRun)
+                try xpcOwner.start(input: stdinPipe.fileHandleForReading,
+                    output: stdoutPipe.fileHandleForWriting, diagnostics: stderrPipe.fileHandleForWriting,
+                    checkAdmission: checkAdmission, withNativeLaunch: withNativeLaunch)
+                try launchCheckpoint?(.afterRun)
+                return
+            }
             try processQueue.sync {
                 try checkAdmission()
                 process.terminationHandler = { [weak self] process in
@@ -290,7 +337,7 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     }
 
     @concurrent func waitForExit(timeoutSeconds: Double) async -> Int32? {
-        guard processLock.withLock({ started }) else { return nil }
+        guard hasStarted else { return nil }
         _ = await exitCompletion.wait(timeoutSeconds: timeoutSeconds)
         return processLock.withLock { exitStatus }
     }
@@ -298,16 +345,20 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     /// Control requests are queued even during Process.run. In particular a
     /// UI cancellation handler never waits behind the native launch operation.
     func terminate() {
+        if let xpcOwner { xpcOwner.cancel(); return }
         processQueue.async { [self] in if process.isRunning { process.terminate() } }
     }
 
-    var hasStarted: Bool { processLock.withLock { started } }
-    var isRunning: Bool { processLock.withLock { started && exitStatus == nil } }
+    var hasStarted: Bool { xpcOwner?.hasStarted ?? processLock.withLock { started } }
+    var isRunning: Bool { xpcOwner?.isRunning ?? processLock.withLock { started && exitStatus == nil } }
     /// Available only after the actual native termination callback. An exit
     /// wait timeout, model-written result or caller cancellation cannot mint it.
     func completionEvidence() -> BackendCompletionEvidence? { processLock.withLock { observedCompletion } }
 
     func forceKill() {
+        // Only the authenticated service owns its process group. Retain the
+        // original observer and source owner until that instance really exits.
+        if let xpcOwner { xpcOwner.cancel(); return }
         processQueue.async { [self] in
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
@@ -327,6 +378,47 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     /// method's return is NOT evidence that reading or journaling has finished.
     /// Stdin remains exclusively owned by FramedWriter, including on failure.
     func cleanup() { output.cleanup() }
+
+    private func inferenceCompleted(_ completion: BackendXPCJobOwner.Completion) {
+        let sourceIdentity = processLock.withLock { xpcSourceIdentity }
+        var evidence: BackendCompletionEvidence?
+        if completion.failure == nil, let configuration = xpcConfiguration, let sourceIdentity,
+           let registered = completion.registeredProcess, let request = completion.requestDigest,
+           let result = completion.operationResult {
+            let process = BackendCompletionEvidence.ProcessIdentity(pid: registered.pid,
+                startSeconds: registered.startSeconds, startMicroseconds: registered.startMicroseconds)
+            let binding = BackendCompletionEvidence.XPCBinding(jobID: completion.reservation.jobID,
+                instanceID: completion.reservation.instanceID, requestSHA256: Self.hex(request), process: process,
+                sourceIdentity: sourceIdentity, sourceSnapshotSHA256: xpcSnapshotSHA256,
+                operation: configuration.operation == .live ? .live : configuration.operation == .reprocess ? .reprocess : .preflight,
+                stream: configuration.streams == .both ? .both : configuration.streams == .system ? .system : .mic,
+                runtimeManifestSHA256: Self.hex(configuration.expectedRuntimeSHA256),
+                modelSetSHA256: Self.hex(configuration.expectedModelsSHA256))
+            let reply = BackendCompletionEvidence.XPCReply(jobID: result.jobID, instanceID: result.instanceID,
+                requestSHA256: Self.hex(result.requestDigest), operationStatus: result.operationStatus)
+            let termination = completion.termination
+            let kernel = BackendCompletionEvidence.KernelExit(process: .init(pid: termination.processIdentifier,
+                startSeconds: termination.startSeconds, startMicroseconds: termination.startMicroseconds),
+                rawWaitStatus: termination.rawWaitStatus,
+                observedExit: termination.eventFlags & UInt32(NOTE_EXIT) != 0,
+                observedExitStatus: termination.eventFlags & UInt32(NOTE_EXITSTATUS) != 0)
+            evidence = try? BackendCompletionEvidence(xpcBinding: binding, reply: reply, kernel: kernel)
+        }
+        // Existing callers consume operation success here. Actual normal exit
+        // 125 or SIGKILL remains separately recorded in native evidence; missing
+        // or mismatched evidence can never become successful completion.
+        let operationStatus = completion.operationResult?.operationStatus ?? 1
+        let status: Int32 = evidence != nil ? 0 : (operationStatus == 0 ? 1 : operationStatus)
+        let callback = processLock.withLock {
+            exitStatus = status
+            observedCompletion = evidence
+            return exitCallback
+        }
+        exitCompletion.markCompleted()
+        callbackQueue.async { callback?(status) }
+    }
+
+    private static func hex(_ value: Data) -> String { value.map { String(format: "%02x", $0) }.joined() }
 }
 
 // MARK: - Framed Writer
