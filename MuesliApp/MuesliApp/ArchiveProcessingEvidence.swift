@@ -18,10 +18,17 @@ nonisolated enum ArchiveProcessingEvidence {
         let manifestRevision: Int64
         let streams: [String: Stream]
     }
+    struct SpeakerKey: Hashable, Sendable {
+        let sourceSessionID: UUID
+        let stream: String
+        let speakerID: String
+    }
     struct Verified: Sendable {
         let sessionCount: Int
         let streamCount: Int
         let turnCount: Int
+        let sourceSessionIDs: Set<UUID>
+        let speakerKeys: Set<SpeakerKey>
     }
     /// The future native owner derives this hash from the corresponding
     /// retained PCM byte range plus its canonical WAV header, not the report.
@@ -103,6 +110,7 @@ nonisolated enum ArchiveProcessingEvidence {
         try require(near(result.duration, expectedDuration) && result.turns.count <= 1_000_000,
                     "Processing duration or turn count is invalid.")
         var turnCounts: [String: Int] = [:], speakers: Set<String> = []
+        var speakerKeys: Set<SpeakerKey> = []
         for turn in result.turns {
             guard let source = byID[turn.sourceSessionId], let stream = source.streams[turn.stream] else {
                 throw Failure(message: "A processed turn has no verified source and stream.")
@@ -115,6 +123,7 @@ nonisolated enum ArchiveProcessingEvidence {
                         "A processed turn has invalid time, speaker or text evidence.")
             turnCounts[key(source.id, turn.stream), default: 0] += 1
             speakers.insert(turn.speakerId)
+            speakerKeys.insert(SpeakerKey(sourceSessionID: UUID(uuidString: source.id)!, stream: turn.stream, speakerID: turn.speakerId))
         }
         try require(result.speakers.count == speakers.count && Set(result.speakers) == speakers,
                     "The processing speaker inventory does not match its turns.")
@@ -157,7 +166,8 @@ nonisolated enum ArchiveProcessingEvidence {
                         "Processing claims more turns than its actual returned words can supply.")
         }
         try require(!result.turns.isEmpty, "Sources without any processed turns require review before archiving.")
-        return Verified(sessionCount: expected.count, streamCount: entries.count, turnCount: result.turns.count)
+        return Verified(sessionCount: expected.count, streamCount: entries.count, turnCount: result.turns.count,
+                        sourceSessionIDs: expectedIDs, speakerKeys: speakerKeys)
     }
 
     private static func emptyRecovery(_ value: Recovery, outcome: String) throws {

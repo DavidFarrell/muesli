@@ -38,6 +38,7 @@
 				AECMode.swift,
 				ArchiveReceipt.swift,
 				ArchiveMoveJournal.swift,
+				ArchiveOutputEvidence.swift,
 				ArchiveProcessingEvidence.swift,
 				ArchiveSourceInventory.swift,
 				ArchiveSourceEligibility.swift,

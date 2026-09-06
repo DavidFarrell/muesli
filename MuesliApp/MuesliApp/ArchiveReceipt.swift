@@ -16,8 +16,8 @@ nonisolated struct ArchiveReceipt: Codable, Equatable, Sendable {
         let folder: String
         let directoryDevice: UInt64
         let directoryInode: UInt64
-        /// Exact, complete relative file inventory, excluding only protocol
-        /// lock files. Source semantic validation is a separate prerequisite.
+        /// Exact, complete relative file inventory, including protocol lock
+        /// files. Source semantic validation is a separate prerequisite.
         let files: [FileRecord]
         let sessionIDs: [String]
         enum CodingKeys: String, CodingKey {
@@ -177,6 +177,14 @@ nonisolated struct ArchiveReceipt: Codable, Equatable, Sendable {
     /// are checked again. The caller retains its actual operation across waits.
     static func readFingerprint(at url: URL, maximumBytes: Int64) throws -> FileRecord {
         try readSnapshot(at: url, maximumBytes: maximumBytes).record
+    }
+    /// Return bounded actual bytes only after rechecking their saved fingerprint.
+    /// Callers reserve aggregate budgets before invoking this reader.
+    static func readVerifiedData(_ record: FileRecord, maximumBytes: Int64) throws -> Data {
+        try require(record.bytes >= 0 && record.bytes <= maximumBytes, "Saved evidence exceeds its read budget.")
+        let snapshot = try readSnapshot(at: URL(fileURLWithPath: record.path), maximumBytes: maximumBytes, captureBytes: true)
+        try require(snapshot.record == record, "Saved evidence changed before validation.")
+        return snapshot.data
     }
     private struct FileIdentity: Hashable {
         let device: UInt64
