@@ -148,8 +148,12 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
         let expired = await lifecycle.waitForStartup(timeoutSeconds: 0.01); XCTAssertEqual(expired, .timedOut)
         XCTAssertFalse(registry.snapshot().pending.isEmpty)
         cleanup.open()
-        let actual = await lifecycle.waitForStartup(timeoutSeconds: 2); XCTAssertEqual(actual, .failed)
-        XCTAssertEqual(lifecycle.snapshot.phase, .failed); XCTAssertEqual(constructors.current, 1)
+        let actual = await lifecycle.waitForStartup(timeoutSeconds: 2)
+        // Cleanup can finish before this concurrent observer captures the slot.
+        // The persistent state must still report the actual startup failure.
+        XCTAssertTrue(actual == .failed || actual == .inactive)
+        XCTAssertEqual(lifecycle.snapshot.phase, .failed); XCTAssertEqual(lifecycle.snapshot.failure, .startupFailed)
+        XCTAssertEqual(constructors.current, 1)
         XCTAssertFalse(lifecycle.hasActualOwner); XCTAssertTrue(registry.snapshot().pending.isEmpty)
     }
     func testQueuedPublicationReadsLatestStateAfterMainActorWasBlocked() async throws {
@@ -276,6 +280,48 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
         XCTAssertEqual(ready, .listening)
         XCTAssertNil(lifecycle.snapshot.failure, "successful new admission must not keep the previous attempt's failure")
         XCTAssertEqual(attempts.current, 2)
+        try await stop(lifecycle, registry)
+    }
+
+    func testReceivedOldRequestCannotEnterReopenedSemanticOwnerAfterCancelQuit() async throws {
+        let registry = ShutdownWorkRegistry(), gate = Gate(), preparations = Count(), constructors = Count()
+        defer { gate.open() }
+        let directory = URL(fileURLWithPath: "/private/tmp/ar-" + UUID().uuidString.prefix(8))
+        XCTAssertEqual(mkdir(directory.path, 0o700), 0)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let semantic = Workflow(acquireWorkToken: { try registry.beginUserWork("semantic") },
+            acquireRetirementToken: { try registry.begin("retirement") }, prepare: { _, _ in
+                preparations.add(); return .init(context: 1, outputManifestPath: "/manifest")
+            }, finalize: { _, _, _ in .retained })
+        let lifecycle = ArchiveListenerLifecycle(workflow: semantic, shutdown: registry, factory: { closed in
+            let first = constructors.add() == 1
+            return try ArchiveWorkflowServer(directory: directory, onClosed: closed, handler: { request in
+                // Deterministic preemption at the real server dispatch boundary,
+                // after its last stop/path check but before semantic admission.
+                if first { gate.block() }
+                return semantic.handle(request)
+            })
+        })
+        lifecycle.enable(); try await until { lifecycle.snapshot.phase == .listening }
+        let client = Task.detached {
+            try? ArchiveWorkflowSocket.request(.begin(sourcePath: "/retired", vaultPath: "/vault"), directory: directory)
+        }
+        await entered(gate)
+        let quit = ApplicationQuitCoordinator(registry: registry)
+        var replies: [Bool] = []
+        quit.configure(accepted: { lifecycle.closeAdmissionForQuit() }, prepare: {}, cancelled: { lifecycle.reopenAfterCancelledQuit() })
+        quit.requestQuit { replies.append($0) }; quit.cancelQuit()
+        XCTAssertEqual(replies, [false])
+        XCTAssertEqual(lifecycle.snapshot.phase, .stopping)
+        XCTAssertEqual(preparations.current, 0)
+        gate.open(); _ = await client.value
+        try await until { lifecycle.snapshot.phase == .listening && constructors.current == 2 }
+        try await until { !semantic.hasActualWork }
+        XCTAssertEqual(preparations.current, 0, "An already-received request from the retired listener must not become new semantic work after Cancel Quit")
+        let current = try ArchiveWorkflowSocket.request(.begin(sourcePath: "/current", vaultPath: "/vault"), directory: directory)
+        XCTAssertNotNil(current.operationID)
+        try await until { !semantic.hasActualWork }
+        XCTAssertEqual(preparations.current, 1, "Only a request received by the new listener may start work")
         try await stop(lifecycle, registry)
     }
 

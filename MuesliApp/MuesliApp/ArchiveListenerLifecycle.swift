@@ -71,7 +71,6 @@ nonisolated final class ArchiveListenerLifecycle: @unchecked Sendable {
     @discardableResult func enable() -> Bool {
         let accepted = lock.withLock {
             guard shutdown.acceptsUserWork else { return false }
-            reopenSemanticAdmission()
             if !desiredEnabled { generation = UUID(); desiredEnabled = true; failure = nil }
             if active == nil { return startLocked() }
             return true
@@ -118,6 +117,11 @@ nonisolated final class ArchiveListenerLifecycle: @unchecked Sendable {
     private func startLocked() -> Bool {
         do {
             let token = try shutdown.beginUserWork("Starting archive command listener")
+            // active is nil only after the original listener and ALL accepted
+            // client/handler owners have actually closed. Cancel Quit may set
+            // desiredEnabled earlier, but cannot reopen semantic admission for
+            // an old request paused after its final socket stop/path check.
+            reopenSemanticAdmission()
             failure = nil
             generation = UUID()
             let attempt = Attempt(generation: generation, token: token)

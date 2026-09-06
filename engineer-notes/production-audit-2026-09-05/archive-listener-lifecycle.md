@@ -78,3 +78,11 @@ identified Release results are reported with the handoff rather than inferred
 from the test result. Separate root full-project qualification remains required.
 
 Native prepared-resource disposal is covered by [archive-context-retirement.md](archive-context-retirement.md); its required successor factory is separate from new-user admission.
+
+## Received request retirement correction
+
+Independent app-wiring review reproduced an already-received request paused at the real server handler boundary after its stop/path checks. Accepted Quit followed by immediate Cancel reopened the shared semantic owner while this old connection still existed; resuming the handler started one retired preparation (expected zero). Original evidence: `/private/tmp/muesli-app-wiring-stale-dispatch-repro.log`.
+
+Cancel now only coalesces desired listener state. Semantic admission reopens in `startLocked`, after successful new startup-token admission and after the original listener plus every accepted client/handler owner actually closes. The same semantic owner is retained. Existing finalization/disposal work stays retired and owned. A new listener request succeeds after actual closure; old received requests cannot enter during the close interval. The deterministic real temporary-socket regression retains its original failing assertion and additionally checks that the new listener can prepare once. No app launch, user support paths, hardware or Finder Trash operations are involved.
+
+Correction qualification: all 71 native wiring integration tests passed (`/private/tmp/muesli-app-wiring-reopen-final-tests.log`), including the unchanged retired-request assertion and a successful new-listener request. Complete actual application sources passed Swift 6/default-MainActor/complete-concurrency typechecking with warnings as errors (empty `/private/tmp/muesli-app-wiring-reopen-strict.log`). Optimized Release with `ENABLE_CODE_COVERAGE=NO` passed (`/private/tmp/muesli-app-wiring-reopen-release.log`). The existing throwing-constructor test now admits an already-closed observer returning inactive while still requiring persistent startup failure, one constructor, no original owner and an empty registry. Independent correction review remains required.
