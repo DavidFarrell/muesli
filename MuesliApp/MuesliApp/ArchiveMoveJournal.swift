@@ -23,7 +23,7 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
             case diagnosticCode = "diagnostic_code", observedAt = "observed_at"
         }
     }
-    enum Checkpoint: Sendable { case initialWrite, fileSync, publish, directorySync }
+    enum Checkpoint: Sendable { case initialWrite, fileSync, publish, exchange, directorySync }
     struct Failure: Error, LocalizedError, Sendable {
         let message: String
         var errorDescription: String? { message }
@@ -33,6 +33,9 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
     private let root: Root
     private let source: MeetingFileAccess
     private let marker: String
+    private let anchor: String
+    private let anchorHandle: FileHandle
+    private let anchorBytes: Data
     private var markerHandle: FileHandle
     private var currentBytes: Data
     private var current: Record
@@ -55,18 +58,29 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         try Self.require(!root.identities.contains(DirectoryIdentity(source.identity)), "Move intent must survive outside the source.")
         self.root = root; self.source = source; self.checkpoint = checkpoint
         marker = Self.marker(source.identity)
+        anchor = Self.anchor(source.identity)
+        try Self.requireAbsent(root.fd, marker)
+        try Self.requireAbsent(root.fd, anchor)
         current = Record(schemaVersion: 1, operationID: operationID, sourceFolder: source.folderURL.path,
             sourceIdentity: source.identity, sourceSessionIDs: sessionIDs, receipt: receipt, phase: .pending,
             destination: nil, diagnosticCode: nil, observedAt: Date().timeIntervalSince1970)
         currentBytes = try Self.encode(current)
+        anchorBytes = currentBytes
+        // The immutable anchor survives a removed/replaced mutable marker.
+        // It is never renamed or deleted by publication or reconciliation.
+        let anchorFD = openat(root.fd, anchor, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+        try Self.require(anchorFD >= 0, "Previous archive intent exists or its anchor cannot be created. Retain the source.")
+        anchorHandle = FileHandle(fileDescriptor: anchorFD, closeOnDealloc: true)
         let fd = openat(root.fd, marker, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
         try Self.require(fd >= 0, "A previous or uncertain archive marker exists, or intent cannot be created. Retain the source.")
         markerHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         // Never remove a partially written marker on failure. No capability is
         // returned until both file and parent-directory sync have succeeded.
         try checkpoint?(.initialWrite)
+        try Self.write(anchorBytes, fd: anchorFD)
         try Self.write(currentBytes, fd: fd)
         try checkpoint?(.fileSync)
+        try Self.require(fsync(anchorFD) == 0 && fcntl(anchorFD, F_FULLFSYNC) == 0, "Pending move anchor could not be synchronized.")
         try Self.require(fsync(fd) == 0 && fcntl(fd, F_FULLFSYNC) == 0, "Pending move intent could not be synchronized.")
         try checkpoint?(.directorySync)
         try Self.require(fsync(root.fd) == 0 && fcntl(root.fd, F_FULLFSYNC) == 0, "Pending move intent directory could not be synchronized.")
@@ -121,6 +135,20 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         let value = try JSONDecoder().decode(Record.self, from: bytes)
         try require(value.schemaVersion == 1 && value.sourceIdentity == sourceIdentity
                     && value.observedAt.isFinite, "Unsupported or mismatched archive outcome.")
+        let anchorName = anchor(sourceIdentity)
+        let anchorFD = openat(root.fd, anchorName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        try require(anchorFD >= 0, "Archive intent anchor is missing; retain and reconcile the source.")
+        let anchorHandle = FileHandle(fileDescriptor: anchorFD, closeOnDealloc: true)
+        let anchorBytes = try read(anchorHandle.fileDescriptor)
+        try ArchiveSourceJSON.check(anchorBytes)
+        let original = try JSONDecoder().decode(Record.self, from: anchorBytes)
+        try require(original.phase == .pending && original.destination == nil && original.diagnosticCode == nil
+                    && original.schemaVersion == value.schemaVersion && original.operationID == value.operationID
+                    && original.sourceFolder == value.sourceFolder && original.sourceIdentity == value.sourceIdentity
+                    && original.sourceSessionIDs == value.sourceSessionIDs && original.receipt == value.receipt
+                    && original.observedAt.isFinite, "Archive outcome does not match its immutable intent anchor.")
+        if value.phase == .pending { try require(value == original, "Pending archive marker was changed.") }
+        try link(root.fd, anchorName, anchorFD)
         try link(root.fd, name, fd); try root.validate()
         return value
     }
@@ -130,7 +158,10 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         try requireCurrent()
     }
     private func requireCurrent() throws {
-        try root.validate(); try Self.link(root.fd, marker, markerHandle.fileDescriptor)
+        try root.validate()
+        try Self.link(root.fd, anchor, anchorHandle.fileDescriptor)
+        try Self.require(try Self.read(anchorHandle.fileDescriptor) == anchorBytes, "The immutable archive intent anchor was changed.")
+        try Self.link(root.fd, marker, markerHandle.fileDescriptor)
         try Self.require(try Self.read(markerHandle.fileDescriptor) == currentBytes, "The durable move intent was changed or is incomplete.")
     }
     private func replace(phase: Phase, destination: String?, diagnosticCode: String?) throws {
@@ -148,10 +179,24 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         try Self.require(fsync(fd) == 0 && fcntl(fd, F_FULLFSYNC) == 0, "Archive outcome could not be synchronized.")
         try requireCurrent(); try Self.link(root.fd, temporary, fd)
         try checkpoint?(.publish)
-        try Self.require(renameat(root.fd, temporary, root.fd, marker) == 0, "Archive outcome could not be published.")
+        try requireCurrent(); try Self.link(root.fd, temporary, fd)
+        try checkpoint?(.exchange)
+        // Atomically retain whatever inode actually occupies the marker slot.
+        // A pre-rename check alone cannot prevent substitution in this window.
+        try Self.require(renameatx_np(root.fd, temporary, root.fd, marker, UInt32(RENAME_SWAP)) == 0,
+                         "Archive outcome could not be exchanged; immutable intent remains nonretryable.")
+        // On mismatch leave BOTH files exactly where the atomic swap put them.
+        // Never roll back over a concurrent writer or delete displaced evidence.
+        try Self.link(root.fd, temporary, markerHandle.fileDescriptor)
+        try Self.require(try Self.read(markerHandle.fileDescriptor) == currentBytes,
+                         "The displaced archive marker changed; reconcile both retained files.")
         try checkpoint?(.directorySync)
         try Self.require(fsync(root.fd) == 0 && fcntl(root.fd, F_FULLFSYNC) == 0, "Archive outcome directory synchronization failed; reconcile the actual outcome.")
         try root.validate(); try Self.link(root.fd, marker, fd)
+        try Self.link(root.fd, temporary, markerHandle.fileDescriptor)
+        try Self.require(try Self.read(markerHandle.fileDescriptor) == currentBytes, "Displaced archive evidence changed during publication.")
+        try Self.link(root.fd, anchor, anchorHandle.fileDescriptor)
+        try Self.require(try Self.read(anchorHandle.fileDescriptor) == anchorBytes, "Archive intent anchor changed during publication.")
         try Self.require(try Self.read(fd) == bytes, "Archive outcome changed during publication.")
         markerHandle = handle; current = value; currentBytes = bytes
     }
@@ -205,6 +250,12 @@ nonisolated final class ArchiveMoveJournal: @unchecked Sendable {
         static func validateLinks(_ links: [(Int32, String, Int32)]) throws {
             for (parent, name, child) in links { try link(parent, name, child) }
         }
+    }
+    private static func anchor(_ identity: MeetingFileAccess.Identity) -> String { "source-\(identity.directoryDevice)-\(identity.directoryInode).anchor.json" }
+    private static func requireAbsent(_ parent: Int32, _ name: String) throws {
+        var existing = stat()
+        let result = fstatat(parent, name, &existing, AT_SYMLINK_NOFOLLOW)
+        try require(result < 0 && errno == ENOENT, "Previous or uncertain archive intent exists. Retain the source; never retry automatically.")
     }
     private static func marker(_ identity: MeetingFileAccess.Identity) -> String { "source-\(identity.directoryDevice)-\(identity.directoryInode).json" }
     private static func encode(_ value: Record) throws -> Data {

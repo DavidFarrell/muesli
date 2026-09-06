@@ -137,4 +137,95 @@ final class ArchiveMoveJournalTests: XCTestCase {
         XCTAssertThrowsError(try ArchiveMoveJournal.inspect(rootURL: root, sourceIdentity: source.identity))
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
     }
+    func testIndependentMarkerSwapAtPublicationCannotBeSilentlyOverwritten() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        let marker = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).json")
+        let displaced = root.appendingPathComponent("previous-marker")
+        let otherEvidence = Data("replacement journal evidence".utf8)
+        let value = try journal(root, source) { point in
+            if case .publish = point {
+                try FileManager.default.moveItem(at: marker, to: displaced)
+                try otherEvidence.write(to: marker, options: .withoutOverwriting)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+            }
+        }
+        XCTAssertThrowsError(try value.recordUncertain(code: "native_move_failed"), "Changed marker identity at publication must not report success")
+        XCTAssertEqual(try Data(contentsOf: marker), otherEvidence, "Do not erase evidence placed at the changed marker path")
+    }
+
+    func testAtomicExchangeRetainsSubstitutedEvidenceAndNeverReportsSuccess() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        let marker = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).json")
+        let displaced = root.appendingPathComponent("original-before-exchange")
+        let unexpected = Data("unexpected evidence at the actual atomic boundary".utf8)
+        var value: ArchiveMoveJournal? = try journal(root, source) { point in
+            if case .exchange = point {
+                try FileManager.default.moveItem(at: marker, to: displaced)
+                try unexpected.write(to: marker, options: .withoutOverwriting)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+            }
+        }
+        XCTAssertThrowsError(try value!.recordUncertain(code: "native_move_failed"))
+        XCTAssertEqual(value!.record.phase, .pending)
+        let retained = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".outcome-") }
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(retained.first)), unexpected)
+        XCTAssertThrowsError(try value!.recordUncertain(code: "retry"))
+        value = nil
+        XCTAssertThrowsError(try journal(root, source))
+    }
+    func testRemovedMarkerAtExchangeLeavesAnchorAndBlocksNextInitializer() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        let marker = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).json")
+        var value: ArchiveMoveJournal? = try journal(root, source) { point in
+            if case .exchange = point { try FileManager.default.removeItem(at: marker) }
+        }
+        XCTAssertThrowsError(try value!.recordUncertain(code: "native_move_failed"))
+        XCTAssertEqual(value!.record.phase, .pending)
+        value = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertThrowsError(try journal(root, source), "Missing mutable marker cannot erase durable intent")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "Rejected retry cannot recreate the marker")
+        XCTAssertThrowsError(try ArchiveMoveJournal.inspect(rootURL: root, sourceIdentity: source.identity))
+    }
+    func testAnchorWithoutMarkerStillRefusesAfterInitialWriteFailure() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        XCTAssertThrowsError(try journal(root, source) { if case .initialWrite = $0 { throw CocoaError(.fileWriteUnknown) } })
+        let marker = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).json")
+        try FileManager.default.removeItem(at: marker)
+        XCTAssertThrowsError(try journal(root, source))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+    func testChangedImmutableAnchorRefusesTerminalPublicationAndInspection() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        var value: ArchiveMoveJournal? = try journal(root, source)
+        let anchor = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).anchor.json")
+        try Data("unexpected anchor".utf8).write(to: anchor)
+        XCTAssertThrowsError(try value!.recordUncertain(code: "native_move_failed"))
+        value = nil
+        XCTAssertThrowsError(try ArchiveMoveJournal.inspect(rootURL: root, sourceIdentity: source.identity))
+        XCTAssertThrowsError(try journal(root, source))
+    }
+
+    func testAtomicExchangeRejectsInPlaceMutationOfOriginalMarkerBytes() throws {
+        let root = try directory(), source = try MeetingFileAccess.acquire(in: directory(), mode: .archive)
+        let marker = root.appendingPathComponent("source-\(source.identity.directoryDevice)-\(source.identity.directoryInode).json")
+        let unexpected = Data("changed original marker bytes".utf8)
+        let value = try journal(root, source) { point in
+            if case .exchange = point {
+                let handle = try FileHandle(forWritingTo: marker)
+                defer { try? handle.close() }
+                try handle.truncate(atOffset: 0)
+                try handle.write(contentsOf: unexpected)
+            }
+        }
+        XCTAssertThrowsError(try value.recordUncertain(code: "native_move_failed"))
+        XCTAssertEqual(value.record.phase, .pending)
+        let retained = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".outcome-") }
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(retained.first)), unexpected)
+    }
+
 }
