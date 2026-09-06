@@ -545,6 +545,54 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
         XCTAssertEqual(value, 1)
     }
 
+    nonisolated private final class IndependentLateValidationProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls = 0
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        func next() -> Int { lock.withLock { calls += 1; return calls } }
+    }
+
+    func testIndependentLateValidationTimeoutRetainsTransactionAndNeverLaunchesChild() async throws {
+        let f = try setup(), probe = IndependentLateValidationProbe(), closed = TaskCompletion()
+        let marker = f.root.appendingPathComponent("independent-child-started")
+        defer { probe.release.signal() }
+        let original = ArchiveSemanticAdapter.Original(try ArchiveSourceEligibility.inspect(access: MeetingFileAccess.acquire(in: f.source, mode: .archive)))
+        let task = Task.detached {
+            do {
+                _ = try await BatchRediarizer(timeoutSeconds: 0.5).runCommand(
+                    ["/bin/sh", "-c", "printf launched > \"$1\"; cat \"$2\"", "fixture", marker.path,
+                     f.root.appendingPathComponent("synthetic-event.jsonl").path], backendRoot: f.root,
+                    sourceMeetingDirectory: f.source, collectProcessingEvidence: true,
+                    expectedMeetingIdentity: original.identity, validateSource: { context in
+                        guard context.access.identity == original.identity else { throw MeetingFileAccess.Failure.changed }
+                        try original.compare(ArchiveSourceInventory.captureForProcessing(context: context))
+                        if probe.next() == 3 {
+                            probe.entered.signal()
+                            XCTAssertEqual(probe.release.wait(timeout: .now() + 8), .success)
+                        }
+                    }, onResourcesClosed: { closed.markCompleted() })
+                return "unexpected success"
+            } catch { return error.localizedDescription }
+        }
+        XCTAssertEqual(probe.entered.wait(timeout: .now() + 3), .success)
+        let failure = await task.value
+        XCTAssertTrue(failure.contains("startup timed out"), failure)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertThrowsError(try TranscriptPersistenceStore.shared.start(in: f.source) { _ in 1 })
+        do {
+            let access = try MeetingFileAccess.acquire(in: f.source)
+            XCTAssertThrowsError(try access.transaction())
+        }
+        probe.release.signal()
+        let actualClose = await closed.wait(timeoutSeconds: 3)
+        XCTAssertEqual(actualClose, .completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "Retired launch cannot run after late validation returns")
+        let next = try TranscriptPersistenceStore.shared.start(in: f.source, purpose: .previewRead) { _ in 1 }
+        let value = try await next.value(timeoutSeconds: 3)
+        XCTAssertEqual(value, 1)
+    }
+
     func testArchiveSnapshotRefusesActualPendingRecoveryWithoutChangingItsFiles() async throws {
         let f = try setup(), metadataURL = f.source.appendingPathComponent("meeting.json")
         let oldMetadata = try Data(contentsOf: metadataURL)
