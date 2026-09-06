@@ -31,10 +31,11 @@ nonisolated struct BatchSourceSnapshot: Sendable, Equatable {
     /// all I/O. A deadline abandons the admission, never this actual worker.
     static func prepare(in folder: URL, stream: BatchRediarizer.Stream,
                         store: TranscriptPersistenceStore = .shared,
+                        purpose: TranscriptPersistenceStore.Purpose = .saveOrRecovery,
                         beforeRead: @escaping @Sendable () throws -> Void = {},
                         validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { _ in }) throws -> Self {
         let finished = DispatchSemaphore(value: 0)
-        let operation = try store.start(in: folder, onCompletion: { _ in finished.signal() }) { context in
+        let operation = try store.start(in: folder, purpose: purpose, onCompletion: { _ in finished.signal() }) { context in
             try beforeRead()
             try validateSource(context)
             let snapshot = try capture(context: context, stream: stream)

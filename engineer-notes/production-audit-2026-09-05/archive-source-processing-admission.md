@@ -14,7 +14,10 @@ identity before source snapshot, backend factory or child work. Under the actual
 folder transaction, the validator checks identity before reading descendants,
 then compares the original complete file/hash list, empty directories and
 per-entry physical identities. The same predicate runs before and after Batch's
-source snapshot. A completed appended Resume, substituted PCM, extra empty
+source snapshot. Archive expected-source snapshots use the read-only purpose
+from the first transaction onward; a newly pending save is refused without
+repairing canonical files or removing its journal. Ordinary reprocess keeps its
+existing explicit recovery behavior. A completed appended Resume, substituted PCM, extra empty
 directory or replaced lock must fail before backend construction.
 
 `ArchiveSourceInventory.captureForProcessing(context:)` is a read-only API that
@@ -60,3 +63,9 @@ Independent red evidence: `/private/tmp/muesli-adapter-independent-prelaunch-rep
 Strict production/DEBUG and identified no-coverage Release outcomes are recorded
 with the frozen handoff. No installed app, user source, hardware or Trash action
 is exercised.
+
+A follow-up actual interrupted-commit/failed-rollback regression demonstrated
+that the ordinary initial snapshot purpose restored canonical metadata and
+deleted its pending journal before rejection. The archive-only read purpose
+corrects that behavior and retains both pending bytes and originals untouched.
+Red evidence: `/private/tmp/muesli-archive-admission-recovery-red.log`.

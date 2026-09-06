@@ -210,7 +210,8 @@ actor BatchRediarizer {
         let environment = { @Sendable in Self.backendEnvironment(root: backendRoot) }
         return try await execute(protecting: meetingDirectory, expectedMeetingIdentity: expectedMeetingIdentity, validateSource: validateSource,
             evidenceByteLimit: collectProcessingEvidence ? 64 * 1024 * 1024 : nil, progressHandler: progressHandler) { accumulator in
-            accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream, validateSource: validateSource))
+            accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream,
+                purpose: expectedMeetingIdentity == nil ? .saveOrRecovery : .previewRead, validateSource: validateSource))
             let build: (String) throws -> BackendProcess = { python in
                 let command = [python, "-m", "diarise_transcribe.reprocess", meetingDirectory.path, "--stream", stream.rawValue, "--meeting-lease-required"]
                 let backend = try BackendProcess(command: command, workingDirectory: backendRoot, environment: environment())
@@ -240,7 +241,7 @@ actor BatchRediarizer {
             evidenceByteLimit: collectProcessingEvidence ? evidenceByteLimit : nil, progressHandler: progressHandler) { accumulator in
             if let sourceMeetingDirectory {
                 accumulator.setSourceSnapshot(try BatchSourceSnapshot.prepare(in: sourceMeetingDirectory, stream: stream,
-                    beforeRead: beforeSourceSnapshot, validateSource: validateSource))
+                    purpose: expectedMeetingIdentity == nil ? .saveOrRecovery : .previewRead, beforeRead: beforeSourceSnapshot, validateSource: validateSource))
             }
             let backend = try BackendProcess(command: command, workingDirectory: backendRoot,
                 environment: Self.backendEnvironment(root: backendRoot), eventJournalURL: eventJournalURL,

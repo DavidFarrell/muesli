@@ -545,4 +545,32 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
         XCTAssertEqual(value, 1)
     }
 
+    func testArchiveSnapshotRefusesActualPendingRecoveryWithoutChangingItsFiles() async throws {
+        let f = try setup(), metadataURL = f.source.appendingPathComponent("meeting.json")
+        let oldMetadata = try Data(contentsOf: metadataURL)
+        var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: oldMetadata) as? [String: Any])
+        metadata["title"] = "Unresolved latest title"
+        let unresolvedMetadata = try JSONSerialization.data(withJSONObject: metadata, options: .sortedKeys)
+        let adapter = f.adapter { checkpoint in
+            guard case .beforeProcessing = checkpoint else { return }
+            let finished = DispatchSemaphore(value: 0)
+            let store = TranscriptPersistenceStore(shutdown: ShutdownWorkRegistry()) { step in
+                if step == .replace("transcript.txt") || step == .restore("meeting.json") { throw POSIXError(.EIO) }
+            }
+            let operation = try store.start(in: f.source, onCompletion: { _ in finished.signal() }) { context in
+                try context.commit(files: ["meeting.json": unresolvedMetadata, "transcript.txt": Data("unresolved".utf8)])
+            }
+            XCTAssertEqual(finished.wait(timeout: .now() + 3), .success)
+            XCTAssertThrowsError(try operation.completedValue())
+        }
+        do { _ = try await adapter.prepare(f.begin, operationID: UUID()); XCTFail("Unresolved save must refuse archive processing") } catch {}
+        let pending = f.source.appendingPathComponent(TranscriptPersistenceStore.journalDirectoryName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pending.path), "Archive processing cannot implicitly recover and delete the original pending transaction")
+        XCTAssertEqual(try Data(contentsOf: metadataURL), unresolvedMetadata)
+        if FileManager.default.fileExists(atPath: pending.path) {
+            XCTAssertEqual(try Data(contentsOf: pending.appendingPathComponent("old-meeting.json")), oldMetadata)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+    }
+
 }
