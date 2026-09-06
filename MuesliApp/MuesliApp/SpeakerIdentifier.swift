@@ -130,9 +130,13 @@ actor SpeakerIdentifier {
 
     private struct ScreenshotCandidate {
         let image: MeetingScreenshotInput.Image
-        var url: URL { image.url }
-        var timestamp: Double? { image.timestamp }
-        var name: String { image.url.lastPathComponent }
+        let url: URL
+        let timestamp: Double?
+        let name: String
+        init(image: MeetingScreenshotInput.Image) {
+            self.image = image
+            url = image.url; timestamp = image.timestamp; name = image.url.lastPathComponent
+        }
     }
 
     func identifySpeakers(
