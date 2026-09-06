@@ -573,4 +573,57 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
     }
 
+    func testIndependentForeignStageOccupantSurvivesExclusiveRenameRefusal() async throws {
+        let f = try setup()
+        let adapter = f.adapter { if case .beforeStagingRename = $0 {
+            let stage = try FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil)
+                .first { $0.lastPathComponent.hasPrefix(".muesli-archive-") }!
+            let occupant = stage.appendingPathComponent("source")
+            try FileManager.default.createDirectory(at: occupant, withIntermediateDirectories: false)
+            try Data("foreign occupant".utf8).write(to: occupant.appendingPathComponent("keep.txt"))
+        } }, id = UUID()
+        let p = try await adapter.prepare(f.begin, operationID: id).context
+        _ = try saveReceipt(f, p)
+        let result = await adapter.finalize(p, receiptPath: p.bundle.receiptPath, operationID: id)
+        XCTAssertEqual(status(result), "uncertain")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: f.source.appendingPathComponent("audio/mic.pcm").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+        let intent = try ArchiveMoveJournal.inspect(rootURL: f.journal, sourceIdentity: p.original.identity)
+        let staged = URL(fileURLWithPath: try XCTUnwrap(intent.plannedStagingPath))
+        XCTAssertEqual(try Data(contentsOf: staged.appendingPathComponent("keep.txt")), Data("foreign occupant".utf8))
+    }
+    func testIndependentSameByteSnapshotManifestSwapAfterPendingStopsMover() async throws {
+        let f = try setup()
+        let adapter = f.adapter { if case .beforeTrash = $0 {
+            let bundle = try FileManager.default.contentsOfDirectory(at: f.output, includingPropertiesForKeys: nil)[0]
+            let snapshot = try FileManager.default.contentsOfDirectory(at: bundle, includingPropertiesForKeys: nil)
+                .first { $0.lastPathComponent.hasPrefix("validation-") }!
+            let file = snapshot.appendingPathComponent("snapshot.json"), bytes = try Data(contentsOf: file)
+            try FileManager.default.moveItem(at: file, to: f.root.appendingPathComponent("original-snapshot.json"))
+            try bytes.write(to: file)
+        } }, id = UUID()
+        let p = try await adapter.prepare(f.begin, operationID: id).context
+        _ = try saveReceipt(f, p)
+        let result = await adapter.finalize(p, receiptPath: p.bundle.receiptPath, operationID: id)
+        XCTAssertEqual(status(result), "uncertain")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+        let intent = try ArchiveMoveJournal.inspect(rootURL: f.journal, sourceIdentity: p.original.identity)
+        XCTAssertNotNil(intent.validationSnapshot)
+        let staged = URL(fileURLWithPath: try XCTUnwrap(intent.plannedStagingPath))
+        XCTAssertEqual(try Data(contentsOf: staged.appendingPathComponent("audio/mic.pcm")), Data(repeating: 1, count: 320))
+    }
+    func testIndependentFailureAfterActualMoveRemainsNonretryableWithOriginalAtReturnedDestination() async throws {
+        let f = try setup(), adapter = f.adapter { if case .afterTrash = $0 { throw CocoaError(.fileWriteUnknown) } }, id = UUID()
+        let p = try await adapter.prepare(f.begin, operationID: id).context
+        _ = try saveReceipt(f, p)
+        let result = await adapter.finalize(p, receiptPath: p.bundle.receiptPath, operationID: id)
+        XCTAssertEqual(status(result), "uncertain")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.path))
+        XCTAssertEqual(try Data(contentsOf: f.destination.appendingPathComponent("audio/mic.pcm")), Data(repeating: 1, count: 320))
+        XCTAssertThrowsError(try ArchiveMoveJournal.requireNoPreviousIntent(rootURL: f.journal, sourceIdentity: p.original.identity))
+        let again = await adapter.finalize(p, receiptPath: p.bundle.receiptPath, operationID: id)
+        XCTAssertEqual(status(again), "uncertain")
+        XCTAssertEqual(try Data(contentsOf: f.destination.appendingPathComponent("audio/mic.pcm")), Data(repeating: 1, count: 320))
+    }
+
 }
