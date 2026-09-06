@@ -60,7 +60,7 @@ def main():
     protocol = output / "FrameSending.swift"
     protocol.write_text(original_protocol.read_text().split("/// Abstraction over a monotonic time source")[0])
     host = output / "BackendProcessFixtureHost"
-    swift_sources = [*[app_sources / name for name in sources], src / "BackendXPCJobOwner.swift",
+    swift_sources = [*[app_sources / name for name in sources], src / "BackendXPCJobOwner.swift", src / "SourceCapabilityOwner.swift",
                      src / "tests/BackendProcessFixtureHost.swift"]
     run(["xcrun", "swiftc", "-parse-as-library", "-swift-version", "6", "-default-isolation", "MainActor",
          "-strict-concurrency=complete", "-warnings-as-errors", "-target", "arm64-apple-macos26.2",
@@ -68,7 +68,7 @@ def main():
          *(["-O", "-whole-module-optimization"] if args.optimized else ["-Onone", "-D", "DEBUG"]),
          protocol, *swift_sources, *objects, "-framework", "Foundation", "-framework", "Security", "-o", host])
     inputs += [*swift_sources, original_protocol, src / "tests/ClientFixtureService.m",
-               src / "InferenceProtocolV2.h", src / "SourceLeaseAdmission.h",
+               src / "InferenceProtocolV2.h", src / "SourceLeaseAdmission.h", src.parent / "source-access-service/SourceAccessProtocol.h",
                src / "MuesliNativeProcessObserver.h", src / "ClientProbe-Bridging.h", Path(__file__).resolve()]
     input_hashes = {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
     (output / "source-inputs.json").write_text(json.dumps(input_hashes, indent=2, sort_keys=True))

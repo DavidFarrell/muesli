@@ -1,8 +1,6 @@
 import Foundation
 
-/// The fixed local service transport. This prototype is deliberately outside
-/// the application target until the current service and native observer pass
-/// their independent qualification. It never launches a command or passes an
+/// The fixed local service transport. It never launches a command or passes an
 /// environment, model path, or import path to the service.
 nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
     struct Failure: LocalizedError, Sendable {
@@ -40,6 +38,27 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
         let expectedRuntimeSHA256: Data
         let expectedModelsSHA256: Data
         let sourceBookmark: @Sendable () throws -> Data
+        let sourceCapabilityOwner: SourceCapabilityOwner?
+        let sourceFolder: URL?
+
+        /// Model-free fixtures can supply their already-scoped generated source.
+        /// Application factories use the session-owner initializer below.
+        init(operation: MuesliInferenceOperation, streams: MuesliInferenceStreams, liveSource: MuesliLiveSource?,
+             expectedRuntimeSHA256: Data, expectedModelsSHA256: Data,
+             sourceBookmark: @escaping @Sendable () throws -> Data) {
+            self.operation = operation; self.streams = streams; self.liveSource = liveSource
+            self.expectedRuntimeSHA256 = expectedRuntimeSHA256; self.expectedModelsSHA256 = expectedModelsSHA256
+            self.sourceBookmark = sourceBookmark; sourceCapabilityOwner = nil; sourceFolder = nil
+        }
+
+        init(operation: MuesliInferenceOperation, streams: MuesliInferenceStreams, liveSource: MuesliLiveSource?,
+             expectedRuntimeSHA256: Data, expectedModelsSHA256: Data,
+             sourceCapabilityOwner: SourceCapabilityOwner, sourceFolder: URL) {
+            self.operation = operation; self.streams = streams; self.liveSource = liveSource
+            self.expectedRuntimeSHA256 = expectedRuntimeSHA256; self.expectedModelsSHA256 = expectedModelsSHA256
+            self.sourceCapabilityOwner = sourceCapabilityOwner; self.sourceFolder = sourceFolder
+            sourceBookmark = { throw Failure(message: "Application source access requires its original read-only capability owner.") }
+        }
     }
 
     struct Completion: @unchecked Sendable {
@@ -68,6 +87,7 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
     private var termination: MuesliProcessTermination?
     private var requestDigest: Data?
     private var sourceSent = false
+    private var sourceCapability: SourceCapabilityOwner.JobToken?
     private var accepted = false
     private var result: Result?
     private var failure: String?
@@ -156,8 +176,26 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
                 throw Failure(message: "Inference reservation belongs to a different process.")
             }
             try ensureAdmission(checkAdmission)
-            let bookmark = try configuration.sourceBookmark()
             let sourceRecord = sourceLease.record
+            let bookmark: Data
+            if let capabilityOwner = configuration.sourceCapabilityOwner, let sourceFolder = configuration.sourceFolder {
+                let process = SourceCapabilityOwner.ProcessIdentity(pid: native.processIdentifier,
+                    startSeconds: native.startSeconds, startMicroseconds: native.startMicroseconds)
+                let token = try capabilityOwner.acquire(meetingFolder: sourceFolder, leaseRecord: sourceRecord,
+                    jobID: jobID, process: process, onRegistered: { [self] token in
+                        let alreadyTerminated = lock.withLock {
+                            sourceCapability = token
+                            return termination
+                        }
+                        if let alreadyTerminated {
+                            do { try token.observedTermination(alreadyTerminated) }
+                            catch { observationFailed(error.localizedDescription) }
+                        }
+                    }, onCapabilityLost: { [weak self] message in self?.sourceCapabilityFailed(message) })
+                bookmark = try token.bookmark
+            } else {
+                bookmark = try configuration.sourceBookmark()
+            }
             guard !bookmark.isEmpty, bookmark.count <= 1024 * 1024,
                   let digest = MuesliInferenceRequestDigest(configuration.operation, reserved.instanceID,
                     jobID, bookmark, sourceLease, configuration.liveSource, configuration.streams) else {
@@ -321,13 +359,17 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
     }
 
     private func observedTermination(_ value: MuesliProcessTermination) {
-        let close = lock.withLock {
+        let (close, capability) = lock.withLock {
             termination = value
             let handles = serviceEnds
             serviceEnds = []
-            return handles
+            return (handles, sourceCapability)
         }
         for handle in close { try? handle.close() }
+        if let capability {
+            do { try capability.observedTermination(value) }
+            catch { observationFailed(error.localizedDescription) }
+        }
         changed.signal()
         // A queued operation reply may follow the kernel event. A finite wait
         // can settle missing evidence as failure, never as successful exit.
@@ -343,6 +385,14 @@ nonisolated final class BackendXPCJobOwner: NSObject, @unchecked Sendable {
         changed.signal()
         cancel()
         // Keep the owner retained. Observation failure is not actual death.
+    }
+
+    private func sourceCapabilityFailed(_ message: String) {
+        lock.withLock { if !completionDelivered && failure == nil { failure = message } }
+        changed.signal()
+        cancel()
+        // The registered token and original source owner remain retained until
+        // the independent kernel observer reports this exact process instance.
     }
 
     private func transportFailed(_ message: String) {

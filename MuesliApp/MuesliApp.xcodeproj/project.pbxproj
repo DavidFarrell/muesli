@@ -24,6 +24,8 @@
 		D12800000000000000000070 /* MuesliNativeProcessObserver.m in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000003; };
 		D12800000000000000000071 /* SourceLeaseAdmission.m in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000004; };
 		D12800000000000000000072 /* Security.framework in Test Frameworks */ = {isa = PBXBuildFile; fileRef = D12800000000000000000008; };
+        D12900000000000000000002 = {isa = PBXBuildFile; fileRef = D12900000000000000000001; };
+        D12900000000000000000003 = {isa = PBXBuildFile; fileRef = D12900000000000000000001; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,12 +56,15 @@
 		D12800000000000000000006 /* MuesliNativeProcessObserver.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MuesliNativeProcessObserver.h; sourceTree = "<group>"; };
 		D12800000000000000000007 /* SourceLeaseAdmission.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SourceLeaseAdmission.h; sourceTree = "<group>"; };
 		D12800000000000000000008 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+        D12900000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceCapabilityOwner.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		AA000001000000000000000B /* Exceptions for "MuesliApp" folder in "MuesliAppTests" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+                LocalInferenceSession.swift,
+                PackagedInferenceRuntime.swift,
                 ShutdownWorkRegistry.swift,
                 ApplicationQuitCoordinator.swift,
                 ArchiveListenerLifecycle.swift,
@@ -205,7 +210,7 @@
 			sourceTree = "<group>";
 		};
 		AC1100000000000000000014 /* ArchiveCLI */ = {isa = PBXGroup; children = (AC1100000000000000000001, AC1100000000000000000002, AC1100000000000000000003,); name = ArchiveCLI; sourceTree = "<group>"; };
-		D12800000000000000000063 /* Inference transport */ = {isa = PBXGroup; children = (D12800000000000000000001, D12800000000000000000002, D12800000000000000000003, D12800000000000000000004, D12800000000000000000005, D12800000000000000000006, D12800000000000000000007, D12800000000000000000008,); name = "Inference transport"; path = "../release/inference-service"; sourceTree = SOURCE_ROOT; };
+		D12800000000000000000063 /* Inference transport */ = {isa = PBXGroup; children = (D12900000000000000000001, D12800000000000000000001, D12800000000000000000002, D12800000000000000000003, D12800000000000000000004, D12800000000000000000005, D12800000000000000000006, D12800000000000000000007, D12800000000000000000008,); name = "Inference transport"; path = "../release/inference-service"; sourceTree = SOURCE_ROOT; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -341,6 +346,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12900000000000000000002,
                 D12800000000000000000064,
                 D12800000000000000000065,
                 D12800000000000000000066,
@@ -353,6 +359,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12900000000000000000003,
                 D1280000000000000000006E,
                 D1280000000000000000006F,
                 D12800000000000000000070,

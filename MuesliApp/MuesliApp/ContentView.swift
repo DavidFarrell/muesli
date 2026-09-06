@@ -325,6 +325,7 @@ struct NewMeetingView: View {
                 .padding(8)
             }
 
+            #if DEBUG
             GroupBox("Backend") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.backendFolderPath)
@@ -363,6 +364,24 @@ struct NewMeetingView: View {
                 }
                 .padding(8)
             }
+
+            #else
+            GroupBox("Local transcription") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.localTranscriptionReady ? "Ready for this session." : "Enable transcription to read your meeting recordings locally.")
+                    if let error = model.backendFolderError {
+                        Text(error).font(.footnote).foregroundStyle(.red)
+                    }
+                    Button(model.isPreparingLocalTranscription ? "Preparing…" : "Enable local transcription") {
+                        Task { await model.enableLocalTranscription() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isPreparingLocalTranscription || model.localTranscriptionReady)
+                    Text("Choose the Muesli Meetings folder when prompted. Audio processing stays on this Mac.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }.padding(8)
+            }
+            #endif
 
             GroupBox("Merge integration") {
                 VStack(alignment: .leading, spacing: 8) {

@@ -65,7 +65,12 @@ static NSDictionary *NetworkAttempt(int family, int type, unsigned short port) {
     _exit(126);
 }
 - (BOOL)listener:(NSXPCListener *)listener shouldAcceptNewConnection:(NSXPCConnection *)connection {
-    [connection setCodeSigningRequirement:@"anchor apple generic and certificate leaf[subject.OU] = \"" MUESLI_SIGNING_TEAM @"\" and (identifier \"paidiaconsulting.MuesliApp.InferenceProof\" or identifier \"paidiaconsulting.MuesliApp\")"];
+    (void)listener;
+#if MUESLI_INFERENCE_PROOF_BUILD
+    [connection setCodeSigningRequirement:@"anchor apple generic and certificate leaf[subject.OU] = \"" MUESLI_SIGNING_TEAM @"\" and identifier \"paidiaconsulting.MuesliApp.InferenceProof\""];
+#else
+    [connection setCodeSigningRequirement:@"anchor apple generic and certificate leaf[subject.OU] = \"" MUESLI_SIGNING_TEAM @"\" and identifier \"paidiaconsulting.MuesliApp\""];
+#endif
     connection.exportedInterface=MuesliServiceInterfaceV2();connection.exportedObject=self;
     connection.remoteObjectInterface=MuesliClientInterfaceV2();
     __weak InferenceServiceV2 *weakSelf=self;__weak NSXPCConnection *weakConnection=connection;

@@ -44,6 +44,7 @@ export PYTHONPATH="$backend_root/src"
 export MUESLI_ALLOW_MODEL_DOWNLOADS=0 HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest "$backend_root/tests" -q -p no:cacheprovider > "$output_root/python-tests.log" 2>&1
 "$UV_PROJECT_ENVIRONMENT/bin/python" "$project_root/scripts/test-runtime-packaging.py" > "$output_root/packaging-tests.log" 2>&1
+"$UV_PROJECT_ENVIRONMENT/bin/python" "$project_root/scripts/test-local-package.py" > "$output_root/local-packaging-tests.log" 2>&1
 xcodebuild test -project "$project_root/MuesliApp/MuesliApp.xcodeproj" -scheme MuesliApp \
   -destination 'platform=macOS' -derivedDataPath "$output_root/DerivedData" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > "$output_root/swift-tests.log" 2>&1

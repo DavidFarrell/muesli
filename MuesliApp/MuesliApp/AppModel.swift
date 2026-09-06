@@ -331,11 +331,19 @@ final class AppModel: ObservableObject {
         #endif
         return nil
     }
+    private let localInferenceSession = LocalInferenceSession()
+    @Published private(set) var localTranscriptionReady = false
+    @Published private(set) var isPreparingLocalTranscription = false
+    private var localInferenceSelection: LocalInferenceSelection?
     private let archiveBackend = ArchiveApplicationBridge.BackendSelection()
     private var archiveBridge: ArchiveApplicationBridge?
     @Published private(set) var archiveListenerState: ArchiveListenerLifecycle.Snapshot?
     @Published var backendFolderURL: URL? {
-        didSet { archiveBackend.set(backendFolderURL) }
+        didSet {
+            #if DEBUG
+            archiveBackend.set(backendFolderURL)
+            #endif
+        }
     }
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
@@ -469,11 +477,21 @@ final class AppModel: ObservableObject {
             AudioLog.event("listener.output.fired", ["snap": AudioDeviceManager.snapshot()])
             Task { @MainActor in self?.handleOutputDeviceChange() }
         }
+        localInferenceSession.observeUnavailability { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.localInferenceSession.isReady else { return }
+                self.localInferenceSelection = nil
+                self.localTranscriptionReady = false
+                self.archiveBackend.setInference(nil)
+            }
+        }
         refreshPermissions()
         loadInputDevices()
         loadOutputDevices()
+        #if DEBUG
         loadBackendBookmark()
         validateBackendFolder()
+        #endif
         loadMeetingHistory()
         Task { await loadShareableContent() }
 
@@ -776,9 +794,39 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    func enableLocalTranscription() async {
+        do { _ = try await prepareLocalTranscription() }
+        catch is CancellationError { }
+        catch { backendFolderError = error.localizedDescription }
+    }
+
+    private func prepareLocalTranscription() async throws -> LocalInferenceSelection {
+        let intent = ApplicationQuitCoordinator.shared.startIntent
+        try ApplicationQuitCoordinator.shared.requireCurrentStart(intent)
+        guard !isPreparingLocalTranscription else {
+            throw BackendAdmissionOwner.Failure(message: "Local transcription setup is already in progress.")
+        }
+        isPreparingLocalTranscription = true
+        defer { isPreparingLocalTranscription = false }
+        let selection = try await localInferenceSession.prepare()
+        try ApplicationQuitCoordinator.shared.requireCurrentStart(intent)
+        guard selection.sources.isAuthorizedSession else {
+            throw BackendAdmissionOwner.Failure(message: "The folder authorization session ended. Enable local transcription again.")
+        }
+        localInferenceSelection = selection
+        localTranscriptionReady = true
+        backendFolderError = nil
+        archiveBackend.setInference(selection)
+        return selection
+    }
+
     func startArchiveIntegration() {
         if archiveBridge == nil {
+            #if DEBUG
             archiveBackend.set(backendFolderURL)
+            #else
+            archiveBackend.setInference(localInferenceSelection)
+            #endif
             archiveBridge = ArchiveApplicationBridge(backend: archiveBackend) { [weak self] state in
                 self?.archiveListenerState = state
             }
@@ -787,6 +835,10 @@ final class AppModel: ObservableObject {
     }
 
     func applicationQuitAccepted() {
+        localInferenceSession.beginShutdown()
+        localInferenceSelection = nil
+        localTranscriptionReady = false
+        archiveBackend.setInference(nil)
         archiveBridge?.closeAdmissionForQuit()
     }
 
@@ -801,6 +853,9 @@ final class AppModel: ObservableObject {
     }
 
     func applicationQuitCancelled() {
+        #if DEBUG
+        archiveBackend.set(backendFolderURL)
+        #endif
         archiveBridge?.reopenAfterCancelledQuit()
         if wantsHomeLevelPreview { Task { await self.startHomeLevelPreview() } }
     }
@@ -2234,7 +2289,19 @@ final class AppModel: ObservableObject {
         backendStallLogTicks = 0
         meters.clearBackendAlert()
 
+        #if DEBUG
         let backendProjectRoot = backendFolderURL
+        let packagedInference: LocalInferenceSelection? = nil
+        let preparationFailure: String? = nil
+        #else
+        let backendProjectRoot: URL? = nil
+        var packagedInference: LocalInferenceSelection?
+        var preparationFailure: String?
+        do { packagedInference = try await prepareLocalTranscription() }
+        catch is CancellationError { return }
+        catch { preparationFailure = error.localizedDescription }
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else { return }
+        #endif
 
         // Always use a display filter for audio capture (system-wide audio)
         // Use selectedDisplay if available, otherwise fall back to first display
@@ -2397,9 +2464,10 @@ final class AppModel: ObservableObject {
                 appendBackendLog("System audio: requested \(captureSampleRate)Hz/\(captureChannels)ch, got \(systemSampleRate)Hz/\(systemChannels)ch.", toTail: true)
             }
 
-            if let backendProjectRoot {
+            if packagedInference != nil || backendProjectRoot != nil {
                 do {
-                    try await launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir,
+                    try await launchLiveInference(backendProjectRoot: backendProjectRoot, inference: packagedInference,
+                                                  sourceID: sourceID, audioDir: audioDir,
                                                   folderURL: folderURL, recorder: recorder, eventsURL: sessionEventsURL,
                                                   startIntent: startIntent)
                 } catch is CancellationError {
@@ -2409,7 +2477,7 @@ final class AppModel: ObservableObject {
                     reportInferenceFailure(error.localizedDescription)
                 }
             } else {
-                reportInferenceFailure("No local transcription backend is configured.")
+                reportInferenceFailure(preparationFailure ?? "No local transcription backend is configured.")
             }
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
             try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
@@ -2470,10 +2538,14 @@ final class AppModel: ObservableObject {
             if error is CancellationError {
                 shareableContentError = "Meeting start was cancelled before setup finished. Its captured source files were retained."
             } else {
+                #if DEBUG
                 let pythonPath = backendPythonCandidatePath ?? "(unknown)"
                 let nsError = error as NSError
                 let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
                 shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) sandboxed=\(isSandboxed) \(details)"
+                #else
+                shareableContentError = "Could not start recording: \(error.localizedDescription)"
+                #endif
             }
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
@@ -2485,7 +2557,8 @@ final class AppModel: ObservableObject {
     }
 
     /// Live inference may be absent or fail; source recording has a separate owner.
-    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL,
+    private func launchLiveInference(backendProjectRoot: URL?, inference: LocalInferenceSelection?, sourceID: String,
+                                     audioDir: URL, folderURL: URL,
                                      recorder: LocalAudioRecorder, eventsURL: URL, startIntent: UUID) async throws {
         try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
         let transcribeStream = transcribeSystem && transcribeMic ? "both" : (transcribeSystem ? "system" : "mic")
@@ -2505,20 +2578,36 @@ final class AppModel: ObservableObject {
                     toTail: self.isCurrentSource(recorder, eventsURL: eventsURL), handle: sessionLogHandle)
             }
         }
-        let attempt = try backendAdmission.start(protecting: folderURL, timeoutSeconds: 8) {
-            try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
-                var command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
+        let attempt = try backendAdmission.start(protecting: folderURL, timeoutSeconds: inference == nil ? 8 : 53) {
+            if let inference {
+                guard let id = UUID(uuidString: sourceID),
+                      audioDir.deletingLastPathComponent().path == folderURL.path,
+                      let live = MuesliLiveSource(audioFolder: audioDir.lastPathComponent, sourceID: id) else {
+                    throw BackendAdmissionOwner.Failure(message: "The original live audio session is invalid.")
+                }
+                let streams: MuesliInferenceStreams = transcribeStream == "both" ? .both : (transcribeStream == "system" ? .system : .mic)
+                let configuration = try inference.configuration(folder: folderURL, operation: .live, streams: streams, liveSource: live)
+                let backend = try BackendProcess(inference: configuration, eventJournalURL: eventsURL)
+                backend.onExit = onExit
+                backend.onStderrLine = onStderr
+                return BackendAdmissionOwner.Resources(backend: backend)
+            }
+            #if DEBUG
+            guard let backendProjectRoot else { throw BackendAdmissionOwner.Failure(message: "No development backend selected.") }
+            return try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
+                let command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
                     "--transcribe-stream", transcribeStream, "--output-dir", audioDir.path,
-                    "--keep-wav", "--source-recording", "--live-asr-only", "--meeting-lease-required"]
-                #if DEBUG
-                command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
-                #endif
+                    "--keep-wav", "--source-recording", "--live-asr-only", "--meeting-lease-required",
+                    "--verbose", "--live-interval", "5", "--live-min-seconds", "5"]
                 let backend = try BackendProcess(command: command, workingDirectory: backendProjectRoot,
                     environment: BatchRediarizer.backendEnvironment(root: backendProjectRoot), eventJournalURL: eventsURL)
                 backend.onExit = onExit
                 backend.onStderrLine = onStderr
                 return backend
             }
+            #else
+            throw BackendAdmissionOwner.Failure(message: "Local transcription is unavailable for this session.")
+            #endif
         }
         let outcome = await attempt.waitUntilReady()
         guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent),
@@ -3306,6 +3395,7 @@ final class AppModel: ObservableObject {
         stream: BatchRediarizer.Stream,
         progressHandler: @escaping @MainActor @Sendable (BatchRediarizer.Progress) -> Void
     ) async throws -> BatchRediarizer.Result {
+        #if DEBUG
         guard let backendProjectRoot = backendFolderURL else {
             throw NSError(
                 domain: "Muesli",
@@ -3315,6 +3405,11 @@ final class AppModel: ObservableObject {
         }
         return try await batchRediarizer.run(meetingDirectory: meeting.folderURL,
             backendRoot: backendProjectRoot, stream: stream, progressHandler: progressHandler)
+        #else
+        let selection = try await prepareLocalTranscription()
+        return try await batchRediarizer.run(meetingDirectory: meeting.folderURL, inference: selection,
+            stream: stream, progressHandler: progressHandler)
+        #endif
     }
 
     func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {

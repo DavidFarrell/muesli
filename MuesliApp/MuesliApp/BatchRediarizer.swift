@@ -228,6 +228,28 @@ actor BatchRediarizer {
         }
     }
 
+    func run(meetingDirectory: URL, inference: LocalInferenceSelection, stream: Stream,
+             collectProcessingEvidence: Bool = false,
+             expectedMeetingIdentity: MeetingFileAccess.Identity? = nil,
+             validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void = { _ in },
+             progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil) async throws -> Result {
+        if collectProcessingEvidence && stream != .both {
+            throw Self.failure(4, "Processing evidence requires both source streams.")
+        }
+        return try await execute(protecting: meetingDirectory, expectedMeetingIdentity: expectedMeetingIdentity,
+            validateSource: validateSource, evidenceByteLimit: collectProcessingEvidence ? 64 * 1024 * 1024 : nil,
+            progressHandler: progressHandler, admissionBudget: 53) { accumulator in
+            let snapshot = try BatchSourceSnapshot.prepare(in: meetingDirectory, stream: stream,
+                purpose: expectedMeetingIdentity == nil ? .saveOrRecovery : .previewRead, validateSource: validateSource)
+            accumulator.setSourceSnapshot(snapshot)
+            let selected: MuesliInferenceStreams = stream == .both ? .both : (stream == .system ? .system : .mic)
+            let config = try inference.configuration(folder: meetingDirectory, operation: .reprocess, streams: selected)
+            let backend = try BackendProcess(inference: config, sourceSnapshotSHA256: snapshot.completionSHA256())
+            Self.attach(backend, accumulator: accumulator, progressHandler: progressHandler)
+            return BackendAdmissionOwner.Resources(backend: backend)
+        }
+    }
+
     /// Runs the same production admission path with model-free child/IO seams.
     func runCommand(_ command: [String], backendRoot: URL,
                     sourceMeetingDirectory: URL? = nil, stream: Stream = .both,
@@ -258,6 +280,7 @@ actor BatchRediarizer {
 
     private func execute(protecting folder: URL, expectedMeetingIdentity: MeetingFileAccess.Identity?,
                          validateSource: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> Void, evidenceByteLimit: Int?, progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+                         admissionBudget: Double = 8,
                          factory: @escaping @Sendable (Accumulator) throws -> BackendAdmissionOwner.Resources) async throws -> Result {
         guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         if let evidenceByteLimit, !(1...64 * 1024 * 1024).contains(evidenceByteLimit) {
@@ -282,7 +305,7 @@ actor BatchRediarizer {
             }
         } else { launchScope = { try $0() } }
         let attempt = try admission.start(protecting: folder, expectedMeetingIdentity: expectedMeetingIdentity,
-            timeoutSeconds: min(8, timeoutSeconds), withNativeLaunch: launchScope) { try factory(accumulator) }
+            timeoutSeconds: min(admissionBudget, timeoutSeconds), withNativeLaunch: launchScope) { try factory(accumulator) }
         return try await withTaskCancellationHandler(operation: {
             do {
                 switch await attempt.waitUntilReady() {

@@ -32,7 +32,7 @@ def main():
         run(compile_args + ["-c", src / (name + ".m"), "-o", obj])
         objects.append(obj)
     host = args.output / "FixtureHost"
-    run(["xcrun", "swiftc", "-swift-version", "6", "-default-isolation", "MainActor", "-strict-concurrency=complete", "-warnings-as-errors", "-target", "arm64-apple-macos26.2", "-module-cache-path", args.output / "swift-cache", "-import-objc-header", src / "ClientProbe-Bridging.h", src / "BackendXPCJobOwner.swift", src / "tests/ClientFixtureHost.swift", *objects, "-framework", "Foundation", "-framework", "Security", "-o", host])
+    run(["xcrun", "swiftc", "-swift-version", "6", "-default-isolation", "MainActor", "-strict-concurrency=complete", "-warnings-as-errors", "-target", "arm64-apple-macos26.2", "-module-cache-path", args.output / "swift-cache", "-import-objc-header", src / "ClientProbe-Bridging.h", src / "BackendXPCJobOwner.swift", src / "SourceCapabilityOwner.swift", src / "tests/ClientFixtureHost.swift", *objects, "-framework", "Foundation", "-framework", "Security", "-o", host])
     sandbox = args.output / "Service.entitlements"
     sandbox.write_bytes(plistlib.dumps({"com.apple.security.app-sandbox": True}))
     reports = []

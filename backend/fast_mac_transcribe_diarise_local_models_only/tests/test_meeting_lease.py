@@ -235,7 +235,7 @@ import Foundation
                              "-module-cache-path", str(folder / "module-cache"),
                              "-import-objc-header", str(transport / "ClientProbe-Bridging.h"),
                              str(folder / "FrameSending.swift"), *[str(app / name) for name in sources],
-                             str(transport / "BackendXPCJobOwner.swift"), *native_objects,
+                             str(transport / "BackendXPCJobOwner.swift"), str(transport / "SourceCapabilityOwner.swift"), *native_objects,
                              "-framework", "Foundation", "-framework", "Security",
                              str(harness), "-o", str(binary)], capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stderr

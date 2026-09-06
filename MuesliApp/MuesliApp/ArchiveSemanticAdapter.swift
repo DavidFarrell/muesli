@@ -5,9 +5,22 @@ import Foundation
 /// FileManager operation are fixed; model/CLI JSON cannot supply either.
 nonisolated final class ArchiveSemanticAdapter: Sendable {
     struct Configuration: Sendable {
-        let backendRoot: URL
+        let inference: LocalInferenceSelection?
         let outputRoot: URL
         let journalRoot: URL
+        #if DEBUG
+        let backendRoot: URL?
+        init(backendRoot: URL, outputRoot: URL, journalRoot: URL) {
+            self.backendRoot = backendRoot; self.outputRoot = outputRoot; self.journalRoot = journalRoot
+            inference = nil
+        }
+        #endif
+        init(inference: LocalInferenceSelection, outputRoot: URL, journalRoot: URL) {
+            self.inference = inference; self.outputRoot = outputRoot; self.journalRoot = journalRoot
+            #if DEBUG
+            backendRoot = nil
+            #endif
+        }
     }
     typealias Workflow = ArchiveWorkflowOwner<Prepared>
     struct Original: Codable, Equatable, Sendable {
@@ -127,21 +140,26 @@ nonisolated final class ArchiveSemanticAdapter: Sendable {
             try original.compare(ArchiveSourceInventory.captureForProcessing(context: context))
         }
         let result: BatchRediarizer.Result
-        #if DEBUG
-        if let fixtureCommand {
-            result = try await BatchRediarizer(timeoutSeconds: 10).runCommand(fixtureCommand,
-                backendRoot: configuration.backendRoot, sourceMeetingDirectory: source, stream: .both, collectProcessingEvidence: true,
+        if let inference = configuration.inference {
+            result = try await BatchRediarizer().run(meetingDirectory: source, inference: inference,
+                stream: .both, collectProcessingEvidence: true,
                 expectedMeetingIdentity: original.identity, validateSource: validateSource)
         } else {
-            result = try await BatchRediarizer().run(meetingDirectory: source, backendRoot: configuration.backendRoot,
-                                                    stream: .both, collectProcessingEvidence: true,
-                expectedMeetingIdentity: original.identity, validateSource: validateSource)
+            #if DEBUG
+            guard let root = configuration.backendRoot else { throw Failure(message: "No development backend is selected.") }
+            if let fixtureCommand {
+                result = try await BatchRediarizer(timeoutSeconds: 10).runCommand(fixtureCommand,
+                    backendRoot: root, sourceMeetingDirectory: source, stream: .both, collectProcessingEvidence: true,
+                    expectedMeetingIdentity: original.identity, validateSource: validateSource)
+            } else {
+                result = try await BatchRediarizer().run(meetingDirectory: source, backendRoot: root,
+                    stream: .both, collectProcessingEvidence: true,
+                    expectedMeetingIdentity: original.identity, validateSource: validateSource)
+            }
+            #else
+            throw Failure(message: "Enable local transcription in Muesli before processing an archive.")
+            #endif
         }
-        #else
-        result = try await BatchRediarizer().run(meetingDirectory: source, backendRoot: configuration.backendRoot,
-                                                stream: .both, collectProcessingEvidence: true,
-                expectedMeetingIdentity: original.identity, validateSource: validateSource)
-        #endif
         guard let proof = result.nativeProcessingEvidence else { throw Failure(message: "Actual native processing closure was not established.") }
         return proof
     }

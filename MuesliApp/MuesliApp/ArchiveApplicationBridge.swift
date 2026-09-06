@@ -5,9 +5,18 @@ import Foundation
 nonisolated final class ArchiveApplicationBridge: Sendable {
     final class BackendSelection: @unchecked Sendable {
         private let lock = NSLock()
-        private var value: URL?
-        func set(_ value: URL?) { lock.withLock { self.value = value } }
-        var selected: URL? { lock.withLock { value } }
+        enum Selection: Sendable {
+            case packaged(LocalInferenceSelection)
+            #if DEBUG
+            case development(URL)
+            #endif
+        }
+        private var value: Selection?
+        func setInference(_ value: LocalInferenceSelection?) { lock.withLock { self.value = value.map(Selection.packaged) } }
+        #if DEBUG
+        func set(_ value: URL?) { lock.withLock { self.value = value.map(Selection.development) } }
+        #endif
+        var selected: Selection? { lock.withLock { value } }
     }
     private final class Context: Sendable {
         let adapter: ArchiveSemanticAdapter
@@ -16,7 +25,10 @@ nonisolated final class ArchiveApplicationBridge: Sendable {
             self.adapter = adapter; self.prepared = prepared
         }
     }
-    private enum Failure: Error { case backendNotConfigured }
+    private enum Failure: Error, LocalizedError {
+        case backendNotConfigured
+        var errorDescription: String? { "Enable local transcription in Muesli before processing an archive." }
+    }
     private let listener: ArchiveListenerLifecycle
 
     init(backend: BackendSelection, paths: ArchiveApplicationDirectories.Paths = .standard,
@@ -26,11 +38,19 @@ nonisolated final class ArchiveApplicationBridge: Sendable {
             acquireWorkToken: { try shutdown.beginUserWork("Preparing or finalizing archive outputs") },
             acquireRetirementToken: { try shutdown.begin("Closing archive output ownership") },
             prepare: { begin, operationID in
-                guard let backendRoot = backend.selected else { throw Failure.backendNotConfigured }
+                guard let selected = backend.selected else { throw Failure.backendNotConfigured }
                 // This read is native configuration, captured for this original
                 // operation. Later settings changes cannot replace its adapter.
-                let adapter = ArchiveSemanticAdapter(configuration: .init(backendRoot: backendRoot,
-                    outputRoot: paths.output, journalRoot: paths.journal))
+                let configuration: ArchiveSemanticAdapter.Configuration
+                switch selected {
+                case .packaged(let inference):
+                    configuration = .init(inference: inference, outputRoot: paths.output, journalRoot: paths.journal)
+                #if DEBUG
+                case .development(let root):
+                    configuration = .init(backendRoot: root, outputRoot: paths.output, journalRoot: paths.journal)
+                #endif
+                }
+                let adapter = ArchiveSemanticAdapter(configuration: configuration)
                 let prepared = try await adapter.prepare(.init(sourcePath: begin.sourcePath, vaultPath: begin.vaultPath), operationID: operationID)
                 return .init(context: Context(adapter: adapter, prepared: prepared.context), outputManifestPath: prepared.outputManifestPath)
             }, finalize: { context, receiptPath, operationID in

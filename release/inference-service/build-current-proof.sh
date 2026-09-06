@@ -43,7 +43,7 @@ PLIST
 python3 "$proof_sources/write-current-build-inputs.py" "$proof_repo" "$proof_app/Contents/Resources/proof-build-inputs.json" "$proof_team" "$proof_picker"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 xcrun clang -fobjc-arc -fblocks -mmacosx-version-min=26.2 -arch arm64 \
-  "-DMUESLI_SIGNING_TEAM=\"$proof_team\"" -I "$proof_runtime/include/python3.12" \
+  -DMUESLI_INFERENCE_PROOF_BUILD=1 "-DMUESLI_SIGNING_TEAM=\"$proof_team\"" -I "$proof_runtime/include/python3.12" \
   -framework Foundation -framework Security "$proof_sources/ServiceV2.m" "$proof_sources/PythonBridgeV2.m" \
   "$proof_sources/InferenceProtocolV2.m" "$proof_sources/SourceLeaseAdmission.m" "$proof_sources/VerifiedPayload.m" \
   -o "$proof_service/Contents/MacOS/InferenceService"
