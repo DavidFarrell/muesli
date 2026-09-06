@@ -21,6 +21,12 @@ nonisolated enum ArchiveSourceEligibility {
         /// Derived bytes; these do not assert that a WAV file exists on disk.
         let modelInputs: [String: ModelInput]
     }
+    struct Screenshot: Sendable, Equatable {
+        let sourceSessionID: UUID
+        let assetID: UUID
+        let timelineSeconds: Double
+        let file: ArchiveReceipt.FileRecord
+    }
     struct ModelInput: Sendable, Equatable {
         let bytes: Int64
         let sha256: String
@@ -30,6 +36,7 @@ nonisolated enum ArchiveSourceEligibility {
     final class VerifiedSource: Sendable {
         let inventory: ArchiveSourceInventory.Snapshot
         let sessions: [Session]
+        let screenshots: [Screenshot]
         private let reader: ArchiveSourceReader
         /// Verify on a retained file worker: the process exit must come from
         /// its actual native owner. This method never launches or deletes.
@@ -54,6 +61,15 @@ nonisolated enum ArchiveSourceEligibility {
             try reader.validate()
             return result
         }
+        /// Only indexed, source-scoped ledger observations can be read. The
+        /// copier consumes these on its retained worker, before releasing EX.
+        func readScreenshot(_ screenshot: Screenshot) throws -> Data {
+            guard screenshots.contains(screenshot) else { throw Failure(message: "Screenshot is not in the verified source ledger.") }
+            try reader.validate()
+            let bytes = try reader.read(screenshot.file, maximumBytes: 32 * 1024 * 1024)
+            try reader.validate()
+            return bytes
+        }
         /// Hash the canonical WAV for a frame range while also rechecking the
         /// entire original PCM fingerprint. No temporary audio is created.
         func recoveryWAVHash(sourceID: String, stream: String, frames: Range<Int64>) throws -> String {
@@ -75,8 +91,8 @@ nonisolated enum ArchiveSourceEligibility {
             try reader.validate()
             return hex(digest.finalize())
         }
-        fileprivate init(inventory: ArchiveSourceInventory.Snapshot, sessions: [Session], reader: ArchiveSourceReader) {
-            self.inventory = inventory; self.sessions = sessions; self.reader = reader
+        fileprivate init(inventory: ArchiveSourceInventory.Snapshot, sessions: [Session], screenshots: [Screenshot], reader: ArchiveSourceReader) {
+            self.inventory = inventory; self.sessions = sessions; self.screenshots = screenshots; self.reader = reader
         }
     }
     /// Synchronous disk work: call only from an independently retained file
@@ -98,7 +114,7 @@ nonisolated enum ArchiveSourceEligibility {
         var check = Check(reader: reader, inventory: inventory, semanticByteLimit: semanticByteLimit)
         let sessions = try check.run()
         try reader.validate()
-        return VerifiedSource(inventory: inventory, sessions: sessions, reader: reader)
+        return VerifiedSource(inventory: inventory, sessions: sessions, screenshots: check.screenshots, reader: reader)
     }
 
     private struct Check {
@@ -110,6 +126,7 @@ nonisolated enum ArchiveSourceEligibility {
         var usedFiles: Set<String> = []
         var usedDirectories: Set<String> = []
         var recordCount = 0
+        var screenshots: [Screenshot] = []
         init(reader: ArchiveSourceReader, inventory: ArchiveSourceInventory.Snapshot, semanticByteLimit: Int64) {
             self.reader = reader; self.inventory = inventory
             files = Dictionary(uniqueKeysWithValues: inventory.files.map { ($0.path, $0) })
@@ -281,6 +298,7 @@ nonisolated enum ArchiveSourceEligibility {
                     try require(assetIDs.insert(id).inserted, "An artifact identity is duplicated.")
                     let image = try file(path)
                     try require(image.bytes > 0 && image.bytes <= 128 * 1024 * 1024, "A committed screenshot is empty or exceeds its size limit.")
+                    self.screenshots.append(Screenshot(sourceSessionID: UUID(uuidString: sourceID)!, assetID: id, timelineSeconds: t, file: image))
                     screenshots += 1; mediaEnd = max(mediaEnd ?? 0, t)
                 case "video":
                     guard let path = event.path, let t = event.requestedT else { throw Failure(message: "A video record is incomplete.") }

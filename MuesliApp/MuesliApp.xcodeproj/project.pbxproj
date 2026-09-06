@@ -51,6 +51,7 @@
 				ArchiveReceipt.swift,
 				ArchiveMoveJournal.swift,
 				ArchiveOutputEvidence.swift,
+				ArchiveAssetCopier.swift,
 				ArchiveProcessingEvidence.swift,
 				ArchiveSourceInventory.swift,
 				ArchiveSourceEligibility.swift,

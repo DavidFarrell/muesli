@@ -479,4 +479,93 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
         XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
         XCTAssertNoThrow(try MeetingFileAccess.acquire(in: root))
     }
+    func testNativeScreenshotCopyPreservesLedgerTimeAndExactOriginalBytes() throws {
+        let sourceRoot = try folder(), vault = try folder()
+        let ids = try fixture(sourceRoot, artifacts: true)
+        let source = try inspect(sourceRoot)
+        let shot = try XCTUnwrap(source.screenshots.first)
+        XCTAssertEqual(shot.sourceSessionID.uuidString, ids[0]); XCTAssertEqual(shot.timelineSeconds, 0.005)
+        let before = source.inventory.files
+        let catalog = try ArchiveAssetCopier.copy(source: source, vaultURL: vault)
+        XCTAssertEqual(catalog.images.count, 1)
+        XCTAssertEqual(catalog.images[0].sourceRelativePath, shot.file.path)
+        XCTAssertEqual(catalog.images[0].timelineSeconds, shot.timelineSeconds)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: catalog.images[0].copied.path)), try source.readScreenshot(shot))
+        try catalog.validate()
+        XCTAssertEqual(try ArchiveSourceInventory.capture(access: source.inventory.access).files, before)
+    }
+    func testCopyCatalogDoesNotRetainOriginalExclusiveSourceOwner() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        var source: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+        let catalog = try ArchiveAssetCopier.copy(source: source!, vaultURL: vault)
+        source = nil
+        let shared = try MeetingFileAccess.acquire(in: root, mode: .shared)
+        try shared.validate(); try catalog.validate()
+    }
+    func testNativeCopiesRejectChangedOriginalAndUnsupportedPNG() throws {
+        for changedAfterInspection in [false, true] {
+            let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+            var source: ArchiveSourceEligibility.VerifiedSource? = try inspect(root)
+            let path = source!.screenshots[0].file.path
+            if changedAfterInspection {
+                try write(root, path, Data(repeating: 0, count: Int(source!.screenshots[0].file.bytes)))
+            } else {
+                // Release and reinspect so the invalid PNG has an authentic
+                // current source fingerprint. Copier must still decode it.
+                let owner = source!.inventory.access
+                source = nil
+                try write(root, path, Data("invalid PNG".utf8))
+                source = try ArchiveSourceEligibility.inspect(access: owner)
+            }
+            XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source!, vaultURL: vault))
+        }
+    }
+    func testNativeCopiesRejectVaultInsideSourceWithoutCreatingFiles() throws {
+        let root = try folder(); try fixture(root, artifacts: true)
+        let source = try inspect(root)
+        XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: root))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("MuesliAssets").path))
+    }
+    func testNativeCopyCatalogRefusesSameByteReplacementAndChangedContent() throws {
+        for replace in [false, true] {
+            let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+            let source = try inspect(root), catalog = try ArchiveAssetCopier.copy(source: source, vaultURL: vault)
+            let url = URL(fileURLWithPath: catalog.images[0].copied.path), bytes = try Data(contentsOf: url)
+            if replace {
+                try FileManager.default.removeItem(at: url); try bytes.write(to: url); XCTAssertEqual(chmod(url.path, 0o600), 0)
+            } else { try Data(repeating: 0, count: bytes.count).write(to: url) }
+            XCTAssertThrowsError(try catalog.validate())
+        }
+    }
+    func testNativeCopyPublicationCannotOverwriteAppearingDestination() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        let source = try inspect(root), shot = source.screenshots[0]
+        let target = vault.appendingPathComponent("MuesliAssets/\(shot.sourceSessionID.uuidString.lowercased())/\(shot.assetID.uuidString.lowercased()).png")
+        let foreign = Data("foreign material".utf8)
+        XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: vault, checkpoint: { phase in
+            if case .beforePublish = phase { try foreign.write(to: target); guard chmod(target.path, 0o600) == 0 else { throw NSError(domain: "fixture", code: 1) } }
+        }))
+        XCTAssertEqual(try Data(contentsOf: target), foreign)
+    }
+    func testNativeCopyCatalogOwnsVaultUntilActualReleaseAndAllowsExactReuse() throws {
+        let root = try folder(), vault = try folder(); try fixture(root, artifacts: true)
+        let source = try inspect(root)
+        var catalog: ArchiveAssetCopier.Catalog? = try ArchiveAssetCopier.copy(source: source, vaultURL: vault)
+        let expected = catalog!.images[0].copied
+        XCTAssertThrowsError(try ArchiveAssetCopier.copy(source: source, vaultURL: vault))
+        catalog = nil
+        let reused = try ArchiveAssetCopier.copy(source: source, vaultURL: vault)
+        XCTAssertEqual(reused.images[0].copied, expected); try reused.validate()
+    }
+    func testNativeCopyCatalogRejectsVaultAncestorReplacementAndForeignSymlink() throws {
+        let root = try folder(), parent = try folder(); try fixture(root, artifacts: true)
+        let vault = parent.appendingPathComponent("vault"), displaced = parent.appendingPathComponent("old-vault"), foreign = try folder()
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: false)
+        let catalog = try ArchiveAssetCopier.copy(source: inspect(root), vaultURL: vault)
+        try FileManager.default.moveItem(at: vault, to: displaced)
+        try FileManager.default.createSymbolicLink(at: vault, withDestinationURL: foreign)
+        XCTAssertThrowsError(try catalog.validate())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: foreign.path), [])
+    }
+
 }
