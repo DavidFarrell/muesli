@@ -1,0 +1,289 @@
+{
+  "assertions" : 33,
+  "boundary" : "NSXPCConnection PID getter and descriptor-exhaustion timing before real kqueue; all child processes, code signatures, proc identity, kqueue registration and exit status are native",
+  "failures" : 0,
+  "passed" : 1,
+  "results" : [
+    {
+      "arm_error" : "",
+      "exit_code" : 125,
+      "name" : "normal exit 125 is preserved",
+      "passed" : true,
+      "pid" : 73652,
+      "raw_wait_status" : 32000,
+      "signal" : 0,
+      "waitpid_status" : 32000
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : -1,
+      "name" : "SIGKILL 9 stays distinct from normal exit 125",
+      "passed" : true,
+      "pid" : 73653,
+      "raw_wait_status" : 9,
+      "signal" : 9,
+      "waitpid_status" : 9
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 126,
+      "name" : "normal exit 126 stays distinct from retirement",
+      "passed" : true,
+      "pid" : 73654,
+      "raw_wait_status" : 32256,
+      "signal" : 0,
+      "waitpid_status" : 32256
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 0",
+      "passed" : true,
+      "pid" : 73655,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 1",
+      "passed" : true,
+      "pid" : 73656,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 2",
+      "passed" : true,
+      "pid" : 73657,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 3",
+      "passed" : true,
+      "pid" : 73658,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 4",
+      "passed" : true,
+      "pid" : 73659,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 5",
+      "passed" : true,
+      "pid" : 73660,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 6",
+      "passed" : true,
+      "pid" : 73663,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 7",
+      "passed" : true,
+      "pid" : 73664,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 8",
+      "passed" : true,
+      "pid" : 73667,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 9",
+      "passed" : true,
+      "pid" : 73668,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 10",
+      "passed" : true,
+      "pid" : 73671,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 11",
+      "passed" : true,
+      "pid" : 73673,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 12",
+      "passed" : true,
+      "pid" : 73674,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 13",
+      "passed" : true,
+      "pid" : 73675,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 14",
+      "passed" : true,
+      "pid" : 73676,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 15",
+      "passed" : true,
+      "pid" : 73677,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 16",
+      "passed" : true,
+      "pid" : 73678,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 17",
+      "passed" : true,
+      "pid" : 73679,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 18",
+      "passed" : true,
+      "pid" : 73680,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "arm_error" : "",
+      "exit_code" : 0,
+      "name" : "immediate exit after arming 19",
+      "passed" : true,
+      "pid" : 73681,
+      "raw_wait_status" : 0,
+      "signal" : 0,
+      "waitpid_status" : 0
+    },
+    {
+      "name" : "caller release and connection invalidation do not mean death",
+      "passed" : true
+    },
+    {
+      "name" : "invalid connection PID fails closed",
+      "passed" : true
+    },
+    {
+      "name" : "nonexistent process identity fails closed",
+      "passed" : true
+    },
+    {
+      "error_code" : 6,
+      "name" : "malformed signature requirement fails closed",
+      "passed" : true
+    },
+    {
+      "error_code" : 7,
+      "name" : "wrong executable signature fails closed",
+      "passed" : true
+    },
+    {
+      "error_code" : 5,
+      "name" : "connection PID changes during arming fail closed",
+      "passed" : true
+    },
+    {
+      "caller_elapsed_ms" : 29.765999999999998,
+      "name" : "blocked registration has bounded caller deadline",
+      "passed" : true
+    },
+    {
+      "failures" : 0,
+      "name" : "timed-out worker retains native call then closes unclaimed observation",
+      "passed" : true,
+      "released_after_return" : 1,
+      "retained_while_blocked" : true,
+      "terminals" : 0
+    },
+    {
+      "arm_error" : "",
+      "name" : "exit queued during final connection check is retained through arm handoff",
+      "passed" : true
+    },
+    {
+      "error_code" : 8,
+      "name" : "actual kernel queue creation failure fails closed",
+      "passed" : true,
+      "underlying_code" : 24
+    }
+  ]
+}
