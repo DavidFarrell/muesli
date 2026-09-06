@@ -16,13 +16,32 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
     }
     private final class Operation: @unchecked Sendable {
         let completion = TaskCompletion()
+        let adoptionDecision = TaskCompletion()
         let lock = NSLock()
         var result: Result<Void, Error>?
         var abandoned = false
+        var claimed = false
+        var claimOpen = true
         var failureReported = false
         func takeFailureReport() -> Bool {
             lock.withLock { if failureReported { return false }; failureReported = true; return true }
         }
+    }
+    /// The native start remains reserved until the UI either atomically takes
+    /// ownership or refuses it. Claim and deadline retirement use the same lock.
+    final class Claim: Sendable {
+        private let take: @Sendable () -> Bool
+        fileprivate init(take: @escaping @Sendable () -> Bool) { self.take = take }
+        func claim() -> Bool { take() }
+    }
+    private final class AdoptionOffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var callback: (@MainActor @Sendable (Claim) -> Void)?
+        init(_ callback: @escaping @MainActor @Sendable (Claim) -> Void) { self.callback = callback }
+        func take() -> (@MainActor @Sendable (Claim) -> Void)? {
+            lock.withLock { defer { callback = nil }; return callback }
+        }
+        func retire() { lock.withLock { callback = nil } }
     }
     private let lock = NSLock()
     private var active: Operation?
@@ -35,6 +54,7 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
                  preservesRecording: Bool = false,
                  onFailure: @escaping @Sendable (Error) -> Void = { _ in },
                  operation: @escaping @Sendable () async throws -> Void,
+                 adoption: (@MainActor @Sendable (Claim) -> Void)? = nil,
                  cleanupIfAbandoned: @escaping @Sendable () async -> Void = {}) async throws {
         let state = Operation()
         let quitWork = preservesRecording ? try shutdown.begin("Waiting for native recording cleanup") : nil
@@ -42,12 +62,50 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
             onFailure(Failure.busy)
             throw Failure.busy
         }
+        let offer = adoption.map(AdoptionOffer.init)
         Task.detached(priority: .userInitiated) { [self] in
             let result: Result<Void, Error>
-            do { try await operation(); result = .success(()) } catch {
+            var cleanedUp = false
+            do {
+                try await operation()
+                if let offer {
+                    let claim = Claim { [self] in
+                        state.lock.withLock {
+                            guard state.claimOpen, !state.abandoned, !state.claimed else { return false }
+                            state.claimed = true
+                            state.result = .success(())
+                            // No suspension between this transfer and the UI's
+                            // engine assignment. Stop can now reserve this lane.
+                            lock.withLock { if active === state { active = nil } }
+                            return true
+                        }
+                    }
+                    // The single UI offer cannot hold native cleanup hostage
+                    // when MainActor is blocked. Expiry retires claim first and
+                    // releases this worker; a queued UI offer then fails closed.
+                    Task { @MainActor in
+                        offer.take()?(claim)
+                        state.adoptionDecision.markCompleted()
+                    }
+                    let decision = await state.adoptionDecision.wait(timeoutSeconds: timeoutSeconds)
+                    let claimed = state.lock.withLock {
+                        if state.claimed { return true }
+                        state.claimOpen = false
+                        return false
+                    }
+                    if !claimed {
+                        offer.retire()
+                        await cleanupIfAbandoned()
+                        cleanedUp = true
+                        throw decision == .timedOut ? Failure.timedOut : Failure.cancelled
+                    }
+                }
+                result = .success(())
+            } catch {
                 if state.takeFailureReport() { onFailure(error) }
                 result = .failure(error)
             }
+            offer?.retire()
             let abandoned = state.lock.withLock {
                 if state.abandoned { return true }
                 lock.withLock { if active === state { active = nil } }
@@ -55,7 +113,7 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
                 return false
             }
             if abandoned {
-                await cleanupIfAbandoned()
+                if !cleanedUp { await cleanupIfAbandoned() }
                 lock.withLock { if active === state { active = nil } }
             }
             quitWork?.finish()
@@ -68,6 +126,7 @@ nonisolated final class CaptureOperationOwner: @unchecked Sendable {
             return nil
         }
         if let result { try result.get(); return }
+        state.adoptionDecision.markCompleted()
         let failure: Failure = wait == .cancelled ? .cancelled : .timedOut
         if state.takeFailureReport() { onFailure(failure) }
         throw failure

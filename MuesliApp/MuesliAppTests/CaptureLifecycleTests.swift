@@ -270,6 +270,185 @@ final class CaptureLifecycleTests: XCTestCase {
         XCTAssertTrue(AudioRefreshResult(microphone: .notRequested, system: .healthy).verified)
         XCTAssertTrue(AudioRefreshResult(microphone: .healthy, system: .healthy).verified)
     }
+    @MainActor
+    func testInitialMicStartStoppedBeforeAdoptionRetainsOwnerThroughCleanup() async {
+        let owner = CaptureOperationOwner()
+        let entered = TaskCompletion(), nativeReturn = TaskCompletion()
+        let cleanupEntered = TaskCompletion(), cleanupReturn = TaskCompletion()
+        var source = UUID(), adopted: UUID?
+        let original = source
+        let start = Task {
+            try? await owner.perform(operation: {
+                entered.markCompleted()
+                _ = await nativeReturn.wait(timeoutSeconds: 10)
+            }, adoption: { claim in
+                guard source == original, claim.claim() else { return }
+                adopted = original
+            }, cleanupIfAbandoned: {
+                cleanupEntered.markCompleted()
+                _ = await cleanupReturn.wait(timeoutSeconds: 10)
+            })
+        }
+        let didEnter = await entered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(didEnter, .completed)
+        // Stop and finalization have both finished; the mutable UI flags could
+        // be open again and a distinct recording can now be desired.
+        source = UUID()
+        nativeReturn.markCompleted()
+        let cleanup = await cleanupEntered.wait(timeoutSeconds: 1)
+        XCTAssertEqual(cleanup, .completed)
+        XCTAssertNil(adopted)
+        XCTAssertTrue(owner.isBusy)
+        do { try await owner.perform { XCTFail("A new source competed with old microphone cleanup") }; XCTFail("Expected busy") }
+        catch { }
+        cleanupReturn.markCompleted(); await start.value
+        XCTAssertFalse(owner.isBusy)
+        let replacement = source
+        do {
+            try await owner.perform(operation: {}, adoption: { claim in
+                guard source == replacement, claim.claim() else { return }
+                adopted = replacement
+            })
+        } catch { XCTFail("Fresh source could not start after actual cleanup: \(error)") }
+        XCTAssertEqual(adopted, replacement)
+    }
+
+    @MainActor
+    func testMicAdoptionClaimTransfersOwnerBeforeImmediateStop() async {
+        let owner = CaptureOperationOwner()
+        var claimed = false
+        do {
+            try await owner.perform(operation: {}, adoption: { claim in
+                XCTAssertTrue(owner.isBusy)
+                claimed = claim.claim()
+                XCTAssertTrue(claimed)
+                XCTAssertFalse(owner.isBusy, "Stop must be able to reserve the lane immediately after engine assignment")
+                XCTAssertFalse(claim.claim())
+            }, cleanupIfAbandoned: { XCTFail("An adopted microphone was cleaned up by its old start") })
+            try await owner.perform { }
+        } catch { XCTFail("Unexpected \(error)") }
+        XCTAssertTrue(claimed)
+    }
+
+    @MainActor
+    func testMicAdoptionExpiryCleansNativeOwnerWhileUIIsBlocked() async {
+        let owner = CaptureOperationOwner()
+        let nativeEntered = DispatchSemaphore(value: 0), cleanupEntered = DispatchSemaphore(value: 0)
+        let cleanupReturn = TaskCompletion()
+        var adopted = false
+        let start = Task.detached {
+            try? await owner.perform(timeoutSeconds: 0.03, operation: {
+                nativeEntered.signal()
+            }, adoption: { claim in
+                if claim.claim() { adopted = true }
+            }, cleanupIfAbandoned: {
+                cleanupEntered.signal()
+                _ = await cleanupReturn.wait(timeoutSeconds: 10)
+            })
+        }
+        XCTAssertEqual(nativeEntered.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(cleanupEntered.wait(timeout: .now() + 2), .success,
+                       "Native cleanup cannot require the queued MainActor adoption to execute")
+        XCTAssertFalse(adopted)
+        XCTAssertTrue(owner.isBusy)
+        cleanupReturn.markCompleted(); await start.value
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while owner.isBusy, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertFalse(owner.isBusy)
+        await Task.yield()
+        XCTAssertFalse(adopted, "A late UI offer cannot reclaim a retired start")
+    }
+
+    @MainActor
+    func testQuitThenCancelCannotReviveOfferedMicrophoneStart() async {
+        let owner = CaptureOperationOwner()
+        let entered = TaskCompletion(), nativeReturn = TaskCompletion(), cleanup = TaskCompletion()
+        var quitIntent = UUID(), adopted = false
+        let originalQuitIntent = quitIntent
+        let start = Task {
+            try? await owner.perform(operation: {
+                entered.markCompleted(); _ = await nativeReturn.wait(timeoutSeconds: 10)
+            }, adoption: { claim in
+                guard quitIntent == originalQuitIntent, claim.claim() else { return }
+                adopted = true
+            }, cleanupIfAbandoned: { cleanup.markCompleted() })
+        }
+        _ = await entered.wait(timeoutSeconds: 1)
+        quitIntent = UUID() // Accepted Quit retires this even if Cancel follows immediately.
+        nativeReturn.markCompleted(); await start.value
+        let closed = await cleanup.wait(timeoutSeconds: 1)
+        XCTAssertEqual(closed, .completed)
+        XCTAssertFalse(adopted)
+        XCTAssertFalse(owner.isBusy)
+    }
+
+    @MainActor
+    func testRejectedMicAdoptionKeepsQuitPendingUntilActualCleanup() async {
+        let registry = ShutdownWorkRegistry(), cleanupEntered = TaskCompletion(), cleanupReturn = TaskCompletion()
+        let owner = CaptureOperationOwner(shutdown: registry)
+        let start = Task {
+            try? await owner.perform(timeoutSeconds: 0.03, preservesRecording: true,
+                operation: {}, adoption: { _ in }, cleanupIfAbandoned: {
+                    cleanupEntered.markCompleted()
+                    _ = await cleanupReturn.wait(timeoutSeconds: 10)
+                })
+        }
+        _ = await cleanupEntered.wait(timeoutSeconds: 1)
+        registry.beginQuit()
+        await start.value
+        XCTAssertTrue(owner.isBusy)
+        XCTAssertFalse(registry.snapshot().pending.isEmpty)
+        XCTAssertFalse(registry.sealIfFinished())
+        cleanupReturn.markCompleted()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while owner.isBusy || !registry.snapshot().pending.isEmpty, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertFalse(owner.isBusy)
+        XCTAssertTrue(registry.sealIfFinished())
+    }
+
+    @MainActor
+    func testExpiredMicUIOfferReleasesActualSourceLeaseWhileUIRemainsBlocked() async throws {
+        let folder = URL(fileURLWithPath: "/private/tmp/muesli-mic-offer-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let registry = ShutdownWorkRegistry(), owner = CaptureOperationOwner(shutdown: registry)
+        let cleanup = DispatchSemaphore(value: 0), returned = DispatchSemaphore(value: 0), released = DispatchSemaphore(value: 0)
+        let start = Task.detached {
+            do {
+                try await owner.perform(timeoutSeconds: 0.03, preservesRecording: true,
+                    operation: {}, adoption: try makeOwnedMicOffer(folder: folder, released: released),
+                    cleanupIfAbandoned: { cleanup.signal() })
+            } catch { }
+            returned.signal()
+        }
+        XCTAssertEqual(cleanup.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(returned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(released.wait(timeout: .now() + 2), .success,
+                       "The queued UI notification must not retain the source lease after original cleanup")
+        // This is a real independent kernel lock acquisition, still before the
+        // queued MainActor offer can execute. No original source owner remains.
+        let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
+        try exclusive.validate()
+        await start.value
+    }
+
 }
 
 nonisolated private enum TestCaptureFailure: Error { case injected }
+
+
+nonisolated private final class MicOfferLease: @unchecked Sendable {
+    private var access: MeetingFileAccess?
+    private let released: DispatchSemaphore
+    init(folder: URL, released: DispatchSemaphore) throws {
+        access = try MeetingFileAccess.acquire(in: folder)
+        self.released = released
+    }
+    deinit { access = nil; released.signal() }
+}
+
+nonisolated private func makeOwnedMicOffer(folder: URL, released: DispatchSemaphore) throws
+    -> @MainActor @Sendable (CaptureOperationOwner.Claim) -> Void {
+    let lease = try MicOfferLease(folder: folder, released: released)
+    return { claim in withExtendedLifetime(lease) { _ = claim.claim() } }
+}
