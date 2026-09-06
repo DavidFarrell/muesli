@@ -37,6 +37,7 @@
                 ApplicationQuitCoordinator.swift,
 				AECMode.swift,
 				ArchiveReceipt.swift,
+				ArchiveMoveJournal.swift,
 				ArchiveProcessingEvidence.swift,
 				ArchiveSourceInventory.swift,
 				ArchiveSourceEligibility.swift,
