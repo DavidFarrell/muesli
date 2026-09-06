@@ -762,6 +762,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--source-recording", action="store_true",
         help="Read app-owned committed PCM from output-dir; never write or delete source audio",
     )
+    parser.add_argument("--admitted-source-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--transcribe-stream",
         choices=["system", "mic", "both"],
@@ -858,7 +859,11 @@ def main() -> int:
     require_app_admission(args)
 
     output_dir = validate_source_path(Path(args.output_dir))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.source_recording:
+        if not output_dir.is_dir():
+            raise ValueError("The admitted source directory must already exist")
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     protocol_stdout = sys.stdout
     stdout_writer = StdoutWriter(protocol_stdout)
@@ -883,6 +888,8 @@ def main() -> int:
 
 
 def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
+    from .inference_workspace import derived_directory
+    derived_output = derived_directory(output_dir)
     state = BackendState(stdout_writer)
     if args.source_recording:
         state.source_directory = output_dir
@@ -897,7 +904,7 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                 stream_name=stream_name,
                 state=state,
                 emitter=emitter,
-                output_dir=output_dir,
+                output_dir=derived_output,
                 diar_backend=args.diar_backend,
                 asr_model=args.asr_model,
                 language=args.language,
@@ -945,6 +952,9 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                     expected = meeting_meta.get("source_session_id")
                     if not isinstance(expected, str) or not expected:
                         raise ValueError("App-owned source mode requires source_session_id")
+                    admitted = getattr(args, "admitted_source_id", None)
+                    if admitted is not None and expected != admitted:
+                        raise ValueError("meetingStart does not match the native-admitted source UUID")
                     sources = committed_sources(output_dir, expected)
                     state.source_session_id = expected
                     state.sample_rate = state.system_sample_rate = state.mic_sample_rate = 16000
@@ -1056,7 +1066,7 @@ def _run_backend(args, output_dir: Path, stdout_writer: StdoutWriter) -> int:
                 sample_rate = state.mic_sample_rate
                 channels = state.mic_channels
             snapshot = snapshot_stream(writer, sample_rate, channels)
-            temp_wav = write_wav_from_pcm(snapshot, output_dir)
+            temp_wav = write_wav_from_pcm(snapshot, derived_output)
             if not temp_wav:
                 emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_writer)
                 processing_complete = False

@@ -51,11 +51,12 @@ def wait_for(predicate, timeout=5):
 def test_valid_pin_is_shared_fixed_order_noninheritable_and_bounds_source_paths(tmp_path):
     token = token_for(tmp_path)
     result = run('''
-import json, os, sys
+import fcntl, json, os, sys
 import diarise_transcribe
 from diarise_transcribe import meeting_lease as lease
 assert lease._PROCESS_PIN is not None
 assert len(lease._PROCESS_PIN.descriptors) == 3
+assert all(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY for fd in lease._PROCESS_PIN.descriptors)
 assert all(not os.get_inheritable(fd) for fd in lease._PROCESS_PIN.descriptors)
 lease.validate_source_path(lease._PROCESS_PIN.folder / "audio")
 try: lease.validate_source_path(lease._PROCESS_PIN.folder.parent / "foreign")
@@ -218,10 +219,24 @@ import Foundation
     binary = folder / "ParentHarness"
     sources = ["CapturedMicAudio.swift", "MeetingFileAccess.swift", "ShutdownWorkRegistry.swift", "BackendAdmissionOwner.swift", "BackendProcess.swift",
                "BackendOutputReader.swift", "TaskCompletion.swift", "WriteBacklogTracker.swift"]
+    transport = repo / "release/inference-service"
+    native_objects = []
+    for name in ("InferenceProtocolV2", "MuesliNativeProcessObserver", "SourceLeaseAdmission"):
+        object_file = folder / (name + ".o")
+        compiled = subprocess.run(["/usr/bin/xcrun", "clang", "-fobjc-arc", "-fblocks", "-fmodules",
+                                   "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+                                   "-fmodules-cache-path=" + str(folder / "clang-cache"),
+                                   "-c", str(transport / (name + ".m")), "-o", str(object_file)],
+                                  capture_output=True, text=True, timeout=60)
+        assert compiled.returncode == 0, compiled.stderr
+        native_objects.append(str(object_file))
     result = subprocess.run(["/usr/bin/xcrun", "swiftc", "-parse-as-library", "-swift-version", "6",
                              "-default-isolation", "MainActor", "-strict-concurrency=complete", "-warnings-as-errors",
                              "-module-cache-path", str(folder / "module-cache"),
+                             "-import-objc-header", str(transport / "ClientProbe-Bridging.h"),
                              str(folder / "FrameSending.swift"), *[str(app / name) for name in sources],
+                             str(transport / "BackendXPCJobOwner.swift"), *native_objects,
+                             "-framework", "Foundation", "-framework", "Security",
                              str(harness), "-o", str(binary)], capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stderr
     return binary
