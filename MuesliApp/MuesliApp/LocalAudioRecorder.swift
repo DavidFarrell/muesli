@@ -120,6 +120,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var workStartedAt = ProcessInfo.processInfo.systemUptime
     private var drainScheduled = false
     private var accepting = true
+    // Stream-local append failure rejects only that stream at admission.
+    // Shared commit/manifest failures still close the global gate.
+    private var failedAdmissionSources: Set<Source> = []
     private var closeRequested = false
     private var closeWaitExpired = false
     private var rejectedFrames: [Source: Int64] = [:]
@@ -201,17 +204,18 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         guard !payload.isEmpty else { return true }
         lock.lock()
         let valid = payload.count % 2 == 0 && ptsUs >= 0 && ptsUs <= maximumDurationUs
-        guard accepting, valid, pending.count < 4096,
+        let sourceFailed = failedAdmissionSources.contains(source)
+        guard accepting, !sourceFailed, valid, pending.count < 4096,
               payload.count <= maxPendingBytes - pendingBytes else {
             rejectedFrames[source, default: 0] += Int64((payload.count + 1) / 2)
             let frame = valid ? (ptsUs * 16_000 + 500_000) / 1_000_000 : nil
             Self.addLoss(Loss(source: source.rawValue,
-                              reason: !valid ? "invalid_audio" : (accepting ? "ingress_overflow" : "after_close_or_failure"),
+                              reason: !valid ? "invalid_audio" : (sourceFailed ? "source_failed" : (accepting ? "ingress_overflow" : "after_close_or_failure")),
                               start_frame: frame, end_frame: frame.map { $0 + Int64(payload.count / 2) },
                               frames: Int64((payload.count + 1) / 2)),
                          to: &rejectedLosses, omitted: &omittedLosses)
             if !valid { latestError = RecorderError.invalidAudio.localizedDescription }
-            else if accepting { latestError = "Source recording queue is full; audio was lost." }
+            else if accepting && !sourceFailed { latestError = "Source recording queue is full; audio was lost." }
             lock.unlock()
             return false
         }
@@ -335,8 +339,11 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             catch {
                 lock.lock()
                 rejectedFrames[packet.source, default: 0] += Int64(packet.payload.count / 2)
-                latestError = error.localizedDescription
-                accepting = false
+                latestError = packet.source.rawValue + " source write failed: " + error.localizedDescription
+                failedAdmissionSources.insert(packet.source)
+                if let recorderError = error as? RecorderError, case .invalidManifest = recorderError {
+                    accepting = false // Invalid shared stream/handle inventory is store-wide.
+                }
                 let start = (packet.ptsUs * 16_000 + 500_000) / 1_000_000
                 Self.addLoss(Loss(source: packet.source.rawValue, reason: "source_write_failed",
                                   start_frame: start, end_frame: start + Int64(packet.payload.count / 2),

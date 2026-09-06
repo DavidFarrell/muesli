@@ -2,6 +2,123 @@ import Foundation
 import XCTest
 
 final class LocalAudioRecorderTests: XCTestCase {
+    func testPerStreamWriteFailurePreservesLaterHealthySourcePackets() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url, commitInterval: 0.01, beforeIO: { checkpoint in
+            if case .write(.mic) = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)) }
+        })
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 0, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while recorder.status().error == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertNotNil(recorder.status().error)
+        let accepted = recorder.record(source: .system, ptsUs: 10_000, payload: samples(160))
+        let result = try await finish(recorder)
+        print("per_stream_mic_write_failure: later_system_accepted=\(accepted), system_committed=\(result.streams["system"]?.committed_bytes ?? -1), system_dropped=\(result.streams["system"]?.dropped_frames ?? -1)")
+        XCTAssertTrue(accepted, "A mic-only write error must not disable the still-writable system track")
+        XCTAssertEqual(result.streams["system"]?.committed_bytes, 640)
+        XCTAssertEqual(result.streams["system"]?.dropped_frames, 0)
+        XCTAssertFalse(result.completed, "The failed mic must remain degraded")
+    }
+
+    func testSystemWriteFailureRejectsOnlySystemAndNewSessionCannotEraseIt() async throws {
+        let oldFolder = try folder()
+        let recorder = try LocalAudioRecorder(directory: oldFolder, beforeIO: { checkpoint in
+            if case .write(.system) = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)) }
+        })
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 0, payload: samples(160)))
+        try await waitForFailure(recorder)
+        XCTAssertTrue(recorder.status().accepting, "The shared store remains available to the healthy stream")
+        XCTAssertFalse(recorder.record(source: .system, ptsUs: 10_000, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 10_000, payload: samples(160)))
+        let old = try await finish(recorder)
+        XCTAssertFalse(old.completed)
+        XCTAssertEqual(old.streams["mic"]?.committed_bytes, 640)
+        XCTAssertEqual(old.streams["mic"]?.dropped_frames, 0)
+        XCTAssertEqual(old.streams["system"]?.dropped_frames, 320)
+        XCTAssertTrue(old.losses.contains { $0.source == "system" && $0.reason == "source_failed" && $0.frames == 160 })
+        XCTAssertFalse(recorder.status().error?.contains("queue is full") ?? true)
+        XCTAssertEqual(try Data(contentsOf: oldFolder.appendingPathComponent("mic.wav")).dropFirst(44), samples(320))
+
+        // Resume creates a separate source. Its healthy completion cannot
+        // mutate or upgrade the failed predecessor's persisted source outcome.
+        let next = try LocalAudioRecorder(directory: folder())
+        XCTAssertTrue(next.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        XCTAssertTrue(next.record(source: .system, ptsUs: 0, payload: samples(160)))
+        let nextResult = try await finish(next)
+        XCTAssertTrue(nextResult.completed)
+        XCTAssertFalse(try LocalAudioRecorder.readManifest(directory: oldFolder).completed)
+    }
+
+    func testStreamFailureDrainsHealthyAcceptedQueueThroughFinish() async throws {
+        let entered = TaskCompletion(), release = DispatchSemaphore(value: 0)
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url, maxPendingBytes: 1280, beforeIO: { checkpoint in
+            if case .write(.system) = checkpoint {
+                entered.markCompleted()
+                _ = release.wait(timeout: .now() + 3)
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+            }
+        })
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 0, payload: samples(160)))
+        let started = await entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(started, .completed)
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 10_000, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 10_000, payload: samples(160)))
+        XCTAssertEqual(recorder.status().queuedBytes, 1280, "The in-flight packet remains inside the shared cap")
+        recorder.requestFinish()
+        release.signal()
+        let final = try await finish(recorder)
+        XCTAssertFalse(final.completed)
+        XCTAssertEqual(final.streams["mic"]?.committed_bytes, 640)
+        XCTAssertEqual(final.streams["mic"]?.dropped_frames, 0)
+        XCTAssertEqual(final.streams["system"]?.committed_bytes, 0)
+        XCTAssertEqual(final.streams["system"]?.dropped_frames, 320)
+        XCTAssertEqual(recorder.status().queuedBytes, 0)
+        XCTAssertEqual(recorder.status().uncommittedPackets, 0)
+        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("mic.pcm")), samples(320))
+        let repeated = try await finish(recorder)
+        XCTAssertEqual(repeated.revision, final.revision, "Repeated Finish does not republish or lose the accepted prefix")
+    }
+
+    func testSharedCommitFailureStillClosesBothAdmissionGates() async throws {
+        let recorder = try LocalAudioRecorder(directory: folder(), commitInterval: 0.01, beforeIO: { checkpoint in
+            if case .manifest = checkpoint { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC)) }
+        })
+        XCTAssertTrue(recorder.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 0, payload: samples(160)))
+        try await waitForFailure(recorder)
+        XCTAssertFalse(recorder.status().accepting)
+        XCTAssertFalse(recorder.record(source: .mic, ptsUs: 10_000, payload: samples(160)))
+        XCTAssertFalse(recorder.record(source: .system, ptsUs: 10_000, payload: samples(160)))
+        let result = try await finish(recorder)
+        XCTAssertFalse(result.completed)
+    }
+
+    func testInvalidSharedInventoryStillClosesBothAdmissionGates() async throws {
+        let recorder = try LocalAudioRecorder(directory: folder(), beforeIO: { checkpoint in
+            if case .write(.system) = checkpoint { throw LocalAudioRecorder.RecorderError.invalidManifest }
+        })
+        XCTAssertTrue(recorder.record(source: .system, ptsUs: 0, payload: samples(160)))
+        try await waitForFailure(recorder)
+        XCTAssertFalse(recorder.status().accepting)
+        XCTAssertFalse(recorder.record(source: .mic, ptsUs: 0, payload: samples(160)))
+        let result = try await finish(recorder)
+        XCTAssertFalse(result.completed)
+    }
+
+    private func waitForFailure(_ recorder: LocalAudioRecorder) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while recorder.status().error == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertNotNil(recorder.status().error)
+    }
+
     private func folder() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("recorder-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
