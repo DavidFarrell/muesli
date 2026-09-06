@@ -30,7 +30,7 @@ FLAG_SETTINGS = ("OTHER_SWIFT_FLAGS", "OTHER_CFLAGS", "OTHER_LDFLAGS", "SWIFT_AC
                  "GCC_PREPROCESSOR_DEFINITIONS", "ENABLE_APP_SANDBOX", "ENABLE_HARDENED_RUNTIME",
                  "CODE_SIGN_ENTITLEMENTS", "SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY",
                  "SWIFT_APPROACHABLE_CONCURRENCY")
-SOURCE_ROOTS = ("MuesliApp/MuesliApp", "MuesliApp/MuesliAppTests", BACKEND + "/src", "scripts")
+SOURCE_ROOTS = ("MuesliApp/ArchiveCLI", "MuesliApp/MuesliApp", "MuesliApp/MuesliAppTests", BACKEND + "/src", "scripts")
 
 
 def digest(data):

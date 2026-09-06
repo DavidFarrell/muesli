@@ -10,6 +10,10 @@
         BC0000010000000000000001 /* EmbeddedBuildIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000004; };
         BC0000010000000000000002 /* EmbeddedBuildIdentity.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000004; };
         BC0000010000000000000003 /* build-identity.json in Resources */ = {isa = PBXBuildFile; fileRef = BC0000010000000000000005; };
+		AC110000000000000000000B = {isa = PBXBuildFile; fileRef = AC1100000000000000000001; };
+		AC110000000000000000000C = {isa = PBXBuildFile; fileRef = AC1100000000000000000002; };
+		AC110000000000000000000D = {isa = PBXBuildFile; fileRef = AC1100000000000000000003; };
+		AC110000000000000000000E = {isa = PBXBuildFile; fileRef = AC1100000000000000000004; settings = {ATTRIBUTES = (CodeSignOnCopy,); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -20,6 +24,7 @@
 			remoteGlobalIDString = 636552CE2F1D175D0042F2C9;
 			remoteInfo = MuesliApp;
 		};
+		AC1100000000000000000018 = {isa = PBXContainerItemProxy; containerPortal = 636552C72F1D175D0042F2C9; proxyType = 1; remoteGlobalIDString = AC110000000000000000001E; remoteInfo = MuesliArchiveCLI; };
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +32,10 @@
         BC0000010000000000000005 /* build-identity.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "build-identity.json"; sourceTree = DERIVED_FILE_DIR; };
 		636552CF2F1D175D0042F2C9 /* MuesliApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MuesliApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000010000000000000001 /* MuesliAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MuesliAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AC1100000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ArchiveCLI/ArchiveCLI.swift"; sourceTree = SOURCE_ROOT; };
+		AC1100000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MuesliApp/ArchiveWorkflowProtocol.swift"; sourceTree = SOURCE_ROOT; };
+		AC1100000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MuesliApp/ArchiveWorkflowSocket.swift"; sourceTree = SOURCE_ROOT; };
+		AC1100000000000000000004 = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; path = "muesli-archive"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -35,6 +44,9 @@
 			membershipExceptions = (
                 ShutdownWorkRegistry.swift,
                 ApplicationQuitCoordinator.swift,
+                ArchiveWorkflowProtocol.swift,
+                ArchiveWorkflowOwner.swift,
+                ArchiveWorkflowSocket.swift,
 				AECMode.swift,
 				ArchiveReceipt.swift,
 				ArchiveMoveJournal.swift,
@@ -136,13 +148,19 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AC1100000000000000000016 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		AC1100000000000000000017 /* Embed Archive CLI */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = "Contents/Helpers"; dstSubfolderSpec = 1; files = (AC110000000000000000000E,); name = "Embed Archive CLI"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXGroup section */
 		636552C62F1D175D0042F2C9 = {
 			isa = PBXGroup;
 			children = (
 				636552D12F1D175D0042F2C9 /* MuesliApp */,
+				AC1100000000000000000014 /* ArchiveCLI */,
 				AA0000010000000000000002 /* MuesliAppTests */,
 				636552D02F1D175D0042F2C9 /* Products */,
 			);
@@ -152,11 +170,13 @@
 			isa = PBXGroup;
 			children = (
 				636552CF2F1D175D0042F2C9 /* MuesliApp.app */,
+				AC1100000000000000000004 /* muesli-archive */,
 				AA0000010000000000000001 /* MuesliAppTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
+		AC1100000000000000000014 /* ArchiveCLI */ = {isa = PBXGroup; children = (AC1100000000000000000001, AC1100000000000000000002, AC1100000000000000000003,); name = ArchiveCLI; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -168,10 +188,12 @@
 				636552CB2F1D175D0042F2C9 /* Sources */,
 				636552CC2F1D175D0042F2C9 /* Frameworks */,
 				636552CD2F1D175D0042F2C9 /* Resources */,
+				AC1100000000000000000017 /* Embed Archive CLI */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				AC1100000000000000000019,
 			);
 			fileSystemSynchronizedGroups = (
 				636552D12F1D175D0042F2C9 /* MuesliApp */,
@@ -206,6 +228,7 @@
 			productReference = AA0000010000000000000001 /* MuesliAppTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		AC110000000000000000001E /* MuesliArchiveCLI */ = {isa = PBXNativeTarget; buildConfigurationList = AC110000000000000000001F; buildPhases = (AC1100000000000000000015, AC1100000000000000000016,); buildRules = (); dependencies = (); name = MuesliArchiveCLI; productName = "muesli-archive"; productReference = AC1100000000000000000004; productType = "com.apple.product-type.tool"; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -239,6 +262,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				AC110000000000000000001E /* MuesliArchiveCLI */,
 				636552CE2F1D175D0042F2C9 /* MuesliApp */,
 				AA0000010000000000000005 /* MuesliAppTests */,
 			);
@@ -300,6 +324,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AC1100000000000000000015 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (AC110000000000000000000B, AC110000000000000000000C, AC110000000000000000000D,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -308,6 +333,7 @@
 			target = 636552CE2F1D175D0042F2C9 /* MuesliApp */;
 			targetProxy = AA0000010000000000000008 /* PBXContainerItemProxy */;
 		};
+		AC1100000000000000000019 = {isa = PBXTargetDependency; target = AC110000000000000000001E; targetProxy = AC1100000000000000000018; };
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -557,6 +583,8 @@
 			};
 			name = Release;
 		};
+		AC1100000000000000000020 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = JA9EPB8K4N; ENABLE_HARDENED_RUNTIME = YES; MACOSX_DEPLOYMENT_TARGET = 26.2; PRODUCT_NAME = "muesli-archive"; SDKROOT = macosx; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = macosx; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; }; name = Debug; };
+		AC1100000000000000000021 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = JA9EPB8K4N; ENABLE_HARDENED_RUNTIME = YES; MACOSX_DEPLOYMENT_TARGET = 26.2; PRODUCT_NAME = "muesli-archive"; SDKROOT = macosx; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = macosx; SWIFT_VERSION = 6.0; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -587,6 +615,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		AC110000000000000000001F = {isa = XCConfigurationList; buildConfigurations = (AC1100000000000000000020, AC1100000000000000000021,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 	};
 	rootObject = 636552C72F1D175D0042F2C9 /* Project object */;

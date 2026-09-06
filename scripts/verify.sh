@@ -50,6 +50,20 @@ xcodebuild test -project "$project_root/MuesliApp/MuesliApp.xcodeproj" -scheme M
 xcodebuild build -project "$project_root/MuesliApp/MuesliApp.xcodeproj" -scheme MuesliApp \
   -configuration Release -derivedDataPath "$output_root/DerivedData" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > "$output_root/release-build.log" 2>&1
+archive_cli="$output_root/DerivedData/Build/Products/Release/MuesliApp.app/Contents/Helpers/muesli-archive"
+test -x "$archive_cli"
+/usr/bin/codesign --verify --strict "$archive_cli" > "$output_root/archive-cli-signature.log" 2>&1
+# Invalid command is handled before any endpoint access: qualification must not
+# contact the installed app or open a listener in the user's support directory.
+if "$archive_cli" unsupported-command > "$output_root/archive-cli-protocol.json"; then
+  echo 'Archive CLI accepted an unsupported command.' >&2; exit 1
+fi
+"$UV_PROJECT_ENVIRONMENT/bin/python" - "$output_root/archive-cli-protocol.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+assert json.loads(Path(sys.argv[1]).read_bytes()) == {"protocol_version": 1, "failure": "invalidRequest"}
+PY
 "$UV_PROJECT_ENVIRONMENT/bin/python" "$project_root/scripts/runtime-manifest.py" \
   --project "$project_root" --out "$output_root/runtime-manifest.json"
 echo "Verification passed. Evidence: $output_root"

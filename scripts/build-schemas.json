@@ -1,4 +1,5 @@
 {
+  "archive_workflow_protocol": 1,
   "meeting_metadata": 1,
   "source_manifest": 1,
   "session_asset_events": 1,
