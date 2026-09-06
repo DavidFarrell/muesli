@@ -19,6 +19,7 @@ typedef NS_ENUM(uint64_t, MuesliInferenceStreams) {
 // Wire record: exactly seven big-endian UInt64 words: version=1, then
 // directory device/inode, access-lock device/inode, backend-lock device/inode.
 // No source path, command, environment, import path or descriptor is encoded.
+NS_SWIFT_SENDABLE
 @interface MuesliSourceLease : NSObject <NSSecureCoding>
 @property(nonatomic, readonly, copy) NSData *record;
 @property(nonatomic, readonly) uint64_t directoryDevice;
@@ -37,6 +38,7 @@ typedef NS_ENUM(uint64_t, MuesliInferenceStreams) {
 // Only audio or audio-session-[1-9][0-9]{0,8}, and a canonical UUID, are valid.
 // Native admission matches this UUID to the bounded source manifest; the live
 // backend must also match the later meetingStart source_session_id exactly.
+NS_SWIFT_SENDABLE
 @interface MuesliLiveSource : NSObject <NSSecureCoding>
 @property(nonatomic, readonly, copy) NSString *audioFolder;
 @property(nonatomic, readonly, copy) NSUUID *sourceID;
@@ -45,6 +47,7 @@ typedef NS_ENUM(uint64_t, MuesliInferenceStreams) {
 
 // The hashes identify actual files in this signed proof bundle. They are not
 // an expected lock, a model-loading claim, or caller-selected model metadata.
+NS_SWIFT_SENDABLE
 @interface MuesliServiceReservation : NSObject <NSSecureCoding>
 @property(nonatomic, readonly) uint64_t protocolVersion;
 @property(nonatomic, readonly, copy) NSUUID *instanceID;
@@ -59,6 +62,7 @@ typedef NS_ENUM(uint64_t, MuesliInferenceStreams) {
 // operationStatus describes native/Python operation return ONLY. The service
 // still performs owned process-group cleanup; actual kernel termination status,
 // transport invalidation, output EOF and journal closure are distinct facts.
+NS_SWIFT_SENDABLE
 @interface MuesliOperationResult : NSObject <NSSecureCoding>
 @property(nonatomic, readonly, copy) NSUUID *instanceID;
 @property(nonatomic, readonly, copy) NSUUID *jobID;
