@@ -61,12 +61,13 @@ work; existing `begin` remains for successors of already accepted work.
 
 ## Validation
 
-41 focused actual Xcode tests pass: 11 listener lifecycle, 16 socket/workflow
+42 focused actual Xcode tests pass: 12 listener lifecycle, 16 socket/workflow
 and 14 existing cooperative Quit tests. Synthetic fixtures cover a stalled
 constructor, actual bound-but-unreturned listener, queued old request, stalled
 close, early callback, duplicate callback, immediate Cancel, second Quit,
 coalesced intent, throwing cleanup, delayed UI publication, retained semantic
-work and callback reentry after real temporary Unix socket/lease closure.
+work callback reentry after real temporary Unix socket/lease closure, and explicit
+retry clearing the prior startup failure only after successful new admission.
 No installed endpoint, app launch, real capture or user Quit is exercised.
 
 Evidence paths: `/private/tmp/muesli-archive-listener-final-tests.log`,

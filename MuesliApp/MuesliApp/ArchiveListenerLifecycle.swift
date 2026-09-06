@@ -118,6 +118,7 @@ nonisolated final class ArchiveListenerLifecycle: @unchecked Sendable {
     private func startLocked() -> Bool {
         do {
             let token = try shutdown.beginUserWork("Starting archive command listener")
+            failure = nil
             generation = UUID()
             let attempt = Attempt(generation: generation, token: token)
             active = attempt

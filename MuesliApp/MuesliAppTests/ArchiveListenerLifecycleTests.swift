@@ -262,4 +262,21 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
         try await stop(lifecycle, registry)
     }
 
+    func testSuccessfulExplicitRetryClearsPriorStartupFailure() async throws {
+        let registry = ShutdownWorkRegistry(), attempts = Count()
+        let lifecycle = ArchiveListenerLifecycle(workflow: workflow(registry), shutdown: registry, factory: { closed in
+            if attempts.add() == 1 { throw ArchiveWorkflowProtocol.Failure.unsafeEndpoint }
+            return Listener(close: closed)
+        })
+        XCTAssertTrue(lifecycle.enable())
+        try await until { lifecycle.snapshot.phase == .failed }
+        XCTAssertEqual(lifecycle.snapshot.failure, .startupFailed)
+        XCTAssertTrue(lifecycle.enable())
+        let ready = await lifecycle.waitForStartup(timeoutSeconds: 2)
+        XCTAssertEqual(ready, .listening)
+        XCTAssertNil(lifecycle.snapshot.failure, "successful new admission must not keep the previous attempt's failure")
+        XCTAssertEqual(attempts.current, 2)
+        try await stop(lifecycle, registry)
+    }
+
 }
