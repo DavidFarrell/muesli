@@ -198,3 +198,36 @@ This supersedes the pending producer/Quit/combined-test statements above.
 - The reviewer and root assessed separate stderr closure and delayed preview-flag candidates. Neither established P2 production impact; no speculative source change was made. This remains a bounded code-review result, not proof that all runtime behavior is flawless.
 - Remaining completion gates: signed helper inference/package qualification, distribution signing/notarization and dependency/model release evidence, clean installation/update/rollback, participating installed archive qualification, and actual eight-hour/100-route/sleep controlled-signal evidence. Archive eligibility intentionally retains ordinary initial source-alignment loss; real automatic-archive usability needs installed qualification. Unit tests and generated fixtures do not satisfy these gates.
 - Public publication and the isolated helper-only unsigned-executable-memory proposal still require the previously requested specific user responses after automatic approval review rejected those actions. The helper proposal remains unapplied. No public push/PR/merge, installed-app replacement/launch, user recording, physical route/sleep test, real Trash action or new external Merge skill change is claimed by this checkpoint. The overall goal is **not complete**.
+
+## Authorised follow-up and Claude review corrections
+
+6 September 2026. The user explicitly authorised publication if Claude Fable 5.1
+passes its review, and authorised the isolated helper entitlement experiment with
+repeat security/inference checks and a fresh Astra review before integration.
+Distribution is deferred; the immediate target is a local build/install for later
+manual testing. This supersedes the unanswered-approval statements above.
+
+- Claude's initial read-only review found system-native retirement F-A and clock
+  drift F-B. Root reproduced both in actual production methods using generated
+  fixtures. Neither finding was treated as hardware-qualified evidence, and
+  unsafe suggested blanket stop-error retirement was rejected.
+- F-A is integrated as `5986342`. Root independently reviewed the native owner
+  and passed ten actual native-owner/lease tests. The unchanged seven-test core
+  went from 18 baseline failures to zero. Author full Swift suite, strict Swift 6
+  and exact identified Release passed. See `native-system-retirement.md`.
+- F-B and bounded diagnostics are integrated as `af607e1` / `240a7c1`, after a
+  separate Astra author/reviewer cycle. The final independent code review passed
+  at `0099ef1`, with 41 independent Swift tests and no supported P2+ remaining in
+  that slice. Root also passed the original drift regression and the real
+  processor/ingress/forwarder/recorder test. See `host-clock-retiming.md` and
+  `clock-correction-diagnostics.md` for fidelity, bounded state and uncertainty.
+- Claude's second pass read the previously unreviewed production subsystems and
+  found no further P2+ defect. It identified a smaller Resume/Stop/export count
+  mismatch, which is being reproduced and corrected before the final tree review.
+  Its publication verdict remains pending. No code has been published by these
+  follow-up steps.
+- The isolated helper experiment is frozen at `fe1a744` with actual inference,
+  native network/peer/ownership checks and a bounded independent Astra pass.
+  Successful private-home source admission and current-backend/client integration
+  remain open, as detailed in `unsigned-memory-proposal.md`. No main-app helper
+  integration or installed-app replacement is claimed.
