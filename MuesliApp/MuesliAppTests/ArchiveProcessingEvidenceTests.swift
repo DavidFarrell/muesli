@@ -58,6 +58,31 @@ final class ArchiveProcessingEvidenceTests: XCTestCase {
         let result = try ArchiveProcessingEvidence.validate(log: encoded(fixture()), observedExitCode: 0, expected: expected)
         XCTAssertEqual(result.sessionCount, 1); XCTAssertEqual(result.streamCount, 2); XCTAssertEqual(result.turnCount, 1)
     }
+    func testTypedLegacyOwnerCompletionStillValidatesExactProcessingProtocol() async throws {
+        let backend = try BackendProcess(command: ["/usr/bin/true"])
+        let writer = FramedWriter(stdinHandle: backend.stdin)
+        defer { backend.forceKill(); backend.cleanup() }
+        try backend.start()
+        _ = await backend.waitForExit(timeoutSeconds: 3)
+        _ = await writer.closeStdinAndWait(timeoutSeconds: 2)
+        _ = await backend.finishStdout(timeoutSeconds: 3)
+        let completion = try XCTUnwrap(backend.completionEvidence())
+        let identity = MeetingFileAccess.Identity(directoryDevice: 1, directoryInode: 2, lockDevice: 1, lockInode: 3)
+        let log = try encoded(fixture())
+        let verified = try ArchiveProcessingEvidence.validate(log: log, completion: completion,
+            sourceIdentity: identity, sourceSnapshotSHA256: pcmHash, expected: expected)
+        XCTAssertEqual(verified.turnCount, 1)
+        XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: log + log, completion: completion,
+            sourceIdentity: identity, sourceSnapshotSHA256: pcmHash, expected: expected))
+        var changed = fixture()
+        changeEntry(&changed) { entry in
+            var input = entry["source_input"] as! [String: Any]
+            input["sha256"] = String(repeating: "f", count: 64)
+            entry["source_input"] = input
+        }
+        XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: encoded(changed), completion: completion,
+            sourceIdentity: identity, sourceSnapshotSHA256: pcmHash, expected: expected))
+    }
     func testActualExitErrorEventsDuplicateFinalAndTrailingRecordsRefuse() throws {
         let log = try encoded(fixture())
         XCTAssertThrowsError(try ArchiveProcessingEvidence.validate(log: log, observedExitCode: 2, expected: expected))

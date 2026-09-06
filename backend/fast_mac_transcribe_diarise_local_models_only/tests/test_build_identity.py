@@ -118,7 +118,7 @@ def test_generated_bytecode_in_python_roots_does_not_dirty_source(tmp_path):
     (tmp_path / '.gitignore').write_text('__pycache__/\n')
     git(tmp_path, 'init'); git(tmp_path, 'add', '.'); git(tmp_path, 'commit', '-m', 'Fixture')
     before = build.identity(tmp_path, {'ACTION': 'install'})
-    for relative in ['scripts', build.BACKEND + '/src']:
+    for relative in ['scripts', build.BACKEND + '/src', 'release/inference-service']:
         bytecode = tmp_path / relative / '__pycache__/module.cpython-312.pyc'
         bytecode.parent.mkdir(parents=True, exist_ok=True); bytecode.write_bytes(b'generated cache')
     after = build.identity(tmp_path, {'ACTION': 'install'})
@@ -139,3 +139,21 @@ def test_effective_coverage_setting_distinguishes_identified_release_builds(tmp_
     assert len({enabled['build_id'], disabled['build_id'], absent['build_id']}) == 3
     assert disabled == build.identity(tmp_path, dict(common, ENABLE_CODE_COVERAGE='NO'))
     assert 'ENABLE_CODE_COVERAGE' not in json.dumps(disabled)
+
+
+@pytest.mark.parametrize('name', ['BackendXPCJobOwner.swift', 'InferenceProtocolV2.m',
+                                 'MuesliNativeProcessObserver.m', 'SourceLeaseAdmission.m'])
+def test_canonical_native_transport_is_in_actual_source_digest(tmp_path, name):
+    fixture(tmp_path)
+    code = tmp_path / 'release/inference-service' / name
+    code.parent.mkdir(parents=True)
+    code.write_text('original compiler input')
+    git(tmp_path, 'init'); git(tmp_path, 'add', '.'); git(tmp_path, 'commit', '-m', 'Fixture')
+    first = build.identity(tmp_path, {'ACTION': 'install'})
+    code.write_text('changed compiler input')
+    changed = build.identity(tmp_path, {})
+    assert changed['source_commit'] == first['source_commit']
+    assert changed['source_tree_sha256'] != first['source_tree_sha256']
+    assert changed['build_id'] != first['build_id']
+    with pytest.raises(ValueError, match='clean, identified'):
+        build.identity(tmp_path, {'ACTION': 'install'})

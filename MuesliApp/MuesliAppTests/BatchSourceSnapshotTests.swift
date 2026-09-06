@@ -241,6 +241,27 @@ final class BatchSourceSnapshotTests: XCTestCase {
         XCTAssertNil(try JSONDecoder().decode(BatchRediarizer.Result.self,
             from: JSONSerialization.data(withJSONObject: forged)).nativeProcessingEvidence)
     }
+    func testNativeCompletionDigestBindsSourceBytesStreamsAndIdentityButNotDisplayNames() async throws {
+        let folder = try fixture(), original = try await snapshot(folder)
+        let digest = try original.completionSHA256()
+        XCTAssertEqual(digest.count, 64)
+        XCTAssertEqual(digest, try original.completionSHA256())
+        let renamed = BatchSourceSnapshot(folderIdentity: original.folderIdentity, selectedStream: original.selectedStream,
+            sessions: original.sessions, sources: original.sources, reviewedNames: ["mic:0": "New display name"])
+        XCTAssertEqual(digest, try renamed.completionSHA256())
+        let mic = try await snapshot(folder, stream: .mic)
+        XCTAssertNotEqual(digest, try mic.completionSHA256())
+        let changedIdentity = MeetingFileAccess.Identity(directoryDevice: original.folderIdentity.directoryDevice,
+            directoryInode: original.folderIdentity.directoryInode + 1,
+            lockDevice: original.folderIdentity.lockDevice, lockInode: original.folderIdentity.lockInode)
+        let replaced = BatchSourceSnapshot(folderIdentity: changedIdentity, selectedStream: original.selectedStream,
+            sessions: original.sessions, sources: original.sources, reviewedNames: original.reviewedNames)
+        XCTAssertNotEqual(digest, try replaced.completionSHA256())
+        let file = try FileHandle(forWritingTo: folder.appendingPathComponent("audio/mic.pcm"))
+        try file.write(contentsOf: Data([1, 0])); try file.close()
+        let changedBytes = try await snapshot(folder)
+        XCTAssertNotEqual(digest, try changedBytes.completionSHA256())
+    }
     func testNonzeroActualExitAndBoundedEvidenceOverflowCannotReturnProof() async throws {
         for nonzero in [true, false] {
             let folder = try fixture(), script = try await eventScript(folder, exitCode: nonzero ? 7 : 0)

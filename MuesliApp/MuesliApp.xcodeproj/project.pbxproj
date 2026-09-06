@@ -14,6 +14,18 @@
 		AC110000000000000000000C = {isa = PBXBuildFile; fileRef = AC1100000000000000000002; };
 		AC110000000000000000000D = {isa = PBXBuildFile; fileRef = AC1100000000000000000003; };
 		AC110000000000000000000E = {isa = PBXBuildFile; fileRef = AC1100000000000000000004; settings = {ATTRIBUTES = (CodeSignOnCopy,); }; };
+		D12800000000000000000064 /* BackendXPCJobOwner.swift in App Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000001; };
+		D12800000000000000000065 /* InferenceProtocolV2.m in App Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000002; };
+		D12800000000000000000066 /* MuesliNativeProcessObserver.m in App Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000003; };
+		D12800000000000000000067 /* SourceLeaseAdmission.m in App Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000004; };
+		D12800000000000000000068 /* Security.framework in App Frameworks */ = {isa = PBXBuildFile; fileRef = D12800000000000000000008; };
+		D1280000000000000000006E /* BackendXPCJobOwner.swift in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000001; };
+		D1280000000000000000006F /* InferenceProtocolV2.m in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000002; };
+		D12800000000000000000070 /* MuesliNativeProcessObserver.m in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000003; };
+		D12800000000000000000071 /* SourceLeaseAdmission.m in Test Sources */ = {isa = PBXBuildFile; fileRef = D12800000000000000000004; };
+		D12800000000000000000072 /* Security.framework in Test Frameworks */ = {isa = PBXBuildFile; fileRef = D12800000000000000000008; };
+        D12900000000000000000002 = {isa = PBXBuildFile; fileRef = D12900000000000000000001; };
+        D12900000000000000000003 = {isa = PBXBuildFile; fileRef = D12900000000000000000001; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -36,12 +48,23 @@
 		AC1100000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MuesliApp/ArchiveWorkflowProtocol.swift"; sourceTree = SOURCE_ROOT; };
 		AC1100000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MuesliApp/ArchiveWorkflowSocket.swift"; sourceTree = SOURCE_ROOT; };
 		AC1100000000000000000004 = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; path = "muesli-archive"; sourceTree = BUILT_PRODUCTS_DIR; };
+		D12800000000000000000001 /* BackendXPCJobOwner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendXPCJobOwner.swift; sourceTree = "<group>"; };
+		D12800000000000000000002 /* InferenceProtocolV2.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = InferenceProtocolV2.m; sourceTree = "<group>"; };
+		D12800000000000000000003 /* MuesliNativeProcessObserver.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MuesliNativeProcessObserver.m; sourceTree = "<group>"; };
+		D12800000000000000000004 /* SourceLeaseAdmission.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SourceLeaseAdmission.m; sourceTree = "<group>"; };
+		D12800000000000000000005 /* InferenceProtocolV2.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = InferenceProtocolV2.h; sourceTree = "<group>"; };
+		D12800000000000000000006 /* MuesliNativeProcessObserver.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MuesliNativeProcessObserver.h; sourceTree = "<group>"; };
+		D12800000000000000000007 /* SourceLeaseAdmission.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SourceLeaseAdmission.h; sourceTree = "<group>"; };
+		D12800000000000000000008 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+        D12900000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceCapabilityOwner.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		AA000001000000000000000B /* Exceptions for "MuesliApp" folder in "MuesliAppTests" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+                LocalInferenceSession.swift,
+                PackagedInferenceRuntime.swift,
                 ShutdownWorkRegistry.swift,
                 ApplicationQuitCoordinator.swift,
                 ArchiveListenerLifecycle.swift,
@@ -145,6 +168,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12800000000000000000068,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -152,6 +176,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12800000000000000000072,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -167,6 +192,7 @@
 			isa = PBXGroup;
 			children = (
 				636552D12F1D175D0042F2C9 /* MuesliApp */,
+				D12800000000000000000063 /* Inference transport */,
 				AC1100000000000000000014 /* ArchiveCLI */,
 				AA0000010000000000000002 /* MuesliAppTests */,
 				636552D02F1D175D0042F2C9 /* Products */,
@@ -184,6 +210,7 @@
 			sourceTree = "<group>";
 		};
 		AC1100000000000000000014 /* ArchiveCLI */ = {isa = PBXGroup; children = (AC1100000000000000000001, AC1100000000000000000002, AC1100000000000000000003,); name = ArchiveCLI; sourceTree = "<group>"; };
+		D12800000000000000000063 /* Inference transport */ = {isa = PBXGroup; children = (D12900000000000000000001, D12800000000000000000001, D12800000000000000000002, D12800000000000000000003, D12800000000000000000004, D12800000000000000000005, D12800000000000000000006, D12800000000000000000007, D12800000000000000000008,); name = "Inference transport"; path = "../release/inference-service"; sourceTree = SOURCE_ROOT; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -319,6 +346,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12900000000000000000002,
+                D12800000000000000000064,
+                D12800000000000000000065,
+                D12800000000000000000066,
+                D12800000000000000000067,
                 BC0000010000000000000001,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -327,6 +359,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                D12900000000000000000003,
+                D1280000000000000000006E,
+                D1280000000000000000006F,
+                D12800000000000000000070,
+                D12800000000000000000071,
                 BC0000010000000000000002,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

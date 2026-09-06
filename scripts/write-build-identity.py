@@ -30,7 +30,7 @@ FLAG_SETTINGS = ("OTHER_SWIFT_FLAGS", "OTHER_CFLAGS", "OTHER_LDFLAGS", "SWIFT_AC
                  "GCC_PREPROCESSOR_DEFINITIONS", "ENABLE_APP_SANDBOX", "ENABLE_HARDENED_RUNTIME",
                  "CODE_SIGN_ENTITLEMENTS", "SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY",
                  "SWIFT_APPROACHABLE_CONCURRENCY", "ENABLE_CODE_COVERAGE")
-SOURCE_ROOTS = ("MuesliApp/ArchiveCLI", "MuesliApp/MuesliApp", "MuesliApp/MuesliAppTests", BACKEND + "/src", "scripts")
+SOURCE_ROOTS = ("MuesliApp/ArchiveCLI", "MuesliApp/MuesliApp", "MuesliApp/MuesliAppTests", BACKEND + "/src", "scripts", "release")
 
 
 def digest(data):
@@ -65,7 +65,7 @@ def identity(root, environment):
         names = {os.fsencode(path) for path in INPUTS.values()}
         for relative in SOURCE_ROOTS:
             for path in (root / relative).rglob("*"):
-                if (relative in {BACKEND + "/src", "scripts"} and path.parent.name == "__pycache__" and path.suffix == ".pyc") or path.name == ".DS_Store":
+                if (relative in {BACKEND + "/src", "scripts", "release"} and path.parent.name == "__pycache__" and path.suffix == ".pyc") or path.name == ".DS_Store":
                     continue
                 if path.is_file() or path.is_symlink():
                     raw = os.fsencode(str(path.relative_to(root)))

@@ -73,7 +73,9 @@ class _ProcessPin:
             # The fixed order matches Swift: outer archive exclusion, then
             # the backend-specific lease. No transaction lock or lock upgrade.
             for name in LOCK_NAMES:
-                fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+                # Shared exclusion does not write the lock file. Read-only
+                # descriptors also work under the helper's admitted read grant.
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
                 opened.append(fd)
                 state = os.fstat(fd)
                 if not _private_lock(state) or not _matches(state, self.lock_identities[name]):
