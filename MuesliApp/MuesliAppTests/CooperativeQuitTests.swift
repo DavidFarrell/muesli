@@ -289,4 +289,41 @@ final class CooperativeQuitTests: XCTestCase {
         XCTAssertEqual(saved.speakerNames, ["first": "Alex", "second": "Blair"])
     }
 
+    func testImmediateCancelCannotReviveAlreadyClaimedStartHandoff() async throws {
+        let registry = ShutdownWorkRegistry(), directory = try folder()
+        let coordinator = ApplicationQuitCoordinator(registry: registry)
+        let store = TranscriptPersistenceStore(shutdown: registry)
+        let owner = MeetingStartPreparationOwner(store: store, shutdown: registry)
+        let bridge = try registry.begin("Start handoff")
+        let oldIntent = coordinator.startIntent
+        guard case .ready(let prepared) = await owner.prepare(.init(title: "Old start", meetingsDirectory: directory)) else {
+            return XCTFail("actual owner must have claimed the ready fixture")
+        }
+        var asyncPreparations = 0, replies: [Bool] = []
+        coordinator.configure(prepare: { asyncPreparations += 1 }, cancelled: {})
+        // This is the real immediate-panel ordering, without yielding MainActor
+        // to the coordinator's queued asynchronous preparation task.
+        registry.recordFailure("Earlier save needs review")
+        coordinator.requestQuit { replies.append($0) }
+        XCTAssertTrue(coordinator.showsPending)
+        coordinator.cancelQuit()
+        XCTAssertTrue(registry.acceptsUserWork)
+        XCTAssertFalse(coordinator.canContinueStart(oldIntent), "reopening admission must not restore the old generation")
+        let nextIntent = coordinator.startIntent
+        XCTAssertTrue(coordinator.canContinueStart(nextIntent), "a newly requested Start remains usable")
+        // Use the same production admission predicate and cleanup owner as
+        // AppModel's post-prepare handoff; no hardware-backed AppModel needed.
+        if coordinator.canContinueStart(oldIntent) { XCTFail("old capture would be adopted") }
+        else { owner.discardUnadopted(prepared) }
+        bridge.finish()
+        try await drained(registry)
+        XCTAssertEqual(asyncPreparations, 0, "Cancel skipped async prepare, but intent was already retired")
+        XCTAssertEqual(replies, [false])
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let metadata = try decoder.decode(MeetingMetadata.self, from: Data(contentsOf: prepared.folderURL.appendingPathComponent("meeting.json")))
+        XCTAssertEqual(metadata.status, .interrupted)
+        XCTAssertEqual(metadata.sessions.last?.sourceSessionID, prepared.sourceID)
+        XCTAssertThrowsError(try prepared.logHandle.write(contentsOf: Data([1])))
+    }
+
 }

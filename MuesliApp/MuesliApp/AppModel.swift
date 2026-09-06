@@ -759,10 +759,7 @@ final class AppModel: ObservableObject {
         return false
     }
 
-    private var quitStartIntent = UUID()
-
     func prepareForApplicationQuit() async {
-        quitStartIntent = UUID()
         meetingCatalog.invalidate()
         backendAdmission.retireAdmission()
         pendingMicOperation = nil
@@ -2102,7 +2099,7 @@ final class AppModel: ObservableObject {
         guard ShutdownWorkRegistry.shared.acceptsUserWork,
               let startWork = try? ShutdownWorkRegistry.shared.begin("Starting or retiring a meeting") else { return }
         defer { startWork.finish() }
-        let startIntent = quitStartIntent
+        let startIntent = ApplicationQuitCoordinator.shared.startIntent
         meetingCatalog.invalidate()
         guard !isStartingMeeting else { return }
         guard !meetingStartPreparation.isBusy else {
@@ -2127,7 +2124,7 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
-        guard startIntent == quitStartIntent, ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else { return }
         refreshPermissions()
         loadInputDevices()
         backendFolderError = nil
@@ -2211,7 +2208,7 @@ final class AppModel: ObservableObject {
             shareableContentError = "The previous meeting preparation is still closing its files."
             return
         }
-        guard startIntent == quitStartIntent, ShutdownWorkRegistry.shared.acceptsUserWork else {
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else {
             meetingStartPreparation.discardUnadopted(prepared)
             return
         }
@@ -3318,11 +3315,14 @@ final class AppModel: ObservableObject {
     }
 
     func resumeMeeting(_ item: MeetingHistoryItem) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        let resumeIntent = ApplicationQuitCoordinator.shared.startIntent
         guard !isPreparingResume, !isStartingMeeting, !isCapturing, !isFinalizing else { return }
         isPreparingResume = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { isPreparingResume = false }
+            guard ApplicationQuitCoordinator.shared.canContinueStart(resumeIntent) else { return }
             await startMeeting(resuming: item)
         }
     }

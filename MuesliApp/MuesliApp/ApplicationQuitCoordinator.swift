@@ -13,6 +13,9 @@ final class ApplicationQuitCoordinator: ObservableObject {
     @Published private(set) var showsPending = false
     private let registry: ShutdownWorkRegistry
     private let pendingAfter: Duration
+    // Captured by Start before its first suspension. Accepting Quit retires
+    // it synchronously, even if Cancel prevents async shutdown preparation.
+    private(set) var startIntent = UUID()
     private var requestID: UUID?
     private var reply: (@MainActor (Bool) -> Void)?
     private var prepare: @MainActor () async -> Void = {}
@@ -27,12 +30,16 @@ final class ApplicationQuitCoordinator: ObservableObject {
     func configure(prepare: @escaping @MainActor () async -> Void, cancelled: @escaping @MainActor () -> Void) {
         self.prepare = prepare; self.cancelled = cancelled
     }
+    func canContinueStart(_ capturedIntent: UUID) -> Bool {
+        registry.acceptsUserWork && startIntent == capturedIntent
+    }
     func requestQuit(reply: @escaping @MainActor (Bool) -> Void) {
         guard requestID == nil else { return }
         let id = UUID()
         // This bridge precedes quiescence, and remains until Stop has admitted
         // its finalizer. Every successor obtains its own token before release.
         guard let preparation = try? registry.begin("Stopping and finalizing capture") else { return }
+        startIntent = UUID()
         requestID = id; self.reply = reply; isRequested = true
         registry.beginQuit()
         let prepare = self.prepare
