@@ -53,13 +53,20 @@ final class CooperativeQuitTests: XCTestCase {
     func testDeadlineOnlyShowsPendingAndActualCompletionRepliesOnce() async throws {
         let registry = ShutdownWorkRegistry(), work = try registry.begin("original source")
         let coordinator = ApplicationQuitCoordinator(registry: registry, pendingAfter: .milliseconds(15))
+        defer { work.finish(); coordinator.cancelQuit() }
+        let pendingShown = TaskCompletion(), quitReplied = TaskCompletion()
+        coordinator.presentationChanged = { visible in
+            if visible { pendingShown.markCompleted() }
+        }
         var replies: [Bool] = []
-        coordinator.requestQuit { replies.append($0) }
-        try await Task.sleep(for: .milliseconds(40))
+        coordinator.requestQuit { replies.append($0); quitReplied.markCompleted() }
+        let pending = await pendingShown.wait(timeoutSeconds: 2)
+        XCTAssertEqual(pending, .completed)
         XCTAssertTrue(coordinator.showsPending)
         XCTAssertEqual(replies, [])
         work.finish()
-        try await Task.sleep(for: .milliseconds(40))
+        let replied = await quitReplied.wait(timeoutSeconds: 2)
+        XCTAssertEqual(replied, .completed)
         XCTAssertEqual(replies, [true])
         XCTAssertThrowsError(try registry.begin("after approval"))
         work.finish()
