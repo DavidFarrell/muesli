@@ -59,7 +59,7 @@ nonisolated enum ArchiveWorkflowProtocol {
         }
     }
     enum State: String, Codable, Sendable {
-        case preparing, awaitingOutputs, finalizing, retained, trashed, uncertain, failed, abandoned
+        case preparing, awaitingOutputs, finalizing, retiring, retained, trashed, uncertain, failed, abandoned
     }
     struct Response: Codable, Sendable {
         let protocolVersion: Int

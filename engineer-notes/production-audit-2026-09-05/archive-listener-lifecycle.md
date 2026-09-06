@@ -19,7 +19,8 @@ runs inside the public methods or their short state lock.
   constructor. The result is an observation, not permission to use a stale
   listener; the owner retains the actual instance and publishes current state.
 - `closeAdmissionForQuit()` synchronously closes semantic admission, retires
-  the listener generation and discards idle semantic proof. For an idle
+  the listener generation and retires idle semantic proof through its owned
+  off-UI cleanup worker. For an idle
   listener it installs a shutdown close token before dispatching stop. Existing
   startup tokens remain owned through late construction and cleanup. Call this
   from the coordinator's synchronous accepted hook with its preparation bridge
@@ -75,3 +76,5 @@ Evidence paths: `/private/tmp/muesli-archive-listener-final-tests.log`,
 `/private/tmp/muesli-archive-listener-release.log`. Frozen strict concurrency and
 identified Release results are reported with the handoff rather than inferred
 from the test result. Separate root full-project qualification remains required.
+
+Native prepared-resource disposal is covered by [archive-context-retirement.md](archive-context-retirement.md); its required successor factory is separate from new-user admission.

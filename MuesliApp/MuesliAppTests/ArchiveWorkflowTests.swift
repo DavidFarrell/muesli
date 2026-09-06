@@ -22,7 +22,7 @@ final class ArchiveWorkflowTests: XCTestCase {
         XCTAssertTrue(condition())
     }
     private func owner(finalize: @escaping Owner.Finalize = { _, _, _ in .retained }) -> Owner {
-        Owner(acquireWorkToken: { 1 }, prepare: { _, _ in .init(context: 7, outputManifestPath: "/tmp/native-manifest.json") }, finalize: finalize)
+        Owner(acquireWorkToken: { 1 }, acquireRetirementToken: { 1 }, prepare: { _, _ in .init(context: 7, outputManifestPath: "/tmp/native-manifest.json") }, finalize: finalize)
     }
     func testProtocolRejectsDuplicateAliasesUnknownFieldsAndUnsupportedShapes() throws {
         let valid = try ArchiveWorkflowProtocol.Request.begin(sourcePath: "/source", vaultPath: "/vault").encode()
@@ -42,7 +42,7 @@ final class ArchiveWorkflowTests: XCTestCase {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         defer { release.signal() }
         let tokens = Counter(), calls = Counter()
-        let owner = Owner(acquireWorkToken: { Token(tokens) }, prepare: { _, _ in
+        let owner = Owner(acquireWorkToken: { Token(tokens) }, acquireRetirementToken: { Token(tokens) }, prepare: { _, _ in
             calls.add(); entered.signal(); release.wait()
             return .init(context: 7, outputManifestPath: "/tmp/native.json")
         }, finalize: { _, _, _ in .retained })
@@ -66,7 +66,7 @@ final class ArchiveWorkflowTests: XCTestCase {
         let owner = owner(); let request = ArchiveWorkflowProtocol.Request.begin(sourcePath: "/source", vaultPath: "/vault")
         let id = try XCTUnwrap(owner.handle(request).operationID)
         waitUntil { !owner.hasActualWork }
-        XCTAssertTrue(owner.closeAdmissionForQuit()); owner.reopenAdmissionAfterCancelledQuit()
+        XCTAssertFalse(owner.closeAdmissionForQuit()); waitUntil { !owner.hasActualWork }; owner.reopenAdmissionAfterCancelledQuit()
         XCTAssertEqual(owner.handle(.operation(.finalize, id: id, receiptPath: "/receipt")).failure, .unknownOperation)
         let second = try XCTUnwrap(owner.handle(request).operationID)
         XCTAssertNotEqual(id, second); waitUntil { !owner.hasActualWork }
@@ -75,7 +75,7 @@ final class ArchiveWorkflowTests: XCTestCase {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         defer { release.signal() }
         let tokens = Counter(), calls = Counter()
-        let owner = Owner(acquireWorkToken: { Token(tokens) }, prepare: { _, _ in .init(context: 7, outputManifestPath: "/manifest") },
+        let owner = Owner(acquireWorkToken: { Token(tokens) }, acquireRetirementToken: { Token(tokens) }, prepare: { _, _ in .init(context: 7, outputManifestPath: "/manifest") },
                           finalize: { context, _, _ in
             XCTAssertEqual(context, 7); calls.add(); entered.signal(); release.wait(); return .trashed
         })
@@ -111,7 +111,7 @@ final class ArchiveWorkflowTests: XCTestCase {
     }
     func testAdmissionFailureNeverStartsNativeWork() {
         let calls = Counter()
-        let owner = Owner(acquireWorkToken: { throw ArchiveWorkflowProtocol.Failure.stopping }, prepare: { _, _ in
+        let owner = Owner(acquireWorkToken: { throw ArchiveWorkflowProtocol.Failure.stopping }, acquireRetirementToken: { 1 }, prepare: { _, _ in
             calls.add(); return .init(context: 0, outputManifestPath: "/manifest")
         }, finalize: { _, _, _ in .retained })
         XCTAssertEqual(owner.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).failure, .admissionRejected)
@@ -157,7 +157,7 @@ final class ArchiveWorkflowTests: XCTestCase {
     func testDisconnectDoesNotCancelAdmittedPrepare() throws {
         let directory = try directory(), entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         defer { release.signal() }
-        let owner = Owner(acquireWorkToken: { 1 }, prepare: { _, _ in
+        let owner = Owner(acquireWorkToken: { 1 }, acquireRetirementToken: { 1 }, prepare: { _, _ in
             entered.signal(); release.wait(); return .init(context: 1, outputManifestPath: "/manifest")
         }, finalize: { _, _, _ in .retained })
         _ = try startServer(directory) { owner.handle($0) }
@@ -217,7 +217,7 @@ final class ArchiveWorkflowTests: XCTestCase {
     func testTokenActualCloseCannotBeSkippedByCompletionOrCancelledQuit() throws {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         defer { release.signal() }
-        let owner = Owner(acquireWorkToken: { BlockingToken(entered: entered, release: release) },
+        let owner = Owner(acquireWorkToken: { BlockingToken(entered: entered, release: release) }, acquireRetirementToken: { 1 },
                           prepare: { _, _ in .init(context: 7, outputManifestPath: "/manifest") },
                           finalize: { _, _, _ in .retained })
         let id = try XCTUnwrap(owner.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
@@ -297,6 +297,244 @@ final class ArchiveWorkflowTests: XCTestCase {
         releaseOld.signal()
         usleep(50_000)
         XCTAssertEqual(server.activeClientCount, 1, "old closed descriptor cleanup must not erase the live reused descriptor's owner")
+    }
+
+    nonisolated private final class IndependentPreparedResource: @unchecked Sendable {
+        let registry: ShutdownWorkRegistry
+        let closed: TaskCompletion
+        init(_ registry: ShutdownWorkRegistry, closed: TaskCompletion) { self.registry = registry; self.closed = closed }
+        deinit {
+            XCTAssertFalse(Thread.isMainThread, "Prepared native resources must retire away from the UI executor.")
+            XCTAssertFalse(registry.snapshot().pending.isEmpty, "Native descriptor cleanup must remain covered by an actual work token.")
+            closed.markCompleted()
+        }
+    }
+    func testIndependentIdleQuitDisposesNativePreparedOffUIUnderOwnership() async throws {
+        let registry = ShutdownWorkRegistry(), closed = TaskCompletion()
+        let workflow = ArchiveWorkflowOwner<IndependentPreparedResource>(acquireWorkToken: { try registry.begin("Archive operation") },
+            acquireRetirementToken: { try registry.begin("Archive retirement") },
+            prepare: { _, _ in .init(context: IndependentPreparedResource(registry, closed: closed), outputManifestPath: "/native-manifest") },
+            finalize: { _, _, _ in .retained })
+        _ = workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault"))
+        waitUntil { !workflow.hasActualWork }
+        _ = workflow.closeAdmissionForQuit()
+        let result = await closed.wait(timeoutSeconds: 2)
+        XCTAssertEqual(result, .completed)
+    }
+    func testIndependentRejectedPreparedClosesBeforeActualTokenRetires() async throws {
+        let registry = ShutdownWorkRegistry(), closed = TaskCompletion()
+        let workflow = ArchiveWorkflowOwner<IndependentPreparedResource>(acquireWorkToken: { try registry.begin("Archive operation") },
+            acquireRetirementToken: { try registry.begin("Archive retirement") },
+            prepare: { _, _ in .init(context: IndependentPreparedResource(registry, closed: closed), outputManifestPath: "invalid-relative-path") },
+            finalize: { _, _, _ in .retained })
+        _ = workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault"))
+        let result = await closed.wait(timeoutSeconds: 2)
+        XCTAssertEqual(result, .completed)
+        waitUntil { !workflow.hasActualWork }
+    }
+
+    nonisolated private final class NativeCloseProbe: @unchecked Sendable {
+        let entered = TaskCompletion(), closed = TaskCompletion()
+        let release = DispatchSemaphore(value: 0)
+        let registry: ShutdownWorkRegistry
+        let lockPath: String
+        init(registry: ShutdownWorkRegistry, lockPath: String) { self.registry = registry; self.lockPath = lockPath }
+    }
+    nonisolated private final class NativePrepared: @unchecked Sendable {
+        let probe: NativeCloseProbe
+        let handle: FileHandle
+        init(_ probe: NativeCloseProbe) throws {
+            self.probe = probe
+            let fd = open(probe.lockPath, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { throw POSIXError(.EIO) }
+            handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            guard flock(fd, LOCK_SH | LOCK_NB) == 0 else { throw POSIXError(.EWOULDBLOCK) }
+        }
+        deinit {
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertFalse(probe.registry.snapshot().pending.isEmpty)
+            probe.entered.markCompleted()
+            XCTAssertEqual(probe.release.wait(timeout: .now() + 8), .success, "Fail-safe released stuck native cleanup")
+            XCTAssertFalse(probe.registry.snapshot().pending.isEmpty)
+            try? handle.close()
+            probe.closed.markCompleted()
+        }
+    }
+    private func assertNativeCloseStillOwned(_ probe: NativeCloseProbe) throws {
+        XCTAssertFalse(probe.registry.snapshot().pending.isEmpty)
+        XCTAssertFalse(probe.registry.sealIfFinished())
+        let fd = open(probe.lockPath, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return XCTFail("Missing retained native lock") }
+        defer { Darwin.close(fd) }
+        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), -1)
+        XCTAssertEqual(errno, EWOULDBLOCK)
+    }
+    private func assertNativeCloseFinished(_ probe: NativeCloseProbe) throws {
+        XCTAssertTrue(probe.registry.snapshot().pending.isEmpty)
+        let fd = open(probe.lockPath, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { return XCTFail("Missing original native lock") }
+        defer { Darwin.close(fd) }
+        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+    }
+    func testActualIdleNativeCloseRetainsBusyAcrossAbandonQuitAndCancel() async throws {
+        for quit in [false, true] {
+            let registry = ShutdownWorkRegistry()
+            let probe = NativeCloseProbe(registry: registry, lockPath: try directory().appendingPathComponent("prepared.lock").path)
+            defer { probe.release.signal() }
+            let workflow = ArchiveWorkflowOwner<NativePrepared>(
+                acquireWorkToken: { try registry.beginUserWork("Archive operation") },
+                acquireRetirementToken: { try registry.begin("Archive retirement") },
+                prepare: { _, _ in .init(context: try NativePrepared(probe), outputManifestPath: "/manifest") },
+                finalize: { _, _, _ in .retained })
+            let id = try XCTUnwrap(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
+            waitUntil { !workflow.hasActualWork }
+            XCTAssertTrue(registry.snapshot().pending.isEmpty)
+            if quit {
+                let bridge = try registry.begin("Quit preparation")
+                XCTAssertFalse(workflow.closeAdmissionForQuit())
+                registry.beginQuit(); bridge.finish()
+            } else {
+                XCTAssertEqual(workflow.handle(.operation(.abandon, id: id)).state, .retiring)
+            }
+            let entered = await probe.entered.wait(timeoutSeconds: 2)
+            XCTAssertEqual(entered, .completed)
+            try assertNativeCloseStillOwned(probe)
+            XCTAssertTrue(workflow.hasActualWork)
+            registry.cancelQuit(); workflow.reopenAdmissionAfterCancelledQuit()
+            XCTAssertEqual(workflow.handle(.begin(sourcePath: "/new", vaultPath: "/vault")).failure, .busy)
+            XCTAssertEqual(workflow.handle(.operation(.finalize, id: id, receiptPath: "/receipt")).failure, .stopping)
+            XCTAssertFalse(workflow.closeAdmissionForQuit()) // second Quit cannot replace the disposal
+            XCTAssertEqual(registry.snapshot().pending.count, 1)
+            workflow.reopenAdmissionAfterCancelledQuit()
+            probe.release.signal()
+            let closed = await probe.closed.wait(timeoutSeconds: 2)
+            XCTAssertEqual(closed, .completed)
+            waitUntil { !workflow.hasActualWork }
+            try assertNativeCloseFinished(probe)
+            XCTAssertEqual(workflow.handle(.operation(.status, id: id)).failure, .unknownOperation)
+        }
+    }
+    func testActualTerminalNativeClosePrecedesFinalOutcomeAndTokenRelease() async throws {
+        for fails in [false, true] {
+            let registry = ShutdownWorkRegistry()
+            let probe = NativeCloseProbe(registry: registry, lockPath: try directory().appendingPathComponent("prepared.lock").path)
+            defer { probe.release.signal() }
+            let workflow = ArchiveWorkflowOwner<NativePrepared>(
+                acquireWorkToken: { try registry.beginUserWork("Archive operation") },
+                acquireRetirementToken: { try registry.begin("Archive retirement") },
+                prepare: { _, _ in .init(context: try NativePrepared(probe), outputManifestPath: "/manifest") },
+                finalize: { value, _, _ in
+                    XCTAssertGreaterThanOrEqual(value.handle.fileDescriptor, 0)
+                    if fails { throw POSIXError(.EIO) }
+                    return .trashed
+                })
+            let id = try XCTUnwrap(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
+            waitUntil { !workflow.hasActualWork }
+            _ = workflow.handle(.operation(.finalize, id: id, receiptPath: "/receipt"))
+            let entered = await probe.entered.wait(timeoutSeconds: 2)
+            XCTAssertEqual(entered, .completed)
+            try assertNativeCloseStillOwned(probe)
+            XCTAssertTrue(workflow.hasActualWork)
+            XCTAssertEqual(workflow.handle(.operation(.status, id: id)).state, .finalizing)
+            probe.release.signal()
+            waitUntil { !workflow.hasActualWork }
+            try assertNativeCloseFinished(probe)
+            XCTAssertEqual(workflow.handle(.operation(.status, id: id)).state, fails ? .uncertain : .trashed)
+        }
+    }
+    func testActualLatePreparedAfterQuitCancellationClosesBeforeReentry() async throws {
+        let registry = ShutdownWorkRegistry(), preparing = TaskCompletion()
+        let releasePrepare = DispatchSemaphore(value: 0)
+        let probe = NativeCloseProbe(registry: registry, lockPath: try directory().appendingPathComponent("prepared.lock").path)
+        defer { releasePrepare.signal(); probe.release.signal() }
+        let workflow = ArchiveWorkflowOwner<NativePrepared>(
+            acquireWorkToken: { try registry.beginUserWork("Archive operation") },
+            acquireRetirementToken: { try registry.begin("Archive retirement") },
+            prepare: { _, _ in
+                let value = try NativePrepared(probe)
+                preparing.markCompleted(); _ = releasePrepare.wait(timeout: .now() + 8)
+                return .init(context: value, outputManifestPath: "/manifest")
+            }, finalize: { _, _, _ in .retained })
+        let id = try XCTUnwrap(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
+        let started = await preparing.wait(timeoutSeconds: 2)
+        XCTAssertEqual(started, .completed)
+        XCTAssertFalse(workflow.closeAdmissionForQuit())
+        workflow.reopenAdmissionAfterCancelledQuit()
+        releasePrepare.signal()
+        let entered = await probe.entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(entered, .completed)
+        try assertNativeCloseStillOwned(probe)
+        XCTAssertEqual(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).failure, .busy)
+        probe.release.signal(); waitUntil { !workflow.hasActualWork }
+        try assertNativeCloseFinished(probe)
+        XCTAssertEqual(workflow.handle(.operation(.status, id: id)).failure, .unknownOperation)
+    }
+    func testActualThrownPreparationAndInvalidManifestCloseBeforeTokenRelease() async throws {
+        for fails in [false, true] {
+            let registry = ShutdownWorkRegistry()
+            let probe = NativeCloseProbe(registry: registry, lockPath: try directory().appendingPathComponent("prepared.lock").path)
+            defer { probe.release.signal() }
+            let workflow = ArchiveWorkflowOwner<NativePrepared>(
+                acquireWorkToken: { try registry.beginUserWork("Archive operation") },
+                acquireRetirementToken: { try registry.begin("Archive retirement") },
+                prepare: { _, _ in
+                    let value = try NativePrepared(probe)
+                    if fails { throw POSIXError(.EIO) }
+                    return .init(context: value, outputManifestPath: "invalid-relative")
+                }, finalize: { _, _, _ in .retained })
+            let id = try XCTUnwrap(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
+            let entered = await probe.entered.wait(timeoutSeconds: 2)
+            XCTAssertEqual(entered, .completed)
+            try assertNativeCloseStillOwned(probe)
+            XCTAssertTrue(workflow.hasActualWork)
+            XCTAssertEqual(workflow.handle(.operation(.status, id: id)).state, .preparing)
+            probe.release.signal(); waitUntil { !workflow.hasActualWork }
+            try assertNativeCloseFinished(probe)
+            XCTAssertEqual(workflow.handle(.operation(.status, id: id)).failure, .preparationFailed)
+        }
+    }
+
+    func testActualCorrectionKeepsProofUntilOwnedRetirementIncludingLateFinalization() async throws {
+        for quitDuringFinalization in [false, true] {
+            let registry = ShutdownWorkRegistry(), finalizing = TaskCompletion()
+            let releaseFinalize = DispatchSemaphore(value: 0)
+            let probe = NativeCloseProbe(registry: registry, lockPath: try directory().appendingPathComponent("prepared.lock").path)
+            defer { releaseFinalize.signal(); probe.release.signal() }
+            let workflow = ArchiveWorkflowOwner<NativePrepared>(
+                acquireWorkToken: { try registry.beginUserWork("Archive operation") },
+                acquireRetirementToken: { try registry.begin("Archive retirement") },
+                prepare: { _, _ in .init(context: try NativePrepared(probe), outputManifestPath: "/manifest") },
+                finalize: { _, _, _ in
+                    finalizing.markCompleted()
+                    if quitDuringFinalization { _ = releaseFinalize.wait(timeout: .now() + 8) }
+                    return .needsCorrection
+                })
+            let id = try XCTUnwrap(workflow.handle(.begin(sourcePath: "/source", vaultPath: "/vault")).operationID)
+            waitUntil { !workflow.hasActualWork }
+            _ = workflow.handle(.operation(.finalize, id: id, receiptPath: "/receipt"))
+            let invoked = await finalizing.wait(timeoutSeconds: 2)
+            XCTAssertEqual(invoked, .completed)
+            if quitDuringFinalization {
+                XCTAssertFalse(workflow.closeAdmissionForQuit())
+                workflow.reopenAdmissionAfterCancelledQuit()
+                releaseFinalize.signal()
+            } else {
+                waitUntil { !workflow.hasActualWork }
+                XCTAssertEqual(workflow.handle(.operation(.status, id: id)).state, .awaitingOutputs)
+                XCTAssertEqual(workflow.handle(.operation(.status, id: id)).failure, .validationFailed)
+                let notClosed = await probe.entered.wait(timeoutSeconds: 0)
+                XCTAssertEqual(notClosed, .timedOut)
+                XCTAssertTrue(registry.snapshot().pending.isEmpty)
+                XCTAssertEqual(workflow.handle(.operation(.abandon, id: id)).state, .retiring)
+            }
+            let entered = await probe.entered.wait(timeoutSeconds: 2)
+            XCTAssertEqual(entered, .completed)
+            try assertNativeCloseStillOwned(probe)
+            XCTAssertTrue(workflow.hasActualWork)
+            XCTAssertEqual(workflow.handle(.begin(sourcePath: "/new", vaultPath: "/vault")).failure, .busy)
+            probe.release.signal(); waitUntil { !workflow.hasActualWork }
+            try assertNativeCloseFinished(probe)
+        }
     }
 
 }

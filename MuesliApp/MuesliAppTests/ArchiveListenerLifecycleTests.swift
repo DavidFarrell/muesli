@@ -27,7 +27,7 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
     }
     private typealias Workflow = ArchiveWorkflowOwner<Int>
     private func workflow(_ registry: ShutdownWorkRegistry) -> Workflow {
-        Workflow(acquireWorkToken: { try registry.beginUserWork("Archive semantic operation") },
+        Workflow(acquireWorkToken: { try registry.beginUserWork("Archive semantic operation") }, acquireRetirementToken: { try registry.begin("Archive retirement") },
                  prepare: { _, _ in .init(context: 1, outputManifestPath: "/native-manifest") },
                  finalize: { _, _, _ in .retained })
     }
@@ -173,7 +173,7 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
     func testSameSemanticOwnerRemainsBusyAcrossListenerRestart() async throws {
         let registry = ShutdownWorkRegistry(), gate = Gate(), preparations = Count()
         defer { gate.open() }
-        let semantic = Workflow(acquireWorkToken: { try registry.beginUserWork("Native operation") }, prepare: { _, _ in
+        let semantic = Workflow(acquireWorkToken: { try registry.beginUserWork("Native operation") }, acquireRetirementToken: { try registry.begin("Archive retirement") }, prepare: { _, _ in
             if preparations.add() == 1 { gate.block() }
             return .init(context: 1, outputManifestPath: "/manifest")
         }, finalize: { _, _, _ in .retained })
@@ -236,7 +236,7 @@ final class ArchiveListenerLifecycleTests: XCTestCase {
         let directory = URL(fileURLWithPath: "/private/tmp/al-" + UUID().uuidString.prefix(8))
         XCTAssertEqual(mkdir(directory.path, 0o700), 0)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let semantic = Workflow(acquireWorkToken: { try registry.beginUserWork("semantic") }, prepare: { _, _ in
+        let semantic = Workflow(acquireWorkToken: { try registry.beginUserWork("semantic") }, acquireRetirementToken: { try registry.begin("Archive retirement") }, prepare: { _, _ in
             preparations.add(); return .init(context: 1, outputManifestPath: "/manifest")
         }, finalize: { _, _, _ in .retained })
         let lifecycle = ArchiveListenerLifecycle(workflow: semantic, shutdown: registry, factory: { closed in
