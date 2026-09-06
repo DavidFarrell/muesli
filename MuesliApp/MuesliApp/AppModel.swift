@@ -331,7 +331,12 @@ final class AppModel: ObservableObject {
         #endif
         return nil
     }
-    @Published var backendFolderURL: URL?
+    private let archiveBackend = ArchiveApplicationBridge.BackendSelection()
+    private var archiveBridge: ArchiveApplicationBridge?
+    @Published private(set) var archiveListenerState: ArchiveListenerLifecycle.Snapshot?
+    @Published var backendFolderURL: URL? {
+        didSet { archiveBackend.set(backendFolderURL) }
+    }
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
     @Published private var metadataEditNotices: [String: String] = [:]
@@ -771,6 +776,20 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    func startArchiveIntegration() {
+        if archiveBridge == nil {
+            archiveBackend.set(backendFolderURL)
+            archiveBridge = ArchiveApplicationBridge(backend: archiveBackend) { [weak self] state in
+                self?.archiveListenerState = state
+            }
+        }
+        _ = archiveBridge?.enable()
+    }
+
+    func applicationQuitAccepted() {
+        archiveBridge?.closeAdmissionForQuit()
+    }
+
     func prepareForApplicationQuit() async {
         retireMeetingMicSource()
         meetingCatalog.invalidate()
@@ -782,6 +801,7 @@ final class AppModel: ObservableObject {
     }
 
     func applicationQuitCancelled() {
+        archiveBridge?.reopenAfterCancelledQuit()
         if wantsHomeLevelPreview { Task { await self.startHomeLevelPreview() } }
     }
 

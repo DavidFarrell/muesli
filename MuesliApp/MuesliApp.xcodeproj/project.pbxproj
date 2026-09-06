@@ -46,6 +46,7 @@
                 ApplicationQuitCoordinator.swift,
                 ArchiveListenerLifecycle.swift,
                 ArchiveApplicationDirectories.swift,
+                ArchiveApplicationBridge.swift,
                 ArchiveWorkflowProtocol.swift,
                 ArchiveWorkflowOwner.swift,
                 ArchiveSemanticAdapter.swift,

@@ -10,8 +10,10 @@ struct MuesliAppApp: App {
         signal(SIGPIPE, SIG_IGN)
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
-        ApplicationQuitCoordinator.shared.configure(prepare: { [weak model] in await model?.prepareForApplicationQuit() },
+        ApplicationQuitCoordinator.shared.configure(accepted: { [weak model] in model?.applicationQuitAccepted() },
+                                                    prepare: { [weak model] in await model?.prepareForApplicationQuit() },
                                                     cancelled: { [weak model] in model?.applicationQuitCancelled() })
+        model.startArchiveIntegration()
     }
 
     var body: some Scene {
