@@ -259,7 +259,9 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
     func testBlockedNativeStageRetainsWorkflowOwnerAndShutdownTokenWithResponsiveUI() async throws {
         let f = try setup(), reached = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         let adapter = f.adapter { if case .beforeTrash = $0 { reached.signal(); release.wait() } }
-        let owner = ArchiveSemanticAdapter.Workflow(acquireWorkToken: { UUID() },
+        let registry = ShutdownWorkRegistry()
+        let owner = ArchiveSemanticAdapter.Workflow(acquireWorkToken: { try registry.beginUserWork("Synthetic semantic archive work") },
+            acquireRetirementToken: { try registry.begin("Synthetic archive retirement") },
             prepare: { try await adapter.prepare($0, operationID: $1) },
             finalize: { await adapter.finalize($0, receiptPath: $1, operationID: $2) })
         let started = owner.handle(.begin(sourcePath: f.source.path, vaultPath: f.vault.path))
@@ -304,13 +306,18 @@ final class ArchiveSemanticAdapterTests: XCTestCase {
         XCTAssertTrue(didReach)
         XCTAssertEqual(owner.handle(.operation(.status, id: id)).state, .finalizing)
         _ = owner.closeAdmissionForQuit()
+        registry.beginQuit()
         XCTAssertTrue(owner.hasActualWork)
+        XCTAssertFalse(registry.snapshot().pending.isEmpty)
+        XCTAssertFalse(registry.sealIfFinished())
         var heartbeat = false; Task { @MainActor in heartbeat = true }
         await Task.yield(); XCTAssertTrue(heartbeat)
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
         release.signal()
         for _ in 0..<500 { if !owner.hasActualWork { break }; try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(owner.hasActualWork)
+        XCTAssertTrue(registry.snapshot().pending.isEmpty)
+        XCTAssertTrue(registry.sealIfFinished())
     }
     func testPrivateOutputInsideSourceIsRejectedBeforeAnyNativeCreation() async throws {
         let f = try setup(), config = ArchiveSemanticAdapter.Configuration(backendRoot: f.root, outputRoot: f.source, journalRoot: f.journal)
