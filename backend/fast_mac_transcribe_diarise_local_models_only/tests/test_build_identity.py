@@ -123,3 +123,19 @@ def test_generated_bytecode_in_python_roots_does_not_dirty_source(tmp_path):
         bytecode.parent.mkdir(parents=True, exist_ok=True); bytecode.write_bytes(b'generated cache')
     after = build.identity(tmp_path, {'ACTION': 'install'})
     assert after['source_dirty'] is False and after['build_id'] == before['build_id']
+
+
+def test_effective_coverage_setting_distinguishes_identified_release_builds(tmp_path):
+    fixture(tmp_path)
+    git(tmp_path, 'init'); git(tmp_path, 'add', '.'); git(tmp_path, 'commit', '-m', 'Fixture')
+    common = {'ACTION': 'install', 'CONFIGURATION': 'Release'}
+    enabled = build.identity(tmp_path, dict(common, ENABLE_CODE_COVERAGE='YES'))
+    disabled = build.identity(tmp_path, dict(common, ENABLE_CODE_COVERAGE='NO'))
+    absent = build.identity(tmp_path, common)
+    assert enabled['source_commit'] == disabled['source_commit']
+    assert enabled['source_tree_sha256'] == disabled['source_tree_sha256']
+    assert enabled['source_dirty'] is disabled['source_dirty'] is False
+    assert enabled['expected_input_sha256']['compiler_flags'] != disabled['expected_input_sha256']['compiler_flags']
+    assert len({enabled['build_id'], disabled['build_id'], absent['build_id']}) == 3
+    assert disabled == build.identity(tmp_path, dict(common, ENABLE_CODE_COVERAGE='NO'))
+    assert 'ENABLE_CODE_COVERAGE' not in json.dumps(disabled)

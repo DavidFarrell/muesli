@@ -49,6 +49,35 @@ private actor CaptureSinkBarrier {
 }
 
 final class CaptureIngressTests: XCTestCase {
+    func testSystemStopEvidencePrecedesUIAndDuplicateCallbacksNotifyOnce() async {
+        let sender = CaptureTestSender()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, stream: .system)
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(8, writer: nil)
+        let relay = SystemAudioCaptureRelay(generation: 8, forwarder: forwarder,
+            display: MicDeliveryDisplayMailbox { _ in }) { error in
+                sender.reportFailure(stream: .system, message: error.localizedDescription)
+            }
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            for _ in 0..<100 {
+                relay.recordNativeStop(NSError(domain: "Synthetic system stop", code: 7))
+            }
+            finished.signal()
+        }
+        // Native evidence and notification admission must complete while the
+        // real UI executor remains blocked, without invoking SCStream/hardware.
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(relay.hasStopped)
+        XCTAssertEqual((relay.stopError as NSError?)?.code, 7)
+        XCTAssertEqual(sender.failureSnapshot().0, 1)
+        await relay.finish()
+        XCTAssertTrue(relay.hasStopped, "Retiring buffers cannot erase native stop evidence")
+        let fresh = SystemAudioCaptureRelay(generation: 9, forwarder: forwarder,
+            display: MicDeliveryDisplayMailbox { _ in }, onStopped: { _ in })
+        XCTAssertNil(fresh.stopError, "Terminal state belongs to the original relay generation")
+    }
+
     nonisolated private static func packet(_ pts: Int64, generation: Int = 1, bytes: Int = 320) -> CapturedMicAudio {
         CapturedMicAudio(data: Data(repeating: 1, count: bytes), captureTimeUs: pts, generation: generation,
                          nativeSampleRate: 16000, nativeChannels: 1, nativeFrameCount: bytes / 2, formatEpoch: 1, outputSampleRate: 16000)

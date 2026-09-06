@@ -1,0 +1,21 @@
+# Native screenshot preservation (6 September 2026)
+
+The source-semantic gate exposes screenshot UUID, source UUID, timeline position and exact file fingerprint from its validated artifact ledger. Reading a screenshot requires membership in that verified inventory and repeats source/secondary ownership and full-byte hash checks. These observations are native, not deserialized copy claims.
+
+ArchiveAssetCopier copies only those indexed bytes into private `MuesliAssets/<lowercase source UUID>/<lowercase asset UUID>.png` directories under the selected canonical vault. It rejects source ancestry before creating output material, holds the vault's physical ancestry and exclusive copy-owner lock, validates single-link regular files, and never overwrites an existing destination. Byte-identical existing copies can be reused after physical and byte validation. New copies are staged exclusively, synchronized and published with RENAME_EXCL. Interrupted staging is preserved for explicit reconciliation rather than broad cleanup.
+
+PNG decoding is checked before copying: complete single-image input, at most 32 MiB, 8192 pixels per edge and 16 megapixels. At most 256 screenshots and 512 MiB combined are admitted. Original PNG bytes are never re-encoded. Unsupported/large/invalid images retain the source for review.
+
+The returned non-Codable Catalog keeps actual vault ownership and original destination directory/file identities. Fresh validation rejects ancestor replacement, changed content and even byte-identical file replacement. It retains no original source owner, allowing Resume during external note work. Finalization must separately reacquire and compare the entire original source and validate this catalog immediately before considering a durable move intent. This component performs no Trash call and grants no cleanup permission.
+
+Author evidence: 49 actual source/output tests passed, including eight native copy cases. Tests cover original-source preservation, source-owner release, changed/invalid PNGs, vault-inside-source refusal, byte-identical replacement, destination appearance at publication, duplicate vault ownership, exact-copy reuse, and vault ancestor substitution. The first run found an invalid-PNG fixture trying to reacquire a secondary lock while retaining its previous inspector; only fixture ownership was corrected. No production lock was weakened. `/private/tmp/muesli-native-copies-v2-tests.log`. All data is synthetic in temporary folders.
+
+## Adversarial corrections
+
+The reviewer reproduced two P2 defects in the first freeze. Existing exact copies could bypass a previously failed sync, and ImageIO accepted damaged PNG containers. Both are corrected:
+
+- Every reused file and directory now completes file and parent synchronization, including the entire native-created directory hierarchy. An earlier mkdir/publication followed by failed sync cannot skip that barrier on retry. Staging and existing foreign files remain preserved on every failure.
+- Bounded PNG validation checks framing, chunk names, CRCs, required/order-sensitive chunks, one terminal IEND and end of file before ImageIO. It validates a bounded exact-size zlib raster and scanline filter range, and limits ancillary/ICC expansion. It deliberately supports non-interlaced static screenshots; animation, compressed text, unsupported format variants and trailing compressed input require review. PNG generally permits unused bytes inside a final IDAT; refusing them here is a narrow supported-input policy, not a claim that all such PNGs are invalid. Each decode has its own autorelease pool.
+- The old positive one-pixel fixture itself had an invalid IDAT CRC. Its checksum is corrected; the original malformed bytes remain an explicit negative regression. A PNG created by the same native ImageIO destination API used in production also passes byte-for-byte.
+
+Corrected author evidence: 53 focused tests passed, `/private/tmp/muesli-native-copies-v4-tests.log`, including complete copy hierarchy retries, the unchanged corrupt container types and actual native encoding. No client media was used. Format rules verified against [W3C PNG specification](https://www.w3.org/TR/png-3/), especially sections5.3–5.6,10.2 and11.2. Independent corrective review is pending.

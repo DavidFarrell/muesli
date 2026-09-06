@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Session
 
@@ -215,10 +216,16 @@ struct SessionView: View {
     private func handlePasteFromClipboard() {
         let pasteboard = NSPasteboard.general
 
-        // Try image first (various types)
-        if let image = NSImage(pasteboard: pasteboard) {
-            model.saveImageAttachment(image)
-            return
+        // Transfer encoded clipboard bytes; decoding/transcoding belongs to
+        // the retained attachment worker rather than the UI executor.
+        let imageTypes = (pasteboard.types ?? []).filter {
+            UTType($0.rawValue)?.conforms(to: .image) == true
+        }
+        for type in imageTypes {
+            if let data = pasteboard.data(forType: type) {
+                model.saveImageAttachment(data)
+                return
+            }
         }
 
         // Fall back to text

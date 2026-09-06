@@ -14,9 +14,11 @@ struct MeetingViewer: View {
     @State private var isIdentifyingSpeakers = false
     @State private var identificationProgress: SpeakerIdentifier.Progress?
     @State private var identificationError: String?
+    @State private var proposedBasis: SpeakerIdentificationBasis?
     @State private var proposedMappings: [SpeakerIdentifier.SpeakerMapping] = []
     @State private var showMappingSheet = false
     @State private var identificationTask: Task<Void, Never>?
+    @State private var identificationGeneration = UUID()
     @State private var isRediarizing = false
     @State private var rediarizeProgress: BatchRediarizer.Progress?
     @State private var rediarizeError: String?
@@ -176,7 +178,12 @@ struct MeetingViewer: View {
             SpeakerMappingSheet(
                 mappings: proposedMappings,
                 onConfirm: { mappings in
-                    model.applySpeakerMappings(mappings, for: meeting)
+                    guard let basis = proposedBasis, basis.matches(transcript) else {
+                        identificationError = "The transcript or speaker names changed. Identify speakers again before applying suggestions."
+                        showMappingSheet = false
+                        return
+                    }
+                    model.applySpeakerMappings(mappings, for: meeting, basis: basis)
                     showMappingSheet = false
                 },
                 onCancel: {
@@ -208,11 +215,10 @@ struct MeetingViewer: View {
                 showRediarizeConfirm = false
             }
         } message: {
-            Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace transcript?")
+            Text("Found \(pendingRediarizeResult?.speakers.count ?? 0) speakers. Replace the transcript with the selected audio streams? Reviewed speaker names will be cleared because the new labels may identify different people.")
         }
         .onDisappear {
-            identificationTask?.cancel()
-            identificationTask = nil
+            cancelSpeakerIdentification()
             rediarizeTask?.cancel()
             rediarizeTask = nil
         }
@@ -465,27 +471,48 @@ struct MeetingViewer: View {
 
         let transcript = transcriptForIdentification()
         let speakerIds = speakerIdsForIdentification()
-        let screenshots = loadScreenshots(for: meeting)
+        let basis = SpeakerIdentificationBasis(self.transcript)
+        let existingNames = basis.names
+        let requestID = UUID()
+        identificationGeneration = requestID
 
         identificationTask = Task {
             do {
                 try Task.checkCancellation()
+                let inputOwner = try TranscriptPersistenceStore.shared.start(in: meeting.folderURL) { context in
+                    try MeetingScreenshotInput.snapshot(context: context)
+                }
+                let input = try await inputOwner.value(timeoutSeconds: 5)
+                try Task.checkCancellation()
+                guard identificationGeneration == requestID, basis.matches(self.transcript) else {
+                    throw TranscriptPersistenceStore.Failure.superseded
+                }
                 let identifier = SpeakerIdentifier()
                 let hint = speakerIdHint.trimmingCharacters(in: .whitespacesAndNewlines)
                 let result = try await identifier.identifySpeakers(
-                    screenshots: screenshots,
+                    screenshots: input.images,
+                    access: input.access,
                     transcript: transcript,
                     speakerIds: speakerIds,
-                    existingSpeakerNames: self.transcript.speakerNames,
+                    existingSpeakerNames: existingNames,
                     userHint: hint.isEmpty ? nil : hint,
                     progressHandler: { progress in
                         Task { @MainActor in
+                            guard identificationGeneration == requestID, basis.matches(self.transcript) else { return }
                             identificationProgress = progress
                         }
                     }
                 )
                 try Task.checkCancellation()
-                await MainActor.run {
+                guard identificationGeneration == requestID, basis.matches(self.transcript) else {
+                    throw TranscriptPersistenceStore.Failure.superseded
+                }
+                try await MainActor.run {
+                    guard identificationGeneration == requestID, basis.matches(self.transcript) else {
+                        throw TranscriptPersistenceStore.Failure.superseded
+                    }
+                    identificationGeneration = UUID()
+                    proposedBasis = basis
                     proposedMappings = result.mappings
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
@@ -493,11 +520,15 @@ struct MeetingViewer: View {
                 }
             } catch is CancellationError {
                 await MainActor.run {
+                    guard identificationGeneration == requestID else { return }
+                    identificationGeneration = UUID()
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
                 }
             } catch {
                 await MainActor.run {
+                    guard identificationGeneration == requestID else { return }
+                    identificationGeneration = UUID()
                     isIdentifyingSpeakers = false
                     identificationProgress = nil
                     if let urlError = error as? URLError, urlError.code == .timedOut {
@@ -511,22 +542,11 @@ struct MeetingViewer: View {
     }
 
     private func cancelSpeakerIdentification() {
+        identificationGeneration = UUID()
         identificationTask?.cancel()
         identificationTask = nil
-    }
-
-    private func loadScreenshots(for meeting: MeetingHistoryItem) -> [URL] {
-        let folder = meeting.folderURL.appendingPathComponent("screenshots", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: folder,
-            includingPropertiesForKeys: nil
-        )) ?? []
-        let imageURLs = urls.filter { url in
-            let ext = url.pathExtension.lowercased()
-            return ext == "png" || ext == "jpg" || ext == "jpeg"
-        }
-        return imageURLs.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        isIdentifyingSpeakers = false
+        identificationProgress = nil
     }
 
     private func speakerIdsForIdentification() -> [String] {

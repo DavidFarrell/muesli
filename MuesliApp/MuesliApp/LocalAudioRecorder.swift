@@ -34,6 +34,94 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         var last_problem: String?
         var losses: [Loss] = []
         var loss_details_omitted: Int64 = 0
+        // Optional additive fields keep manifests from older app versions readable.
+        var power_events: [PowerEvent]?
+        var power_events_omitted: Int64?
+        var clock_corrections: [String: ClockCorrectionSummary]?
+    }
+
+    /// Fixed-size per-stream observations, including the latest generation in
+    /// the totals. These count conversion work, never persisted PCM or losses.
+    /// Historical generations are folded into totals before replacing latest.
+    struct ClockCorrectionSummary: Codable, Sendable, Equatable {
+        var generation_count: Int64 = 1
+        var native_frames: Int64
+        var nominal_output_frames: Int64
+        var host_output_frames: Int64
+        var observed_intervals: Int64
+        var uncertain_intervals: Int64
+        var min_rate_ratio: Double?
+        var max_rate_ratio: Double?
+        var counters_saturated = false
+        var latest: CapturedClockCorrection
+
+        init(_ correction: CapturedClockCorrection) {
+            latest = correction
+            native_frames = correction.native_frames
+            nominal_output_frames = correction.nominal_output_frames
+            host_output_frames = correction.host_output_frames
+            observed_intervals = correction.observed_intervals
+            uncertain_intervals = correction.uncertain_intervals
+            min_rate_ratio = correction.min_rate_ratio
+            max_rate_ratio = correction.max_rate_ratio
+        }
+
+        mutating func observe(_ correction: CapturedClockCorrection) {
+            guard correction.isValid, correction.generation >= latest.generation else { return }
+            let sameGeneration = correction.generation == latest.generation
+            if sameGeneration {
+                guard correction.native_frames >= latest.native_frames,
+                      correction.nominal_output_frames >= latest.nominal_output_frames,
+                      correction.host_output_frames >= latest.host_output_frames,
+                      correction.observed_intervals >= latest.observed_intervals,
+                      correction.uncertain_intervals >= latest.uncertain_intervals else { return }
+            }
+            var saturated = counters_saturated
+            func add(_ total: Int64, _ current: Int64, _ previous: Int64) -> Int64 {
+                let sum = total.addingReportingOverflow(current - (sameGeneration ? previous : 0))
+                if sum.overflow { saturated = true; return Int64.max }
+                return sum.partialValue
+            }
+            native_frames = add(native_frames, correction.native_frames, latest.native_frames)
+            nominal_output_frames = add(nominal_output_frames, correction.nominal_output_frames, latest.nominal_output_frames)
+            host_output_frames = add(host_output_frames, correction.host_output_frames, latest.host_output_frames)
+            observed_intervals = add(observed_intervals, correction.observed_intervals, latest.observed_intervals)
+            uncertain_intervals = add(uncertain_intervals, correction.uncertain_intervals, latest.uncertain_intervals)
+            if !sameGeneration {
+                let count = generation_count.addingReportingOverflow(1)
+                generation_count = count.overflow ? Int64.max : count.partialValue
+                saturated = saturated || count.overflow
+            }
+            counters_saturated = saturated
+            min_rate_ratio = [min_rate_ratio, correction.min_rate_ratio].compactMap { $0 }.min()
+            max_rate_ratio = [max_rate_ratio, correction.max_rate_ratio].compactMap { $0 }.max()
+            latest = correction
+        }
+
+        var isValid: Bool {
+            generation_count > 0 && latest.isValid
+                && native_frames >= latest.native_frames && nominal_output_frames >= latest.nominal_output_frames
+                && host_output_frames >= latest.host_output_frames && observed_intervals >= latest.observed_intervals
+                && uncertain_intervals >= latest.uncertain_intervals
+                && CapturedClockCorrection(native_frames: native_frames, nominal_output_frames: nominal_output_frames,
+                    host_output_frames: host_output_frames, observed_intervals: observed_intervals,
+                    uncertain_intervals: uncertain_intervals, min_rate_ratio: min_rate_ratio,
+                    max_rate_ratio: max_rate_ratio, generation: latest.generation).isValid
+        }
+    }
+
+    struct PowerEvent: Codable, Sendable, Equatable {
+        enum Kind: String, Codable, Sendable {
+            case willSleep = "will_sleep", didWake = "did_wake", monitorUnavailable = "monitor_unavailable"
+            case bindingDuringSleep = "binding_during_sleep"
+        }
+        let kind: Kind
+        let cycle_id: UUID?
+        let source_time_us: Int64?
+        let process_continuous_us: Int64
+        // Duration between observed notifications, not claimed captured media
+        // or an exact kernel sleep duration. Never changes PCM sample positions.
+        let observed_pause_us: Int64?
     }
 
     struct Loss: Codable, Sendable {
@@ -103,6 +191,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var workStartedAt = ProcessInfo.processInfo.systemUptime
     private var drainScheduled = false
     private var accepting = true
+    // Stream-local append failure rejects only that stream at admission.
+    // Shared commit/manifest failures still close the global gate.
+    private var failedAdmissionSources: Set<Source> = []
     private var closeRequested = false
     private var closeWaitExpired = false
     private var rejectedFrames: [Source: Int64] = [:]
@@ -111,12 +202,17 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var lastCommitUptime = ProcessInfo.processInfo.systemUptime
     private var rejectedLosses: [Loss] = []
     private var omittedLosses: Int64 = 0
+    private var pendingPowerEvents: [PowerEvent] = []
+    private var omittedPowerEvents: Int64 = 0
+    private var clockCorrections: [Source: ClockCorrectionSummary] = [:]
     private var closedManifest: Manifest?
     private let closeCompletion = TaskCompletion()
+    private let quitWork: ShutdownWorkRegistry.Token
 
     // Queue-owned fields.
     private var handles: [Source: FileHandle] = [:]
     private var sourceLease: FileHandle?
+    private var meetingAccess: MeetingFileAccess? // owned by queue
     private var positions: [Source: Int64] = [:]
     private var manifest: Manifest
     private var dirty = false
@@ -128,7 +224,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
          maxPendingBytes: Int = 2 * 1024 * 1024,
          maximumDurationSeconds: Int64 = 24 * 60 * 60,
          commitInterval: TimeInterval = 0.5,
+         shutdown: ShutdownWorkRegistry = .shared,
          beforeIO: (@Sendable (Checkpoint) throws -> Void)? = nil) throws {
+        quitWork = try shutdown.begin("Finishing audio recording")
         self.directory = directory
         self.maxPendingBytes = max(2, maxPendingBytes)
         maximumDurationUs = max(1, min(maximumDurationSeconds, 24 * 60 * 60)) * 1_000_000
@@ -159,6 +257,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         timer.resume()
     }
 
+    func retainMeetingAccess(_ access: MeetingFileAccess) {
+        queue.async { [self] in meetingAccess = access }
+    }
+
     deinit {
         timer?.cancel()
         // A missing explicit finish leaves completed=false on disk. Do not
@@ -174,17 +276,18 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         guard !payload.isEmpty else { return true }
         lock.lock()
         let valid = payload.count % 2 == 0 && ptsUs >= 0 && ptsUs <= maximumDurationUs
-        guard accepting, valid, pending.count < 4096,
+        let sourceFailed = failedAdmissionSources.contains(source)
+        guard accepting, !sourceFailed, valid, pending.count < 4096,
               payload.count <= maxPendingBytes - pendingBytes else {
             rejectedFrames[source, default: 0] += Int64((payload.count + 1) / 2)
             let frame = valid ? (ptsUs * 16_000 + 500_000) / 1_000_000 : nil
             Self.addLoss(Loss(source: source.rawValue,
-                              reason: !valid ? "invalid_audio" : (accepting ? "ingress_overflow" : "after_close_or_failure"),
+                              reason: !valid ? "invalid_audio" : (sourceFailed ? "source_failed" : (accepting ? "ingress_overflow" : "after_close_or_failure")),
                               start_frame: frame, end_frame: frame.map { $0 + Int64(payload.count / 2) },
                               frames: Int64((payload.count + 1) / 2)),
                          to: &rejectedLosses, omitted: &omittedLosses)
             if !valid { latestError = RecorderError.invalidAudio.localizedDescription }
-            else if accepting { latestError = "Source recording queue is full; audio was lost." }
+            else if accepting && !sourceFailed { latestError = "Source recording queue is full; audio was lost." }
             lock.unlock()
             return false
         }
@@ -215,6 +318,40 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             Self.addLoss(Loss(source: source.rawValue, reason: "source_failure_unknown_range",
                               start_frame: nil, end_frame: nil, frames: 0),
                          to: &rejectedLosses, omitted: &omittedLosses)
+        }
+    }
+
+    /// Coalesced in memory under the same admission lock as close. The source
+    /// timer/final barrier persists at most two summaries without per-packet I/O.
+    func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection) {
+        guard correction.isValid else { return }
+        let source: Source = stream == .mic ? .mic : .system
+        lock.withLock {
+            guard !closeRequested else { return }
+            if var summary = clockCorrections[source] {
+                summary.observe(correction)
+                clockCorrections[source] = summary
+            } else {
+                clockCorrections[source] = ClockCorrectionSummary(correction)
+            }
+        }
+    }
+
+    /// Admission only; the original source queue commits both evidence and the
+    /// incomplete marker even if post-wake native audio resumes immediately.
+    func reportPowerEvent(_ event: PowerEvent) {
+        lock.withLock {
+            guard !closeRequested else { return }
+            if pendingPowerEvents.count < 128 { pendingPowerEvents.append(event) }
+            else { omittedPowerEvents = min(Int64.max - 1, omittedPowerEvents) + 1 }
+            switch event.kind {
+            case .monitorUnavailable:
+                latestError = "System sleep observation is unavailable; capture continuity cannot be verified."
+            case .bindingDuringSleep:
+                latestError = "Recording began during a pending sleep transition; capture continuity cannot be verified."
+            case .willSleep, .didWake:
+                latestError = "Recording was interrupted by system sleep. The unrecorded interval is preserved in source power events."
+            }
         }
     }
 
@@ -290,8 +427,11 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             catch {
                 lock.lock()
                 rejectedFrames[packet.source, default: 0] += Int64(packet.payload.count / 2)
-                latestError = error.localizedDescription
-                accepting = false
+                latestError = packet.source.rawValue + " source write failed: " + error.localizedDescription
+                failedAdmissionSources.insert(packet.source)
+                if let recorderError = error as? RecorderError, case .invalidManifest = recorderError {
+                    accepting = false // Invalid shared stream/handle inventory is store-wide.
+                }
                 let start = (packet.ptsUs * 16_000 + 500_000) / 1_000_000
                 Self.addLoss(Loss(source: packet.source.rawValue, reason: "source_write_failed",
                                   start_frame: start, end_frame: start + Int64(packet.payload.count / 2),
@@ -369,9 +509,32 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let error = latestError
         let losses = rejectedLosses
         let omitted = omittedLosses
+        let power = pendingPowerEvents
+        let powerOmitted = omittedPowerEvents
+        let clocks = clockCorrections
         rejectedLosses.removeAll()
         omittedLosses = 0
+        pendingPowerEvents.removeAll(keepingCapacity: true)
+        omittedPowerEvents = 0
         lock.unlock()
+        if !clocks.isEmpty {
+            let summaries = Dictionary(uniqueKeysWithValues: clocks.map { ($0.key.rawValue, $0.value) })
+            if manifest.clock_corrections != summaries {
+                manifest.clock_corrections = summaries
+                dirty = true
+            }
+        }
+        if !power.isEmpty || powerOmitted > 0 {
+            var recorded = manifest.power_events ?? []
+            let admitted = power.prefix(max(0, 128 - recorded.count))
+            recorded.append(contentsOf: admitted)
+            manifest.power_events = recorded
+            let lost = powerOmitted.addingReportingOverflow(Int64(power.count - admitted.count))
+            let total = (manifest.power_events_omitted ?? 0).addingReportingOverflow(lost.partialValue)
+            manifest.power_events_omitted = lost.overflow || total.overflow ? Int64.max : total.partialValue
+            manifest.completed = false
+            dirty = true
+        }
         for loss in losses {
             appendManifestLoss(loss)
             dirty = true
@@ -438,6 +601,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
                 try Self.exportWAVs(manifest: manifest, directory: directory, beforeIO: beforeIO)
                 manifest.completed = failedSources.isEmpty && manifest.problem_count == 0
                     && manifest.streams.values.allSatisfy { $0.dropped_frames == 0 }
+                    && (manifest.power_events?.isEmpty ?? true) && (manifest.power_events_omitted ?? 0) == 0
                 dirty = true
                 commitIfNeeded()
             } catch {
@@ -460,6 +624,8 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         lock.unlock()
         try? sourceLease?.close()
         sourceLease = nil
+        meetingAccess = nil
+        quitWork.finish(failure: dirty ? "The final source recording could not be saved." : nil)
         closeCompletion.markCompleted()
     }
 
@@ -495,10 +661,25 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let url = directory.appendingPathComponent(manifestName)
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= 1024 * 1024 else { throw RecorderError.invalidManifest }
-        let result = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
+        return try decodeManifest(Data(contentsOf: url))
+    }
+
+    static func decodeManifest(_ data: Data) throws -> Manifest {
+        guard data.count <= 1024 * 1024 else { throw RecorderError.invalidManifest }
+        let result = try JSONDecoder().decode(Manifest.self, from: data)
         guard result.schema_version == 1, !result.session_id.isEmpty,
               result.timeline_offset_us >= 0,
               result.streams.count == Source.allCases.count else { throw RecorderError.invalidManifest }
+        if let clocks = result.clock_corrections {
+            guard clocks.count <= Source.allCases.count,
+                  clocks.allSatisfy({ Source(rawValue: $0.key) != nil && $0.value.isValid }) else {
+                throw RecorderError.invalidManifest
+            }
+        }
+        guard (result.power_events?.count ?? 0) <= 128, (result.power_events_omitted ?? 0) >= 0,
+              result.power_events?.allSatisfy({ $0.process_continuous_us >= 0 && ($0.source_time_us ?? 0) >= 0 && ($0.observed_pause_us ?? 0) >= 0 }) ?? true else {
+            throw RecorderError.invalidManifest
+        }
         for source in Source.allCases {
             guard let state = result.streams[source.rawValue], state.sample_rate == 16_000,
                   state.channels == 1, state.committed_bytes >= 0, state.committed_bytes % 2 == 0,

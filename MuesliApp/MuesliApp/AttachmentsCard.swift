@@ -1,229 +1,172 @@
 import SwiftUI
-import AppKit
 
 struct AttachmentsCard: View {
     @EnvironmentObject var model: AppModel
-    @State private var selectedAttachment: Attachment?
-    @State private var hoveredAttachment: Attachment?
-
-    private let columns = [
-        GridItem(.adaptive(minimum: 60, maximum: 80), spacing: 8)
-    ]
+    @State private var selected: Selection?
+    @State private var hoveredAttachment: UUID?
+    private struct Selection: Identifiable {
+        let attachment: Attachment
+        let folder: URL
+        var id: UUID { attachment.id }
+    }
+    private let columns = [GridItem(.adaptive(minimum: 60, maximum: 80), spacing: 8)]
 
     var body: some View {
         GroupBox("Attachments") {
             VStack(alignment: .leading, spacing: 8) {
+                if let notice = model.attachmentNotice {
+                    Text(notice).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if model.currentAttachments.isEmpty {
-                    emptyState
+                    VStack(spacing: 8) {
+                        Image(systemName: "photo.on.rectangle.angled").font(.system(size: 24))
+                        Text("Paste images or text").font(.caption)
+                        Text("Cmd+V").font(.caption2)
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(.vertical, 16)
                 } else {
-                    attachmentsGrid
+                    LazyVGrid(columns: columns, spacing: 8) {
+                        ForEach(model.currentAttachments) { attachment in
+                            AttachmentThumbnail(attachment: attachment, folder: model.currentSession?.folderURL,
+                                isHovered: hoveredAttachment == attachment.id,
+                                onTap: {
+                                    if let folder = model.currentSession?.folderURL {
+                                        selected = Selection(attachment: attachment, folder: folder)
+                                    }
+                                }, onDelete: { model.deleteAttachment(attachment) })
+                                .onHover { hoveredAttachment = $0 ? attachment.id : nil }
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Text("\(model.currentAttachments.count) attachment\(model.currentAttachments.count == 1 ? "" : "s")")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-
-                if !model.currentAttachments.isEmpty {
-                    footer
-                }
-            }
-            .padding(8)
+            }.padding(8)
         }
-        .sheet(item: $selectedAttachment) { attachment in
-            AttachmentDetailSheet(attachment: attachment) {
-                selectedAttachment = nil
-            }
+        .sheet(item: $selected) { selection in
+            AttachmentDetailSheet(attachment: selection.attachment, folder: selection.folder) { selected = nil }
         }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "photo.on.rectangle.angled")
-                .font(.system(size: 24))
-                .foregroundStyle(.secondary)
-            Text("Paste images or text")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("Cmd+V")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
-    }
-
-    private var attachmentsGrid: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
-            ForEach(model.currentAttachments) { attachment in
-                AttachmentThumbnail(
-                    attachment: attachment,
-                    isHovered: hoveredAttachment?.id == attachment.id,
-                    onTap: { selectedAttachment = attachment },
-                    onDelete: { model.deleteAttachment(attachment) }
-                )
-                .onHover { isHovered in
-                    hoveredAttachment = isHovered ? attachment : nil
-                }
-            }
-        }
-    }
-
-    private var footer: some View {
-        HStack {
-            Spacer()
-            Text("\(model.currentAttachments.count) attachment\(model.currentAttachments.count == 1 ? "" : "s")")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        .onChange(of: model.currentSession?.folderURL) { _, _ in selected = nil }
+        .onChange(of: model.currentAttachments.map(\.id)) { _, ids in
+            if let selected, !ids.contains(selected.id) { self.selected = nil }
         }
     }
 }
 
+private func previewRequest(_ attachment: Attachment, folder: URL?, mode: AttachmentPreviewReader.Mode) -> AttachmentPreviewReader.Request? {
+    guard let folder else { return nil }
+    return .init(folder: folder, attachmentID: attachment.id, filename: attachment.filename,
+                 kind: attachment.type == .image ? .image : .text, mode: mode,
+                 sourceSessionID: attachment.sourceSessionID, expectedBytes: attachment.byteCount,
+                 expectedSHA256: attachment.sha256)
+}
+
 struct AttachmentThumbnail: View {
     let attachment: Attachment
+    let folder: URL?
     let isHovered: Bool
     let onTap: () -> Void
     let onDelete: () -> Void
-
-    @EnvironmentObject var model: AppModel
+    @StateObject private var preview = AttachmentPreviewModel()
+    private var request: AttachmentPreviewReader.Request? { previewRequest(attachment, folder: folder, mode: .thumbnail) }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Button(action: onTap) {
-                thumbnailContent
-                    .frame(width: 60, height: 60)
-                    .background(Color.secondary.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Group {
+                    switch preview.event {
+                    case .loaded(.image(let value)):
+                        Image(decorative: value.image, scale: 1).resizable().aspectRatio(contentMode: .fill)
+                    case .loaded(.text): Image(systemName: "doc.text").font(.system(size: 24))
+                    case .loading: ProgressView().controlSize(.small)
+                    case .pending: Image(systemName: "clock").accessibilityLabel("Preview still loading. Open for details.")
+                    case .failed: Image(systemName: "exclamationmark.triangle").accessibilityLabel("Preview unavailable. Open to retry.")
+                    }
+                }
+                .frame(width: 60, height: 60).background(Color.secondary.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
-
+            .help("Open attachment preview")
             if isHovered {
                 Button(action: onDelete) {
-                    Image(systemName: "trash.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white)
-                        .padding(4)
-                        .background(Color.red)
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .offset(x: 4, y: -4)
+                    Image(systemName: "trash.fill").font(.system(size: 10)).foregroundColor(.white)
+                        .padding(4).background(Color.red).clipShape(Circle())
+                }.buttonStyle(.plain).offset(x: 4, y: -4)
             }
         }
-    }
-
-    @ViewBuilder
-    private var thumbnailContent: some View {
-        switch attachment.type {
-        case .image:
-            if let url = model.attachmentFileURL(for: attachment),
-               let nsImage = NSImage(contentsOf: url) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 60, height: 60)
-                    .clipped()
-            } else {
-                Image(systemName: "photo")
-                    .font(.system(size: 24))
-                    .foregroundStyle(.secondary)
-            }
-        case .text:
-            Image(systemName: "doc.text")
-                .font(.system(size: 24))
-                .foregroundStyle(.secondary)
-        }
+        .onChange(of: request) { _, request in preview.load(request) }
+        .onDisappear { preview.stop() }
+        .onAppear { preview.load(request) }
     }
 }
 
 struct AttachmentDetailSheet: View {
     let attachment: Attachment
+    let folder: URL
     let onDismiss: () -> Void
-
-    @EnvironmentObject var model: AppModel
-    @State private var textContent: String = ""
+    @StateObject private var preview = AttachmentPreviewModel()
+    private var request: AttachmentPreviewReader.Request? { previewRequest(attachment, folder: folder, mode: .detail) }
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(attachment.filename).font(.headline)
+                    if attachment.sourceSessionID == nil {
+                        Text("Legacy attachment: session and time alignment unknown.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text(formatTimestamp(attachment.timestamp)).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if attachment.sha256 == nil { Text("Legacy attachment: no saved fingerprint.").font(.caption).foregroundStyle(.secondary) }
+                }
+                Spacer()
+                Button("Done", action: onDismiss).keyboardShortcut(.escape)
+            }.padding()
             Divider()
-            contentArea
+            content.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 500, minHeight: 400)
-        .onAppear {
-            if attachment.type == .text {
-                loadTextContent()
+        .onChange(of: request, initial: true) { _, request in preview.load(request) }
+        .onDisappear { preview.stop() }
+    }
+    @ViewBuilder private var content: some View {
+        switch preview.event {
+        case .loading:
+            ProgressView("Loading preview…")
+        case .pending:
+            VStack(spacing: 12) {
+                Text("The preview is still loading. Its original file operation remains active.")
+                Button("Check again") { preview.retry() }
+            }.padding()
+        case .failed(let message):
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle").font(.title)
+                Text(message).multilineTextAlignment(.center)
+                Button("Retry") { preview.retry() }
+            }.padding()
+        case .loaded(.image(let value)):
+            VStack {
+                Image(decorative: value.image, scale: 1).resizable().aspectRatio(contentMode: .fit).padding()
+                Text("Preview limited to 2048 pixels; original file is unchanged.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.bottom)
+            }
+        case .loaded(.text(let text)):
+            ScrollView {
+                Text(text).font(.body).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding()
             }
         }
     }
-
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.filename)
-                    .font(.headline)
-                Text(formatTimestamp(attachment.timestamp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Done") { onDismiss() }
-                .keyboardShortcut(.escape)
-        }
-        .padding()
-    }
-
-    @ViewBuilder
-    private var contentArea: some View {
-        switch attachment.type {
-        case .image:
-            imageContent
-        case .text:
-            textContentView
-        }
-    }
-
-    private var imageContent: some View {
-        Group {
-            if let url = model.attachmentFileURL(for: attachment),
-               let nsImage = NSImage(contentsOf: url) {
-                ScrollView([.horizontal, .vertical]) {
-                    Image(nsImage: nsImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding()
-                }
-            } else {
-                ContentUnavailableView("Image not found", systemImage: "photo")
-            }
-        }
-    }
-
-    private var textContentView: some View {
-        ScrollView {
-            Text(textContent)
-                .font(.body)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-        }
-    }
-
-    private func loadTextContent() {
-        guard let url = model.attachmentFileURL(for: attachment) else {
-            textContent = "(Unable to load file)"
-            return
-        }
-        do {
-            textContent = try String(contentsOf: url, encoding: .utf8)
-        } catch {
-            textContent = "(Error loading text: \(error.localizedDescription))"
-        }
-    }
-
     private func formatTimestamp(_ seconds: Double) -> String {
-        let hours = Int(seconds) / 3600
-        let minutes = (Int(seconds) % 3600) / 60
-        let secs = Int(seconds) % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d into meeting", hours, minutes, secs)
-        } else {
-            return String(format: "%d:%02d into meeting", minutes, secs)
-        }
+        let value = seconds.isFinite ? min(Double(Int.max / 2), max(0, seconds)) : 0
+        let hours = Int(value) / 3600, minutes = (Int(value) % 3600) / 60, secs = Int(value) % 60
+        return hours > 0 ? String(format: "%d:%02d:%02d into meeting", hours, minutes, secs)
+            : String(format: "%d:%02d into meeting", minutes, secs)
     }
 }

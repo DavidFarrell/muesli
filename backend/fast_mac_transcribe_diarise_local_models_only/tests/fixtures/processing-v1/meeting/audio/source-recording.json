@@ -1,0 +1,30 @@
+{
+  "completed": true,
+  "loss_details_omitted": 0,
+  "losses": [],
+  "problem_count": 0,
+  "revision": 2,
+  "schema_version": 1,
+  "session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+  "streams": {
+    "mic": {
+      "captured_frames": 16000,
+      "channels": 1,
+      "committed_bytes": 32000,
+      "dropped_frames": 0,
+      "gap_frames": 0,
+      "overlap_frames": 0,
+      "sample_rate": 16000
+    },
+    "system": {
+      "captured_frames": 16000,
+      "channels": 1,
+      "committed_bytes": 32000,
+      "dropped_frames": 0,
+      "gap_frames": 0,
+      "overlap_frames": 0,
+      "sample_rate": 16000
+    }
+  },
+  "timeline_offset_us": 0
+}

@@ -46,8 +46,35 @@ nonisolated struct CapturedMicAudio: Sendable {
     let nativeFrameCount: Int
     let formatEpoch: Int
     let outputSampleRate: Int
+    var clockCorrection: CapturedClockCorrection? = nil
 
     var outputFrameCount: Int { data.count / MemoryLayout<Int16>.size }
+}
+
+/// Cumulative observations within one native generation. These describe clock
+/// conversion, not committed audio or missing source samples. Keep the native
+/// generation when forwarding so late observations cannot replace its successor.
+nonisolated struct CapturedClockCorrection: Codable, Sendable, Equatable {
+    let native_frames: Int64
+    let nominal_output_frames: Int64
+    let host_output_frames: Int64
+    let observed_intervals: Int64
+    let uncertain_intervals: Int64
+    let min_rate_ratio: Double?
+    let max_rate_ratio: Double?
+    let generation: Int
+
+    var isValid: Bool {
+        guard generation >= 0, native_frames >= 0, nominal_output_frames >= 0,
+              host_output_frames >= 0, observed_intervals >= 0, uncertain_intervals >= 0 else { return false }
+        // A broad diagnostic input bound, not the retimer's supported drift
+        // range. The retimer owns its tighter correction/uncertainty policy.
+        for ratio in [min_rate_ratio, max_rate_ratio].compactMap({ $0 }) {
+            guard ratio.isFinite, (0.5...2).contains(ratio) else { return false }
+        }
+        if let minimum = min_rate_ratio, let maximum = max_rate_ratio, minimum > maximum { return false }
+        return true
+    }
 }
 
 /// A native failure is evidence even if it is the final callback. Unknown

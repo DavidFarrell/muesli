@@ -35,32 +35,6 @@ struct MeetingSession {
     let startedAt: Date
 }
 
-enum BackendPythonError: Error {
-    case venvOutside
-    case venvMissing
-    case venvNotExecutable
-
-    var message: String {
-        switch self {
-        case .venvOutside:
-            return "Backend venv points outside the backend folder. Recreate it with " +
-                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        case .venvMissing:
-            return "Backend venv not found. Run /opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        case .venvNotExecutable:
-            return "Backend venv python exists but is not executable. Recreate it with " +
-                "/opt/homebrew/bin/python3.12 -m venv --copies .venv and install deps with pip."
-        }
-    }
-}
-
-enum SpeakerIdStatus: Equatable {
-    case unknown
-    case ready
-    case ollamaNotRunning
-    case modelMissing(String)
-    case error(String)
-}
 
 enum AppScreen {
     case start
@@ -137,6 +111,9 @@ final class AppModel: ObservableObject {
     @Published var windowThumbnails: [CGWindowID: CGImage] = [:]
     @Published var isLoadingShareableContent = false
     @Published var shareableContentError: String?
+    private let thumbnailOwner = NativeCallbackOwner<SourceThumbnailRequest.Image>()
+    private var thumbnailTask: Task<Void, Never>?
+    private var thumbnailGeneration = UUID()
 
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var selectedWindowID: CGWindowID?
@@ -181,6 +158,10 @@ final class AppModel: ObservableObject {
 
     let transcriptModel = TranscriptModel()
     @Published var currentAttachments: [Attachment] = []
+    @Published private var attachmentNotices: [String: String] = [:]
+    private var attachmentNoticeOwners: [String: UUID] = [:]
+    private var attachmentEditID: UUID?
+    var attachmentNotice: String? { currentSession.flatMap { attachmentNotices[$0.folderURL.path] } }
 
     private let captureEngine = CaptureEngine()
     // `any MicCapturing` rather than `MicEngine?`: this can hold either the
@@ -212,6 +193,15 @@ final class AppModel: ObservableObject {
     private var lastResolvedInputConfiguration: String?
     private var lastObservedOutputDeviceID: UInt32?
     private var micEngineGeneration: Int = 0
+    private var micSourceIntent: UUID?
+    private struct MeetingMicStartContext {
+        let sourceIntent: UUID
+        let quitIntent: UUID
+        let recorder: LocalAudioRecorder
+        let timeline: CaptureTimeline
+        let eventsURL: URL
+        let access: MeetingFileAccess
+    }
     // The device the running engine is actually bound to / started on. The
     // restart decision compares the DESIRED device to this, not a bare ID delta
     // on the display mirror (audit D1/D3).
@@ -282,6 +272,10 @@ final class AppModel: ObservableObject {
     private var backend: BackendProcess?
     private var writer: FramedWriter?
     private var sourceRecorder: LocalAudioRecorder?
+    private let powerLifecycle = SystemPowerObserver.shared.lifecycle
+    private var powerBindingID: UUID?
+    private var powerBindingIsMeeting = false
+    private var currentMeetingAccess: MeetingFileAccess?
     private let meetingStartPreparation = MeetingStartPreparationOwner()
     private var sourceTimeline: CaptureTimeline?
     private var sessionArtifactStore: SessionArtifactStore?
@@ -294,6 +288,8 @@ final class AppModel: ObservableObject {
     // (mic buffers in MicAudioForwarder's pending ring, system audio in
     // CaptureEngine's) and the meeting is not presented as recording.
     private let backendStartupGate = BackendStartupGate()
+    private let backendAdmission = BackendAdmissionOwner()
+    private let batchRediarizer = BatchRediarizer()
     // 10s: the pre-read-loop cost is the module import chain (numpy/
     // soundfile/parakeet_mlx pulling in MLX/Metal), a few seconds on a cold
     // start - and most of it overlaps the capture/mic startup that runs
@@ -311,7 +307,6 @@ final class AppModel: ObservableObject {
     private var backendLogURL: URL?
     private var transcriptEventsURL: URL?
     private var currentTranscriptEventsStartOffset: UInt64 = 0
-    private var backendAccessURL: URL?
     private var stdoutTask: Task<Void, Never>?
     private let backendBookmarkKey = "MuesliBackendBookmark"
     private let aecModeKey = "aecMode"
@@ -336,7 +331,12 @@ final class AppModel: ObservableObject {
         #endif
         return nil
     }
-    @Published var backendFolderURL: URL?
+    private let archiveBackend = ArchiveApplicationBridge.BackendSelection()
+    private var archiveBridge: ArchiveApplicationBridge?
+    @Published private(set) var archiveListenerState: ArchiveListenerLifecycle.Snapshot?
+    @Published var backendFolderURL: URL? {
+        didSet { archiveBackend.set(backendFolderURL) }
+    }
     @Published var backendFolderError: String?
     @Published var meetingHistory: [MeetingHistoryItem] = []
     @Published private var metadataEditNotices: [String: String] = [:]
@@ -344,7 +344,7 @@ final class AppModel: ObservableObject {
     @Published private var catalogNotice: String?
     private var pendingDeletes: [String: UUID] = [:]
     var metadataEditNotice: String? {
-        let notices = metadataEditNotices.keys.sorted().compactMap { metadataEditNotices[$0] } + [catalogNotice].compactMap { $0 }
+        let notices = metadataEditNotices.keys.sorted().compactMap { metadataEditNotices[$0] } + attachmentNotices.keys.sorted().compactMap { attachmentNotices[$0] } + [catalogNotice].compactMap { $0 }
         return notices.isEmpty ? nil : notices.joined(separator: "\n")
     }
     private lazy var metadataEdits = MeetingMetadataEdits { [weak self] event in
@@ -438,6 +438,13 @@ final class AppModel: ObservableObject {
             )
         }
         mainActorStarvationWatchdog.start()
+        powerLifecycle.setWakeHandler { [weak self, powerLifecycle] in
+            Task { @MainActor [weak self] in
+                guard let wake = powerLifecycle.takeWake() else { return }
+                self?.handleSystemWake(wake)
+            }
+        }
+        SystemPowerObserver.shared.start()
 
         // Restore the persisted device policy (a pin survives relaunch by UID).
         inputSelection = Self.persistedSelection(
@@ -488,21 +495,6 @@ final class AppModel: ObservableObject {
             "system_errors": debugAudioErrors, "mic_buffers": debugMicBuffers,
             "mic_frames": debugMicFrames, "mic_errors": debugMicErrors
         ], sandboxed: isSandboxed)
-    }
-
-    private func resolveBackendPython(for root: URL) -> Result<String, BackendPythonError> {
-        let venvPythonURL = root.appendingPathComponent(".venv/bin/python")
-        if FileManager.default.fileExists(atPath: venvPythonURL.path) {
-            #if DEBUG
-            return .success(venvPythonURL.path)
-            #else
-            if Self.hasExecutePermissionBits(atPath: venvPythonURL.path) {
-                return .success(venvPythonURL.path)
-            }
-            return .failure(.venvNotExecutable)
-            #endif
-        }
-        return .failure(.venvMissing)
     }
 
     /// Checks the file's POSIX mode bits directly. `FileManager.isExecutableFile`
@@ -585,58 +577,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startBackendAccess(for url: URL) -> Bool {
-        guard backendAccessURL == nil else { return true }
-        if url.startAccessingSecurityScopedResource() {
-            backendAccessURL = url
-            return true
-        }
-        return false
-    }
-
-    private func stopBackendAccess() {
-        if let url = backendAccessURL {
-            url.stopAccessingSecurityScopedResource()
-        }
-        backendAccessURL = nil
-    }
-
-    private func stopBackendAccess(for url: URL?) {
-        url?.stopAccessingSecurityScopedResource()
-    }
-
-    private func resetBackendLog(in folderURL: URL) {
-        let logURL = folderURL.appendingPathComponent("backend.log")
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        backendLogURL = logURL
-        backendLogHandle = try? FileHandle(forWritingTo: logURL)
-        backendLogWriter.reset(handle: backendLogHandle)
-    }
-
     private func closeBackendLog() {
         backendLogWriter.close()
         backendLogHandle = nil
-    }
-
-    private func resetTranscriptEventsLog(in audioDirectory: URL) throws {
-        let logURL = audioDirectory.appendingPathComponent("transcript_events.jsonl")
-        // Each source session has its own journal. Never truncate or append
-        // into a prior session while its timed-out reader may still own it.
-        try Data().write(to: logURL, options: .withoutOverwriting)
-        currentTranscriptEventsStartOffset = 0
-        transcriptEventsURL = logURL
-    }
-
-    private func loadTranscriptFromDisk(in folderURL: URL) {
-        let transcriptURL = folderURL.appendingPathComponent("transcript.jsonl")
-        guard FileManager.default.fileExists(atPath: transcriptURL.path) else { return }
-        guard let data = try? Data(contentsOf: transcriptURL),
-              let content = String(data: data, encoding: .utf8) else {
-            return
-        }
-        for line in content.split(whereSeparator: \.isNewline) {
-            transcriptModel.ingest(jsonLine: String(line))
-        }
     }
 
     private func closeTranscriptEventsLog() {
@@ -645,9 +588,7 @@ final class AppModel: ObservableObject {
     }
 
     private func closeHandle(_ handle: FileHandle?) {
-        if let handle {
-            try? handle.close()
-        }
+        if let handle { backendLogWriter.close(handle: handle) }
     }
 
     /// The actual file write + ring-buffer append happen on
@@ -774,10 +715,12 @@ final class AppModel: ObservableObject {
     /// rebuilds the engine into a new generation, so its first delivered
     /// frame is always the generation's first frame too.
     private func onMicAudioDelivered(_ result: MicAudioForwarder.DeliveryResult, generation: Int) {
+        guard isCapturing, !isFinalizing else { return }
         guard generation == micEngineGeneration else { return }
         guard transcribeMic else { return }
         guard !micHealth.invalidated else { return }
-        _ = micHealth.progress(frames: result.totalFrameCount, generation: generation)
+        guard micHealth.observeMicrophoneProgress(frames: result.totalFrameCount, generation: generation,
+                                                  receivedAt: result.receivedAt) else { return }
         debugMicErrorMessage = "-"
         publishMicError()
 
@@ -811,7 +754,7 @@ final class AppModel: ObservableObject {
         // actual STALL DETECTION reads `micAudioForwarder.snapshot()`
         // directly instead (ground truth, updated even when this MainActor
         // hop is delayed) - see `startMicFramesWatchdog`.
-        lastMicAudioAt = Date()
+        lastMicAudioAt = result.receivedAt
         micFrameCount = result.totalFrameCount
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
         publishMicMeters()
@@ -819,7 +762,8 @@ final class AppModel: ObservableObject {
 
     private func handlePreviewMicAudio(_ result: MicAudioForwarder.DeliveryResult) {
         guard !previewMicHealth.invalidated else { return }
-        _ = previewMicHealth.progress(frames: result.totalFrameCount, generation: previewMicGeneration)
+        guard previewMicHealth.observeMicrophoneProgress(frames: result.totalFrameCount, generation: previewMicGeneration,
+                                                         receivedAt: result.receivedAt) else { return }
         debugMicErrorMessage = "-"
         publishMicError()
         meters.clearMicAlert()
@@ -832,8 +776,37 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    func startArchiveIntegration() {
+        if archiveBridge == nil {
+            archiveBackend.set(backendFolderURL)
+            archiveBridge = ArchiveApplicationBridge(backend: archiveBackend) { [weak self] state in
+                self?.archiveListenerState = state
+            }
+        }
+        _ = archiveBridge?.enable()
+    }
+
+    func applicationQuitAccepted() {
+        archiveBridge?.closeAdmissionForQuit()
+    }
+
+    func prepareForApplicationQuit() async {
+        retireMeetingMicSource()
+        meetingCatalog.invalidate()
+        backendAdmission.retireAdmission()
+        pendingMicOperation = nil
+        captureEngine.retireCaptureIntent()
+        if isCapturing, !isFinalizing { await stopMeeting() }
+        await stopHomeLevelPreview()
+    }
+
+    func applicationQuitCancelled() {
+        archiveBridge?.reopenAfterCancelledQuit()
+        if wantsHomeLevelPreview { Task { await self.startHomeLevelPreview() } }
+    }
+
     private var wantsHomeLevelPreview: Bool {
-        CapturePreviewPolicy.wantsPreview(isCapturing: isCapturing, isStarting: isStartingMeeting,
+        ShutdownWorkRegistry.shared.acceptsUserWork && CapturePreviewPolicy.wantsPreview(isCapturing: isCapturing, isStarting: isStartingMeeting,
                                          isFinalizing: isFinalizing, isStartScreenActive: isStartScreenActive,
                                          onboarding: shouldShowOnboarding)
     }
@@ -889,9 +862,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress,
+    private func nativeMicrophoneStartRequest(_ engine: any MicCapturing, ingress: MicAudioIngress,
                                       generation: Int, voiceProcessing: Bool, resolvedID: UInt32,
-                                      pinned: Bool, preview: Bool) async throws {
+                                      pinned: Bool, preview: Bool, meetingAccess: MeetingFileAccess? = nil,
+                                      adoption: (@MainActor @Sendable (CaptureOperationOwner.Claim) -> Void)? = nil) -> CaptureOperationOwner.Request {
+        let access = meetingAccess ?? (preview ? nil : currentMeetingAccess)
         let problem = ingress.problemCallback()
         let invalidation = CaptureInvalidationMailbox(onInvalidated: {
             problem(.unknown(generation: generation, message: "The native microphone configuration was invalidated."))
@@ -899,30 +874,59 @@ final class AppModel: ObservableObject {
             self?.invalidateMicrophone(generation: generation, preview: preview)
         }
         let changed = invalidation.callback()
-        try await micOperationOwner.perform(onFailure: { error in
+        return CaptureOperationOwner.Request(onFailure: { error in
             problem(.unknown(generation: generation, message: "Microphone start failed: \(error.localizedDescription)"))
         }, operation: {
+            defer { withExtendedLifetime(access) {} }
             try await engine.start(generation: generation, enableVoiceProcessing: voiceProcessing,
                                    preferredInputDeviceID: resolvedID == 0 ? nil : resolvedID,
                                    pinned: pinned, onConfigurationChange: changed,
                                    onCaptureProblem: ingress.problemCallback(), onAudioData: ingress.callback())
-        }, cleanupIfAbandoned: {
+        }, adoption: adoption, cleanupIfAbandoned: {
+            defer { withExtendedLifetime(access) {} }
             await engine.stop()
             await ingress.finish()
         })
     }
 
+    private func meetingMicStartContext() -> MeetingMicStartContext? {
+        guard isCapturing, !isFinalizing, ShutdownWorkRegistry.shared.acceptsUserWork,
+              let sourceIntent = micSourceIntent, let recorder = sourceRecorder,
+              let timeline = sourceTimeline, let eventsURL = transcriptEventsURL,
+              let access = currentMeetingAccess else { return nil }
+        return MeetingMicStartContext(sourceIntent: sourceIntent,
+            quitIntent: ApplicationQuitCoordinator.shared.startIntent, recorder: recorder,
+            timeline: timeline, eventsURL: eventsURL, access: access)
+    }
+
+    private func isCurrentMicStart(_ context: MeetingMicStartContext) -> Bool {
+        micSourceIntent == context.sourceIntent
+            && ApplicationQuitCoordinator.shared.canContinueStart(context.quitIntent)
+            && isCurrentSource(context.recorder, eventsURL: context.eventsURL)
+    }
+
+    private func retireMeetingMicSource() {
+        if micSourceIntent != nil, transcribeMic, micEngine == nil {
+            sourceRecorder?.reportFailure(stream: .mic,
+                message: "Recording stopped before microphone startup could be adopted; microphone completeness could not be verified.")
+        }
+        micSourceIntent = nil
+    }
+
     @discardableResult
     private func stopNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress?, preview: Bool) async -> Bool {
+        let access = preview ? nil : currentMeetingAccess
         let generation = preview ? previewMicGeneration : micEngineGeneration
         let problem = ingress?.problemCallback()
         do {
-            try await micOperationOwner.perform(onFailure: { error in
+            let stopRequest = CaptureOperationOwner.Request(onFailure: { error in
                 problem?(.unknown(generation: generation, message: "Microphone stop failed: \(error.localizedDescription)"))
-            }) {
+            }, operation: {
+                defer { withExtendedLifetime(access) {} }
                 await engine.stop()
                 await ingress?.finish()
-            }
+            })
+            try await micOperationOwner.perform(stopRequest, preservesRecording: !preview)
             return true
         } catch {
             if let failure = error as? CaptureOperationOwner.Failure, case .busy = failure { return false }
@@ -1105,6 +1109,7 @@ final class AppModel: ObservableObject {
     }
 
     private func startHomeLevelPreviewNow() async {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { await stopHomeLevelPreviewNow(); return }
         startMicFramesWatchdog()
         guard !isCapturing else { return }
         guard !isStartingMeeting else { return }
@@ -1126,6 +1131,10 @@ final class AppModel: ObservableObject {
             return
         }
 
+        if powerBindingID == nil {
+            powerBindingIsMeeting = false
+            powerBindingID = powerLifecycle.bind()
+        }
         if !isPreviewCaptureRunning {
             if let display = selectedDisplay ?? displays.first {
             let audioFilter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
@@ -1201,9 +1210,10 @@ final class AppModel: ObservableObject {
                                                onProblem: await forwarder.captureFailureHandler())
         previewMicAudioIngress = ingress
         do {
-            try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
+            let request = nativeMicrophoneStartRequest(engine, ingress: ingress, generation: generation,
                                             voiceProcessing: previewVoiceProcessingRequested,
                                             resolvedID: resolvedID, pinned: pinned, preview: true)
+            try await micOperationOwner.perform(request)
         } catch {
             await previewMicAudioIngress?.finish()
             lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
@@ -1242,6 +1252,7 @@ final class AppModel: ObservableObject {
     }
 
     private func stopHomeLevelPreviewNow() async {
+        if !powerBindingIsMeeting { retirePowerBinding() }
         if let engine = previewMicEngine,
            await stopNativeMicrophone(engine, ingress: previewMicAudioIngress, preview: true) {
             await previewMicAudioIngress?.finish()
@@ -1298,20 +1309,54 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func retirePowerBinding() {
+        if let id = powerBindingID { powerLifecycle.retire(id) }
+        powerBindingID = nil
+        powerBindingIsMeeting = false
+    }
+
+    private func handleSystemWake(_ wake: CapturePowerLifecycle.Wake) {
+        guard powerBindingID == wake.bindingID else { return }
+        if powerBindingIsMeeting {
+            guard sourceRecorder != nil, !isFinalizing, wake.sourceSessionID == diagnosticSourceID else { return }
+            if transcribeMic {
+                micHealth.invalidateAfterSystemWake()
+            }
+        } else {
+            guard wantsHomeLevelPreview else { return }
+            previewMicHealth.invalidateAfterSystemWake()
+        }
+        captureEngine.invalidateAfterSystemWake()
+        // Health invalidation rejects old-generation progress. The existing
+        // supervisor performs bounded, coalesced source/preview reconciliation
+        // when the original native owner is available, including silent SCK.
+        startMicFramesWatchdog()
+    }
+
     private func shouldEnableVoiceProcessing() -> Bool {
         let outputIsBuiltIn = AudioDeviceManager.defaultOutputDeviceID().map(AudioDeviceManager.isBuiltInSpeaker) ?? false
         return shouldRequestVoiceProcessing(mode: aecMode, outputIsBuiltInSpeaker: outputIsBuiltIn)
     }
 
-    private func startMeetingMicEngine() async {
+    private func startMeetingMicEngine(expectedSourceIntent: UUID? = nil) async {
+        guard let context = meetingMicStartContext(),
+              expectedSourceIntent == nil || expectedSourceIntent == context.sourceIntent else { return }
         startMicFramesWatchdog()
         guard transcribeMic else {
+            let generation = micEngineGeneration
+            let retiringIngress = micAudioIngress
+            if let engine = micEngine {
+                guard await stopNativeMicrophone(engine, ingress: retiringIngress, preview: false),
+                      isCurrentMicStart(context), generation == micEngineGeneration else { return }
+            }
+            await retiringIngress?.finish()
+            guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
             micEngine = nil
             micEngineStartedAt = nil
-            await micAudioIngress?.finish()
-            lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
+            lastRetiredMicIngress = retiringIngress?.snapshot() ?? lastRetiredMicIngress
             micAudioIngress = nil
             await micAudioForwarder.stop()
+            guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
             cancelMicStartupHealthCheck()
             return
         }
@@ -1343,6 +1388,7 @@ final class AppModel: ObservableObject {
                 usesCaptureSession: usesCaptureSession, resolvedID: resolvedID, pinned: pinned, generation: generation
             )
         } catch is CaptureSessionMicEngineError where usesCaptureSession {
+            guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
             // The capture-session engine could not even start (e.g. the CoreAudio
             // UID -> AVCaptureDevice mapping did not hold on this hardware - the
             // one unverified assumption in that path). Degrade to AVAudioEngine
@@ -1360,9 +1406,11 @@ final class AppModel: ObservableObject {
                     usesCaptureSession: false, resolvedID: resolvedID, pinned: pinned, generation: fallbackGeneration
                 )
             } catch {
+                guard isCurrentMicStart(context), fallbackGeneration == micEngineGeneration else { return }
                 await handleMeetingMicEngineStartFailure(error)
             }
         } catch {
+            guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
             await handleMeetingMicEngineStartFailure(error)
         }
     }
@@ -1376,6 +1424,7 @@ final class AppModel: ObservableObject {
     private func attemptMeetingMicEngineStart(
         usesCaptureSession: Bool, resolvedID: UInt32, pinned: Bool, generation: Int
     ) async throws {
+        guard let context = meetingMicStartContext() else { return }
         let engine = makeMicEngine(usesCaptureSession: usesCaptureSession, context: "meeting", resolvedID: resolvedID, pinned: pinned)
 
         // Effective VPIO drops to off once a downgrade has fired this
@@ -1396,42 +1445,33 @@ final class AppModel: ObservableObject {
         // mechanism only papered over: no buffer can arrive before its
         // generation is recognised.
         await micAudioIngress?.finish()
-        await micAudioForwarder.beginGeneration(generation, writer: sourceRecorder, outputEnabled: sourceRecorder != nil)
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
+        await micAudioForwarder.beginGeneration(generation, writer: context.recorder, outputEnabled: true)
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
         let display = MicDeliveryDisplayMailbox { [weak self] result in
             self?.onMicAudioDelivered(result, generation: generation)
         }
         observedMicProblems = 0
         let reportProblem = await micAudioForwarder.captureFailureHandler()
-        let recorder = sourceRecorder
-        let timeline = sourceTimeline
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
+        let recorder = context.recorder
+        let timeline = context.timeline
         let ingress = MicAudioIngress.forwarding(to: micAudioForwarder, display: display, onRejected: { packet, reason in
-            guard let timeline else { return }
-            recorder?.reportLoss(stream: .mic, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
+            recorder.reportLoss(stream: .mic, ptsUs: timeline.relativeMicroseconds(packet.captureTimeUs),
                                  frames: Int64(packet.outputFrameCount), reason: reason.rawValue)
         }, onProblem: reportProblem)
         micAudioIngress = ingress
 
         micHealth.begin(generation: generation)
-        try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
-                                        voiceProcessing: enableVPIO, resolvedID: resolvedID, pinned: pinned, preview: false)
-        // Serialization should prevent overlap, but bail if a newer start
-        // superseded this one before it completed (audit D2 belt-and-braces).
-        guard generation == micEngineGeneration else {
-            AudioLog.event("engine.start.superseded", ["gen": generation, "current": micEngineGeneration])
-            _ = await stopNativeMicrophone(engine, ingress: ingress, preview: false)
-            return
-        }
-        // A stop() that ran concurrently with this start (e.g. a recovery
-        // rebuild in flight when the user hit Stop) must not have this
-        // start assign a live engine after the meeting has ended - stop
-        // what we just started and leave micEngine untouched instead.
-        guard !isFinalizing else {
-            AudioLog.event("engine.start.superseded-by-stop", ["gen": generation])
-            _ = await stopNativeMicrophone(engine, ingress: ingress, preview: false)
-            return
-        }
-        micEngine = engine
-        micEngineStartedAt = Date()
+        let request = nativeMicrophoneStartRequest(engine, ingress: ingress, generation: generation,
+                                        voiceProcessing: enableVPIO, resolvedID: resolvedID, pinned: pinned, preview: false,
+                                        meetingAccess: context.access, adoption: { [self] claim in
+            guard isCurrentMicStart(context), generation == micEngineGeneration, claim.claim() else { return }
+            micEngine = engine
+            micEngineStartedAt = Date()
+        })
+        try await micOperationOwner.perform(request, preservesRecording: true)
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
         // Only open the pipe once the backend has acknowledged
         // MSG_MEETING_START (2026-07-16 RCA §9 startup-ordering defect: mic
         // forwarding used to be enabled here unconditionally, before
@@ -1451,6 +1491,7 @@ final class AppModel: ObservableObject {
     }
 
     private func handleMeetingMicEngineStartFailure(_ error: Error) async {
+        guard let context = meetingMicStartContext() else { return }
         // A VPIO-format failure is not a hard failure: downgrade to plain
         // capture once and restart rather than leaving the mic dead.
         if micVoiceProcessingRequested, !micVoiceProcessingDowngraded,
@@ -1463,21 +1504,26 @@ final class AppModel: ObservableObject {
             // path runs at first-start too, BEFORE isCapturing is set, so it
             // must not route through restartMeetingMicEngineForInputSwitch
             // (which guards on isCapturing and would no-op here).
-            await startMeetingMicEngine()
+            await startMeetingMicEngine(expectedSourceIntent: context.sourceIntent)
             return
         }
         await handleMicStartFailure(error)
     }
 
     private func handleMicStartFailure(_ error: Error) async {
+        guard let context = meetingMicStartContext() else { return }
+        let generation = micEngineGeneration
+        let retiringIngress = micAudioIngress
+        await retiringIngress?.finish()
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
         micEngine = nil
         micEngineStartedAt = nil
         micEngineBoundDeviceID = 0
         micEngineUsesCaptureSession = false
-        await micAudioIngress?.finish()
-        lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
+        lastRetiredMicIngress = retiringIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
+        guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
         cancelMicStartupHealthCheck()
         debugMicErrors += 1
         debugMicErrorMessage = "mic_start_failed: \(error.localizedDescription)"
@@ -1495,6 +1541,8 @@ final class AppModel: ObservableObject {
     /// Stop-then-start the meeting mic engine. MUST run on the mic lifecycle
     /// serializer (via `enqueueMicLifecycle`) - never spawn it in a bare Task.
     private func restartMeetingMicEngineForInputSwitch() async {
+        guard let context = meetingMicStartContext() else { return }
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard isCapturing else { return }
         guard transcribeMic else { return }
         // A stop in progress poisons any queued/in-flight restart - the
@@ -1508,6 +1556,7 @@ final class AppModel: ObservableObject {
 
         if let engine = micEngine {
             guard await stopNativeMicrophone(engine, ingress: micAudioIngress, preview: false) else { return }
+            guard isCurrentMicStart(context) else { return }
             micEngine = nil
         }
         micEngineBoundDeviceID = 0
@@ -1519,16 +1568,18 @@ final class AppModel: ObservableObject {
         // explicitly here too so forwarding halts the instant the engine
         // does, rather than lingering until the new generation is armed.
         await micAudioIngress?.finish()
+        guard isCurrentMicStart(context) else { return }
         lastRetiredMicIngress = micAudioIngress?.snapshot() ?? lastRetiredMicIngress
         micAudioIngress = nil
         await micAudioForwarder.stop()
+        guard isCurrentMicStart(context) else { return }
         micLevel = 0
         debugMicBuffers = 0
         debugMicFrames = 0
         debugMicPTS = 0
         lastMicAudioAt = nil
         publishMicMeters(force: true)
-        await startMeetingMicEngine()
+        await startMeetingMicEngine(expectedSourceIntent: context.sourceIntent)
         AudioLog.event("engine.restart.end", ["boundID": micEngineBoundDeviceID])
     }
 
@@ -1591,8 +1642,8 @@ final class AppModel: ObservableObject {
                     }
                     if let forwarder = previewMicForwarder {
                         let snapshot = await forwarder.snapshot()
-                        if previewMicHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
-                                                      at: snapshot.lastFrameAt ?? Date()) {
+                        if previewMicHealth.observeMicrophoneProgress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                                                     receivedAt: snapshot.lastFrameAt) {
                             debugMicErrorMessage = "-"
                             publishMicError()
                             meters.clearMicAlert()
@@ -1610,8 +1661,8 @@ final class AppModel: ObservableObject {
                         micHealth.fail("The previous microphone operation has finished.")
                     }
                     let snapshot = await micAudioForwarder.snapshot()
-                    if micHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
-                                           at: snapshot.lastFrameAt ?? Date()) {
+                    if micHealth.observeMicrophoneProgress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                                          receivedAt: snapshot.lastFrameAt) {
                         resetMicRecoveryLadder()
                         debugMicErrorMessage = "-"
                         publishMicError()
@@ -1749,12 +1800,17 @@ final class AppModel: ObservableObject {
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
         while ContinuousClock.now < deadline {
+            if preview { previewMicHealth.observeExpectedProgress() }
+            else if transcribeMic { micHealth.observeExpectedProgress() }
             let microphone = preview ? previewMicHealth.phase : micHealth.phase
             _ = captureEngine.supervise(allowRecovery: false)
             if (microphone == .healthy || (!preview && !transcribeMic)), captureEngine.health.phase == .healthy { break }
             if microphone == .failed || microphone == .quarantined { break }
             do { try await Task.sleep(for: .milliseconds(50)) } catch { break }
         }
+        // The final suspension may itself outlive the last fresh sample.
+        if preview { previewMicHealth.observeExpectedProgress() }
+        else if transcribeMic { micHealth.observeExpectedProgress() }
         func outcome(_ phase: CaptureSourceHealth.Phase) -> AudioRefreshResult.Outcome {
             switch phase {
             case .healthy: return .healthy
@@ -1818,75 +1874,72 @@ final class AppModel: ObservableObject {
         return Float(min(1.0, rms))
     }
 
-    private func buildTranscriptJSONL(from segments: [TranscriptSegment]) -> String {
-        // Legacy export wrapper. Authoritative saves use the throwing encoder
-        // through TranscriptReplacement and TranscriptPersistenceStore.
-        do { return try TranscriptModel.jsonLines(from: segments) }
-        catch {
-            appendBackendLog("Failed to encode transcript JSONL: \(error.localizedDescription)", toTail: true)
-            return ""
-        }
-    }
-
-    private func writeTranscriptData(
-        _ data: Data?,
-        to url: URL,
-        encodeFailure: String,
-        writeFailure: String,
-        logToTail: Bool = true,
-        logHandle: FileHandle? = nil
-    ) {
-        guard let data else {
-            appendBackendLog(encodeFailure, toTail: logToTail, handle: logHandle)
-            return
-        }
-        do {
-            try data.write(to: url)
-        } catch {
-            appendBackendLog(
-                "\(writeFailure): \(error.localizedDescription)",
-                toTail: logToTail,
-                handle: logHandle
-            )
-        }
-    }
+    @Published var transcriptExportNotice: String?
+    private let transcriptExportOwner = TranscriptExportOwner()
+    private var transcriptExportID: UUID?
 
     func exportTranscriptFiles() {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         guard let session = currentSession else {
-            appendBackendLog("Export failed: no active session.", toTail: true)
+            transcriptExportNotice = "Open a saved meeting to export its transcript."
             return
         }
+        presentTranscriptExport(sourceDirectory: session.folderURL, title: session.title)
+    }
 
+    private func presentTranscriptExport(sourceDirectory: URL, title: String) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        guard transcriptExportID == nil else {
+            transcriptExportNotice = "The original transcript export is still running. Its result will appear here."
+            return
+        }
+        if currentSession?.folderURL == sourceDirectory, isCapturing || isFinalizing {
+            transcriptExportNotice = "Stop and finish saving this meeting before exporting its transcript."
+            return
+        }
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "\(session.title)-transcript.txt"
+        panel.title = "Export transcript folder"
+        panel.nameFieldLabel = "Folder name:"
+        panel.nameFieldStringValue = "\(title)-transcript"
         panel.prompt = "Export"
-        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
+        panel.message = "Create a new folder containing transcript.txt and transcript.jsonl. Existing folders are never replaced."
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        beginTranscriptExport(sourceDirectory: sourceDirectory, destinationDirectory: destination)
+    }
 
-        if panel.runModal() == .OK, let url = panel.url {
-            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
-            let targetDir = url.deletingLastPathComponent()
-
-            let textString = transcriptModel.asPlainText()
-            let textData = textString.data(using: .utf8)
-            writeTranscriptData(
-                textData,
-                to: url,
-                encodeFailure: "Failed to encode exported transcript text.",
-                writeFailure: "Failed to export transcript text"
-            )
-
-            let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
-            let jsonlData = jsonlString.data(using: .utf8)
-            writeTranscriptData(
-                jsonlData,
-                to: jsonlURL,
-                encodeFailure: "Failed to encode exported transcript JSONL.",
-                writeFailure: "Failed to export transcript JSONL"
-            )
-
-            appendBackendLog("Transcript exported to \(targetDir.path).", toTail: true)
+    /// The selected URLs are immutable; late completion never reads a different
+    /// viewer's model. Every actual outcome is visible outside the backend log.
+    private func beginTranscriptExport(sourceDirectory: URL, destinationDirectory: URL) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        let id = UUID()
+        transcriptExportID = id
+        transcriptExportNotice = "Exporting the selected meeting's saved transcript…"
+        do {
+            let attempt = try transcriptExportOwner.start(sourceDirectory: sourceDirectory,
+                destinationDirectory: destinationDirectory, onCompletion: { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.transcriptExportID == id else { return }
+                        self.transcriptExportID = nil
+                        switch result {
+                        case .success(let receipt):
+                            self.transcriptExportNotice = "Exported transcript folder “\(receipt.directory.lastPathComponent)”."
+                        case .failure(let error): self.transcriptExportNotice = error.localizedDescription
+                        }
+                    }
+                })
+            Task { @MainActor [weak self] in
+                let outcome = await attempt.wait(timeoutSeconds: 5)
+                guard let self, self.transcriptExportID == id else { return }
+                switch outcome {
+                case .timedOut, .cancelled:
+                    self.transcriptExportNotice = "The transcript export is still pending. Its original operation remains active; the actual result will appear here."
+                case .completed: break // Only the original callback publishes once.
+                }
+            }
+        } catch {
+            transcriptExportID = nil
+            transcriptExportNotice = error.localizedDescription
         }
     }
 
@@ -1924,6 +1977,12 @@ final class AppModel: ObservableObject {
     }
 
     func loadShareableContent() async {
+        guard !isLoadingShareableContent else { return }
+        thumbnailGeneration = UUID()
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
+        displayThumbnails.removeAll()
+        windowThumbnails.removeAll()
         isLoadingShareableContent = true
         shareableContentError = nil
         defer { isLoadingShareableContent = false }
@@ -1944,17 +2003,20 @@ final class AppModel: ObservableObject {
                 selectedWindowID = windows.first?.windowID
             }
 
-            // Capture thumbnails in background - don't block the UI
-            Task { @MainActor in
-                await captureThumbnails()
+            let generation = thumbnailGeneration
+            let capturedDisplays = displays
+            let capturedWindows = windows
+            thumbnailTask = Task { @MainActor [weak self] in
+                await self?.captureThumbnails(displays: capturedDisplays, windows: capturedWindows, generation: generation)
             }
 
             if isStartScreenActive && !isCapturing {
                 await refreshHomeLevelPreview()
             }
         } catch {
-            shareableContentError = String(describing: error)
-            screenPermissionGranted = false
+            shareableContentError = error.localizedDescription
+            // An unavailable native request is not evidence of TCC denial.
+            screenPermissionGranted = Permissions.screenCapturePreflight()
         }
     }
 
@@ -2055,7 +2117,7 @@ final class AppModel: ObservableObject {
             )
             screenPermissionGranted = true
         } catch {
-            screenPermissionGranted = false
+            screenPermissionGranted = Permissions.screenCapturePreflight()
         }
     }
 
@@ -2065,94 +2127,44 @@ final class AppModel: ObservableObject {
     }
 
     @MainActor
-    private func captureThumbnails() async {
-        displayThumbnails.removeAll()
-        windowThumbnails.removeAll()
-
-        let thumbnailSize = CGSize(width: 160, height: 90)
-
+    private func captureThumbnails(displays: [SCDisplay], windows: [SCWindow], generation: UUID) async {
+        defer {
+            if thumbnailGeneration == generation { thumbnailTask = nil }
+        }
+        // Snapshot IDs/filters belong only to this picker generation. A new
+        // refresh retires publication immediately, even if macOS returns late.
         for display in displays {
-            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-            if let image = await captureThumbnail(for: filter),
-               let thumbnail = resizeImage(image, to: thumbnailSize) {
-                displayThumbnails[display.displayID] = thumbnail
+            guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+            let request = SourceThumbnailRequest(filter: SCContentFilter(display: display, excludingApplications: [], exceptingWindows: []))
+            do {
+                let image = try await thumbnailOwner.perform(timeoutSeconds: 2, request: request.capture)
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                displayThumbnails[display.displayID] = image.value
+            } catch {
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                if thumbnailOwner.isBusy {
+                    shareableContentError = "Screen previews are unavailable while a previous macOS request is still pending."
+                    return
+                }
+                // A disappeared individual window/display may fail normally;
+                // only unresolved native ownership stops the entire batch.
             }
         }
-
         for window in windows {
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            if let image = await captureThumbnail(for: filter),
-               let thumbnail = resizeImage(image, to: thumbnailSize) {
-                windowThumbnails[window.windowID] = thumbnail
-            }
-        }
-    }
-
-    @MainActor
-    private func captureThumbnail(for filter: SCContentFilter) async -> CGImage? {
-        let config = SCStreamConfiguration()
-        config.showsCursor = false
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-
-        // Use a timeout to prevent hanging if a window capture never returns
-        return await withTaskGroup(of: CGImage?.self) { group in
-            group.addTask {
-                await withCheckedContinuation { continuation in
-                    SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: config) { sampleBuffer, error in
-                        guard error == nil,
-                              let sampleBuffer,
-                              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-                            continuation.resume(returning: nil)
-                            return
-                        }
-                        let ciImage = CIImage(cvImageBuffer: imageBuffer)
-                        let context = CIContext()
-                        let cgImage = context.createCGImage(ciImage, from: ciImage.extent)
-                        continuation.resume(returning: cgImage)
-                    }
+            guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+            let request = SourceThumbnailRequest(filter: SCContentFilter(desktopIndependentWindow: window))
+            do {
+                let image = try await thumbnailOwner.perform(timeoutSeconds: 2, request: request.capture)
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                windowThumbnails[window.windowID] = image.value
+            } catch {
+                guard !Task.isCancelled, thumbnailGeneration == generation else { return }
+                if thumbnailOwner.isBusy {
+                    shareableContentError = "Screen previews are unavailable while a previous macOS request is still pending."
+                    return
                 }
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(2))
-                return nil
-            }
-            // Return first result (either the capture or timeout)
-            let result = await group.next() ?? nil
-            group.cancelAll()
-            return result
         }
-    }
-
-    private func resizeImage(_ image: CGImage, to maxSize: CGSize) -> CGImage? {
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
-        if width == 0 || height == 0 {
-            return nil
-        }
-
-        let widthRatio = maxSize.width / width
-        let heightRatio = maxSize.height / height
-        let ratio = min(widthRatio, heightRatio)
-
-        let newWidth = Int(width * ratio)
-        let newHeight = Int(height * ratio)
-
-        guard let context = CGContext(
-            data: nil,
-            width: newWidth,
-            height: newHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
-
-        return context.makeImage()
     }
 
     func startMeeting() async {
@@ -2164,6 +2176,10 @@ final class AppModel: ObservableObject {
     }
 
     private func startMeeting(resuming meeting: MeetingHistoryItem?) async {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork,
+              let startWork = try? ShutdownWorkRegistry.shared.begin("Starting or retiring a meeting") else { return }
+        defer { startWork.finish() }
+        let startIntent = ApplicationQuitCoordinator.shared.startIntent
         meetingCatalog.invalidate()
         guard !isStartingMeeting else { return }
         guard !meetingStartPreparation.isBusy else {
@@ -2188,6 +2204,7 @@ final class AppModel: ObservableObject {
         cancelMicStartupHealthCheck()
         micVoiceProcessingDowngraded = false
         await stopHomeLevelPreview()
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else { return }
         refreshPermissions()
         loadInputDevices()
         backendFolderError = nil
@@ -2271,6 +2288,10 @@ final class AppModel: ObservableObject {
             shareableContentError = "The previous meeting preparation is still closing its files."
             return
         }
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else {
+            meetingStartPreparation.discardUnadopted(prepared)
+            return
+        }
         let title = prepared.title
         let folderURL = prepared.folderURL
         let audioDir = prepared.audioDirectory
@@ -2285,13 +2306,17 @@ final class AppModel: ObservableObject {
         meetingTitle = title
         meetingCatalog.protect(folderURL)
         currentSession = session
+        micSourceIntent = UUID()
         sourceRecorder = recorder
+        powerBindingIsMeeting = true
+        powerBindingID = powerLifecycle.bind(recorder: recorder, timeline: captureTimeline, sourceSessionID: sourceID)
+        currentMeetingAccess = prepared.access
         sessionArtifactStore = prepared.artifacts
         sourceTimeline = captureTimeline
         inferenceFailure = nil
         backendLogURL = prepared.logURL
         backendLogHandle = prepared.logHandle
-        backendLogWriter.reset(handle: prepared.logHandle)
+        backendLogWriter.reset(handle: prepared.logHandle, access: prepared.access)
         transcriptEventsURL = prepared.eventsURL
         currentTranscriptEventsStartOffset = 0
         transcriptModel.resetForNewMeeting(keepSpeakerNames: false)
@@ -2309,6 +2334,11 @@ final class AppModel: ObservableObject {
             catch { appendBackendLog("Failed to decode saved attachments: \(error.localizedDescription)", toTail: true) }
         }
         transcriptModel.timestampOffset = timestampOffset
+        // The source and session now exist. Stop must be available during
+        // native setup and the bounded inference admission that follows.
+        isCapturing = true
+        activeScreen = .session
+        let sessionEventsURL = prepared.eventsURL
 
         do {
             try Task.checkCancellation()
@@ -2329,19 +2359,33 @@ final class AppModel: ObservableObject {
 
             sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
             try await captureEngine.startCapture(
                 contentFilter: audioFilter,
                 writer: recorder,
                 recordTo: recordURL,
                 timeline: captureTimeline,
-                audioOutputEnabled: true
+                audioOutputEnabled: true, meetingAccess: prepared.access
             )
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             resetMicDebugState()
             micStartTime = Date()
-            await startMeetingMicEngine()
+            let initialMicIntent = micSourceIntent
+            enqueueMicLifecycle("meeting-initial-microphone") { model in
+                guard let initialMicIntent, model.micSourceIntent == initialMicIntent,
+                      ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else { return }
+                await model.startMeetingMicEngine(expectedSourceIntent: initialMicIntent)
+            }
+            await micLifecycleTask?.value
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
             let systemSampleRate = 16_000
             let systemChannels = 1
             let micSampleRate = micOutputSampleRate
@@ -2355,13 +2399,20 @@ final class AppModel: ObservableObject {
 
             if let backendProjectRoot {
                 do {
-                    _ = try launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir, folderURL: folderURL)
+                    try await launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir,
+                                                  folderURL: folderURL, recorder: recorder, eventsURL: sessionEventsURL,
+                                                  startIntent: startIntent)
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
+                    guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
                     reportInferenceFailure(error.localizedDescription)
                 }
             } else {
                 reportInferenceFailure("No local transcription backend is configured.")
             }
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             let meta: [String: Any] = [
                 "protocol_version": 1,
@@ -2408,141 +2459,100 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            isCapturing = true
-            activeScreen = .session
             scheduleMicStartupHealthCheck()
             startMicFramesWatchdog()
         } catch {
-            let pythonPath = backendPythonCandidatePath ?? "(unknown)"
-            let nsError = error as NSError
-            let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
-            shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) exists=\(backendPythonExists) sandboxed=\(isSandboxed) \(details)"
+            // Stop owns teardown once it retires this source. A late startup
+            // continuation must not touch its files or a subsequent meeting.
+            guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            isFinalizing = true
+            defer { isFinalizing = false; isCapturing = false; activeScreen = .start }
+            if error is CancellationError {
+                shareableContentError = "Meeting start was cancelled before setup finished. Its captured source files were retained."
+            } else {
+                let pythonPath = backendPythonCandidatePath ?? "(unknown)"
+                let nsError = error as NSError
+                let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
+                shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) sandboxed=\(isSandboxed) \(details)"
+            }
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
     }
 
-    /// Live inference may be absent or fail; source recording has a separate owner.
-    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL) throws -> FramedWriter {
-    guard startBackendAccess(for: backendProjectRoot) else {
-        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied."])
+    private func isCurrentSource(_ recorder: LocalAudioRecorder, eventsURL: URL) -> Bool {
+        isCapturing && !isFinalizing && sourceRecorder === recorder && transcriptEventsURL == eventsURL
     }
 
-    switch resolveBackendPython(for: backendProjectRoot) {
-    case .success(let backendPython):
-        if !FileManager.default.fileExists(atPath: backendPython) {
-            let message = "Backend python not found at \(backendPython)."
-            throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-        }
-        let transcribeStream: String
-        if transcribeSystem && transcribeMic {
-            transcribeStream = "both"
-        } else if transcribeSystem {
-            transcribeStream = "system"
-        } else {
-            transcribeStream = "mic"
-        }
-
-        var command = [
-            backendPython,
-            "-m",
-            "diarise_transcribe.muesli_backend",
-            "--emit-meters",
-            "--transcribe-stream",
-            transcribeStream,
-            "--output-dir",
-            audioDir.path
-        ]
-        command.append("--keep-wav")
-        command.append("--source-recording")
-        command.append("--live-asr-only")
-        #if DEBUG
-        command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
-        #endif
-        let baseEnv = ProcessInfo.processInfo.environment
-        let defaultPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        let mergedPath: String
-        if let existingPath = baseEnv["PATH"], !existingPath.isEmpty {
-            mergedPath = "\(defaultPath):\(existingPath)"
-        } else {
-            mergedPath = defaultPath
-        }
-        let backendEnv = [
-            "MUESLI_ALLOW_MODEL_DOWNLOADS": "0",
-            "HF_HUB_OFFLINE": "1",
-            "HF_HUB_DISABLE_TELEMETRY": "1",
-            "PYTHONPATH": backendProjectRoot.appendingPathComponent("src").path,
-            "PATH": mergedPath
-        ]
-        let backend = try BackendProcess(
-            command: command,
-            workingDirectory: backendProjectRoot,
-            environment: backendEnv,
-            eventJournalURL: transcriptEventsURL
-        )
-        let sessionFolderURL = folderURL
-        let sessionEventsURL = transcriptEventsURL
+    /// Live inference may be absent or fail; source recording has a separate owner.
+    private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL,
+                                     recorder: LocalAudioRecorder, eventsURL: URL, startIntent: UUID) async throws {
+        try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
+        let transcribeStream = transcribeSystem && transcribeMic ? "both" : (transcribeSystem ? "system" : "mic")
         let sessionLogHandle = backendLogHandle
-        appendBackendLog("Backend folder: \(backendProjectRoot.path)", toTail: true)
-        appendBackendLog("PATH: \(mergedPath)", toTail: true)
-        appendBackendLog("Command: \(command.joined(separator: " "))", toTail: true)
-        backend.onExit = { [weak self] status in
+        let onExit: @Sendable (Int32) -> Void = { [weak self] status in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                if isActiveSession && !self.isFinalizing {
-                    self.reportInferenceFailure("The transcription process exited (status \(status)).")
-                }
-                self.appendBackendLog(
-                    "Backend exited with status \(status)",
-                    toTail: isActiveSession,
-                    handle: sessionLogHandle
-                )
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                let active = self.isCurrentSource(recorder, eventsURL: eventsURL)
+                if active { self.reportInferenceFailure("The transcription process exited (status \(status)).") }
+                self.appendBackendLog("Backend exited with status \(status)", toTail: active, handle: sessionLogHandle)
             }
         }
-        backend.onStderrLine = { [weak self] line in
+        let onStderr: @Sendable (String) -> Void = { [weak self] line in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                self.appendBackendLog(
-                    "[stderr] \(line)",
-                    toTail: isActiveSession,
-                    handle: sessionLogHandle
-                )
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                self.appendBackendLog("[stderr] \(line)",
+                    toTail: self.isCurrentSource(recorder, eventsURL: eventsURL), handle: sessionLogHandle)
             }
         }
-        try backend.start()
+        let attempt = try backendAdmission.start(protecting: folderURL, timeoutSeconds: 8) {
+            try BackendLaunchConfiguration.scoped(root: backendProjectRoot) { python in
+                var command = [python, "-m", "diarise_transcribe.muesli_backend", "--emit-meters",
+                    "--transcribe-stream", transcribeStream, "--output-dir", audioDir.path,
+                    "--keep-wav", "--source-recording", "--live-asr-only", "--meeting-lease-required"]
+                #if DEBUG
+                command.append(contentsOf: ["--verbose", "--live-interval", "5", "--live-min-seconds", "5"])
+                #endif
+                let backend = try BackendProcess(command: command, workingDirectory: backendProjectRoot,
+                    environment: BatchRediarizer.backendEnvironment(root: backendProjectRoot), eventJournalURL: eventsURL)
+                backend.onExit = onExit
+                backend.onStderrLine = onStderr
+                return backend
+            }
+        }
+        let outcome = await attempt.waitUntilReady()
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent),
+              isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
+            attempt.cancel()
+            throw CancellationError()
+        }
+        switch outcome {
+        case .ready: break
+        case .failed(let message): throw BackendAdmissionOwner.Failure(message: message)
+        case .timedOut, .cancelled: throw BackendAdmissionOwner.Failure.retired
+        }
+        // No await between the current-source fence, claim and UI publication.
+        let resources = try attempt.claim()
+        let backend = resources.backend
+        let createdWriter = resources.writer
         self.backend = backend
+        self.writer = createdWriter
+        currentTranscriptEventsStartOffset = backend.stdoutStatus().journalStartOffset
+        createdWriter.onWriteError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self, self.transcriptEventsURL == eventsURL else { return }
+                self.handleBackendWriteError(error)
+            }
+        }
         stdoutTask?.cancel()
         stdoutTask = Task { @MainActor in
             for await line in backend.stdoutLines {
                 guard !Task.isCancelled else { break }
-                let isActiveSession = self.isCapturing && self.currentSession?.folderURL == sessionFolderURL
-                    && self.transcriptEventsURL == sessionEventsURL
-                self.handleBackendJSONLine(
-                    line,
-                    backendLogHandle: sessionLogHandle,
-                    ingestIntoLiveTranscript: isActiveSession,
-                    sessionFolderURL: sessionFolderURL
-                )
+                self.handleBackendJSONLine(line, backendLogHandle: sessionLogHandle,
+                    ingestIntoLiveTranscript: self.isCurrentSource(recorder, eventsURL: eventsURL),
+                    sessionFolderURL: folderURL)
             }
         }
-        let createdWriter = FramedWriter(stdinHandle: backend.stdin)
-        createdWriter.onWriteError = { [weak self] error in
-            Task { @MainActor [weak self] in
-                guard let self, self.transcriptEventsURL == sessionEventsURL else { return }
-                self.handleBackendWriteError(error)
-            }
-        }
-        self.writer = createdWriter
-        return createdWriter
-
-    case .failure(let error):
-        throw NSError(domain: "Muesli", code: 1, userInfo: [NSLocalizedDescriptionKey: error.message])
-    }
-
     }
 
     /// Explicit teardown for a startMeeting() attempt that threw partway
@@ -2564,6 +2574,10 @@ final class AppModel: ObservableObject {
         wasResume: Bool,
         priorMetadata: MeetingMetadata?
     ) async {
+        retireMeetingMicSource()
+        retirePowerBinding()
+        let stoppingAccess = currentMeetingAccess
+        defer { currentMeetingAccess = nil; withExtendedLifetime(stoppingAccess) {} }
         let stoppingArtifacts = takeSessionArtifactStore()
         cancelMicStartupHealthCheck()
         stopMicFramesWatchdog()
@@ -2628,17 +2642,16 @@ final class AppModel: ObservableObject {
 
         closeBackendLog()
         closeTranscriptEventsLog()
-        stopBackendAccess()
 
         if hadSourceRecorder {
             // Source capture may have succeeded before another source failed.
             // Keep this session indexed so preserved material is recoverable.
             await finalizeMeetingMetadata(for: session, finalizedSegments: [], sourceManifest: sourceResult,
-                                    artifactResult: artifactResult, incomplete: true)
+                                    artifactResult: artifactResult, incomplete: true, access: stoppingAccess)
         } else {
             // Preserve the prepared session index even if no recorder reached
             // this defensive path. The owned finalizer reports missing sources.
-            await finalizeMeetingMetadata(for: session, finalizedSegments: [], incomplete: true)
+            await finalizeMeetingMetadata(for: session, finalizedSegments: [], incomplete: true, access: stoppingAccess)
         }
 
         clearAttachments()
@@ -2646,9 +2659,14 @@ final class AppModel: ObservableObject {
     }
 
     func stopMeeting() async {
-        guard isCapturing, !isFinalizing else { return }
+        guard isCapturing, !isFinalizing,
+              let stopWork = try? ShutdownWorkRegistry.shared.begin("Stopping accepted recording") else { return }
+        defer { stopWork.finish() }
+        retirePowerBinding()
+        let stoppingAccess = currentMeetingAccess
 
         isFinalizing = true
+        retireMeetingMicSource()
         // Retire edit admission before any suspension. The retained finalizer
         // carries accepted names even if their preceding disk edit fails.
         let acceptedSpeakerNames = currentSession.map { retireMetadataEdits(in: $0.folderURL) } ?? [:]
@@ -2725,7 +2743,6 @@ final class AppModel: ObservableObject {
         let stoppingWriter = writer
         let stoppingStdoutTask = stdoutTask
         let stoppingBackendLogHandle = backendLogHandle
-        let stoppingBackendAccessURL = backendAccessURL
         let stoppingTranscriptEventsStartOffset = currentTranscriptEventsStartOffset
         let stoppingTranscriptEventsURL = transcriptEventsURL
         let stoppingTranscriptSegments = transcriptModel.segments.filter { !$0.isPartial }
@@ -2739,29 +2756,28 @@ final class AppModel: ObservableObject {
         backendLogHandle = nil
         backendLogURL = nil
         transcriptEventsURL = nil
-        backendAccessURL = nil
         currentTranscriptEventsStartOffset = 0
         clearAttachments()
 
         isCapturing = false
+        currentMeetingAccess = nil
         currentSession = nil
         activeScreen = .start
 
         guard let stoppingSession else {
             closeHandle(stoppingBackendLogHandle)
-            stopBackendAccess(for: stoppingBackendAccessURL)
             isFinalizing = false
             return
         }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        let finalizationWork = try? ShutdownWorkRegistry.shared.begin("Saving the final transcript and session")
+        Task { @MainActor [self] in
+            defer { finalizationWork?.finish() }
             await self.finalizeStoppedMeeting(
                 session: stoppingSession,
                 backend: stoppingBackend,
                 stdoutTask: stoppingStdoutTask,
                 backendLogHandle: stoppingBackendLogHandle,
-                backendAccessURL: stoppingBackendAccessURL,
                 transcriptEventsStartOffset: stoppingTranscriptEventsStartOffset,
                 transcriptEventsURL: stoppingTranscriptEventsURL,
                 transcriptSegmentsSnapshot: stoppingTranscriptSegments,
@@ -2771,7 +2787,8 @@ final class AppModel: ObservableObject {
                 writer: stoppingWriter,
                 sourceManifest: sourceResult,
                 artifactResult: artifactResult,
-                inferenceFailed: stoppingInferenceFailed
+                inferenceFailed: stoppingInferenceFailed,
+                access: stoppingAccess
             )
         }
     }
@@ -2781,7 +2798,6 @@ final class AppModel: ObservableObject {
         backend: BackendProcess?,
         stdoutTask: Task<Void, Never>?,
         backendLogHandle: FileHandle?,
-        backendAccessURL: URL?,
         transcriptEventsStartOffset: UInt64,
         transcriptEventsURL: URL?,
         transcriptSegmentsSnapshot: [TranscriptSegment],
@@ -2791,14 +2807,15 @@ final class AppModel: ObservableObject {
         writer: FramedWriter? = nil,
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
         artifactResult: SessionArtifactFinishResult? = nil,
-        inferenceFailed: Bool = false
+        inferenceFailed: Bool = false,
+        access: MeetingFileAccess? = nil
     ) async {
+        defer { withExtendedLifetime(access) {} }
         defer {
             // Ordered after any writes still queued on the writer's own
             // serial queue - see BackendLogWriter.close's doc comment for
             // why this must not be a bare `handle.close()` here.
-            backendLogWriter.close()
-            stopBackendAccess(for: backendAccessURL)
+            backendLogWriter.close(handle: backendLogHandle)
             isFinalizing = false
             // The home-level preview was blocked from (re)starting while
             // isFinalizing (see startHomeLevelPreviewNow's guard, item 4) -
@@ -2881,7 +2898,8 @@ final class AppModel: ObservableObject {
                 onCompletion: { [weak self] result in
                     Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
-                try TranscriptReplacement.commitStoppedMeeting(context: context,
+                defer { withExtendedLifetime(access) {} }
+                return try TranscriptReplacement.commitStoppedMeeting(context: context,
                     timestampOffset: timestampOffsetSnapshot, segments: transcriptSegmentsSnapshot,
                     speakerNames: speakerNamesSnapshot, journalURL: transcriptEventsURL,
                     journalStatus: journalStatus, sourceManifest: sourceManifest,
@@ -2914,6 +2932,7 @@ final class AppModel: ObservableObject {
             // its older title/count/status snapshot back into history.
             loadMeetingHistory()
         case .failure(let error):
+            ShutdownWorkRegistry.shared.recordFailure("The final meeting save failed: \(error.localizedDescription)")
             metadataEdits.completeRetirement(in: folder, successorSucceeded: false)
             meetingSaveNotices[folder.path] = "Meeting save needs attention: \(error.localizedDescription) Original audio and recovery files have been retained."
         }
@@ -3054,6 +3073,7 @@ final class AppModel: ObservableObject {
     /// native stop. Taking it closes screenshot admission immediately; pending
     /// SDK video callbacks continue to address this original session's ledger.
     private func takeSessionArtifactStore() -> SessionArtifactStore? {
+        backendAdmission.retireAdmission()
         captureEngine.retireCaptureIntent()
         screenshotScheduler.stop()
         let store = sessionArtifactStore
@@ -3069,14 +3089,17 @@ final class AppModel: ObservableObject {
         finalizedSegments: [TranscriptSegment],
         sourceManifest: LocalAudioRecorder.Manifest? = nil,
         artifactResult: SessionArtifactFinishResult? = nil,
-        incomplete: Bool = false
+        incomplete: Bool = false,
+        access: MeetingFileAccess? = nil
     ) async {
+        defer { withExtendedLifetime(access) {} }
         let saveID = meetingSavePublication.begin(folder: session.folderURL)
         do {
             let operation = try TranscriptPersistenceStore.shared.startAfterCurrent(in: session.folderURL,
                 onCompletion: { [weak self] result in
                     Task { @MainActor [weak self] in self?.publishMeetingSave(result, folder: session.folderURL, id: saveID) }
                 }) { context in
+                defer { withExtendedLifetime(access) {} }
                 let prior = try context.readMetadata()
                 let problems = OrphanedMeetingRecovery.finalizationSourceProblems(folderURL: context.folder, metadata: prior)
                 let metadata = prior.finalized(segments: finalizedSegments, sourceManifest: sourceManifest,
@@ -3099,6 +3122,7 @@ final class AppModel: ObservableObject {
     }
 
     func renameSpeaker(id: String, to name: String) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         let folder: URL?
         if let session = currentSession { folder = session.folderURL }
         else if case .viewing(let item) = activeScreen { folder = item.folderURL }
@@ -3155,136 +3179,94 @@ final class AppModel: ObservableObject {
 
     // MARK: - Attachments
 
-    private func attachmentsFolderURL(for session: MeetingSession) -> URL {
-        session.folderURL.appendingPathComponent("attachments", isDirectory: true)
-    }
-
-    private func attachmentsManifestURL(for session: MeetingSession) -> URL {
-        session.folderURL.appendingPathComponent("attachments.json")
-    }
-
-    private func meetingElapsedSeconds() -> Double {
-        guard let session = currentSession else { return 0 }
-        return Date().timeIntervalSince(session.startedAt)
-    }
-
-    private func formatTimestampFilename(_ seconds: Double, extension ext: String) -> String {
-        // Format: t+0000005.123.png (7 digits for seconds, 3 for milliseconds)
-        let wholeSec = Int(seconds)
-        let millis = Int((seconds - Double(wholeSec)) * 1000)
-        return String(format: "t+%07d.%03d.%@", wholeSec, millis, ext)
-    }
-
-    func saveImageAttachment(_ image: NSImage) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        do {
-            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
-        } catch {
-            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
-            return
-        }
-
-        let elapsed = meetingElapsedSeconds()
-        let filename = formatTimestampFilename(elapsed, extension: "png")
-        let fileURL = attachmentsDir.appendingPathComponent(filename)
-
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            appendBackendLog("Failed to convert image to PNG", toTail: true)
-            return
-        }
-
-        do {
-            try pngData.write(to: fileURL)
-            let attachment = Attachment(type: .image, timestamp: elapsed, filename: filename)
-            currentAttachments.append(attachment)
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Saved image attachment: \(filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to save image attachment: \(error.localizedDescription)", toTail: true)
-        }
+    func saveImageAttachment(_ encodedImage: Data) {
+        let input = AttachmentPersistence.ImageInput(data: encodedImage)
+        saveAttachment(type: .image) { try input.png() }
     }
 
     func saveTextAttachment(_ text: String) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        do {
-            try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
-        } catch {
-            appendBackendLog("Failed to create attachments folder: \(error.localizedDescription)", toTail: true)
+        guard text.utf8.count <= AttachmentPersistence.maximumTextBytes else {
+            if let folder = currentSession?.folderURL {
+                setAttachmentNotice("The text exceeds the 1 MB attachment limit. Nothing was saved.", folder: folder, id: UUID())
+            }
             return
         }
+        saveAttachment(type: .text) { Data(text.utf8) }
+    }
 
-        let elapsed = meetingElapsedSeconds()
-        let filename = formatTimestampFilename(elapsed, extension: "txt")
-        let fileURL = attachmentsDir.appendingPathComponent(filename)
-
-        do {
-            try text.write(to: fileURL, atomically: true, encoding: .utf8)
-            let attachment = Attachment(type: .text, timestamp: elapsed, filename: filename)
-            currentAttachments.append(attachment)
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Saved text attachment: \(filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to save text attachment: \(error.localizedDescription)", toTail: true)
+    private func saveAttachment(type: AttachmentType, data: @escaping @Sendable () throws -> Data) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        guard isCapturing, !isFinalizing, let timeline = sourceTimeline,
+              let sourceID = diagnosticSourceID, let session = currentSession else { return }
+        let timestamp = transcriptModel.timestampOffset
+            + Double(max(0, timeline.relativeMicroseconds(CaptureTimeline.hostNowMicroseconds()))) / 1_000_000
+        performAttachmentEdit(folder: session.folderURL, sourceID: sourceID) { context in
+            try AttachmentPersistence.add(context: context, type: type, timestamp: timestamp,
+                                          sourceID: sourceID, data: data())
         }
     }
 
     func deleteAttachment(_ attachment: Attachment) {
-        guard let session = currentSession else { return }
-
-        let attachmentsDir = attachmentsFolderURL(for: session)
-        let fileURL = attachmentsDir.appendingPathComponent(attachment.filename)
-
-        do {
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
-            }
-            currentAttachments.removeAll { $0.id == attachment.id }
-            saveAttachmentsManifest(for: session)
-            appendBackendLog("Deleted attachment: \(attachment.filename)", toTail: true)
-        } catch {
-            appendBackendLog("Failed to delete attachment: \(error.localizedDescription)", toTail: true)
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        guard isCapturing, !isFinalizing, let session = currentSession,
+              let sourceID = diagnosticSourceID else { return }
+        performAttachmentEdit(folder: session.folderURL, sourceID: sourceID) { context in
+            try AttachmentPersistence.remove(context: context, id: attachment.id)
         }
     }
 
     func attachmentFileURL(for attachment: Attachment) -> URL? {
-        guard let session = currentSession else { return nil }
-        return attachmentsFolderURL(for: session).appendingPathComponent(attachment.filename)
+        guard let session = currentSession, AttachmentPersistence.validFilename(attachment.filename),
+              currentAttachments.contains(where: { $0.id == attachment.id && $0.filename == attachment.filename }) else { return nil }
+        return session.folderURL.appendingPathComponent("attachments").appendingPathComponent(attachment.filename)
     }
 
-    private func saveAttachmentsManifest(for session: MeetingSession) {
-        let manifest = AttachmentsManifest(attachments: currentAttachments)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
+    private func performAttachmentEdit(folder: URL, sourceID: String,
+        operation: @escaping @Sendable (TranscriptPersistenceStore.Context) throws -> AttachmentPersistence.Snapshot) {
+        let id = UUID()
+        guard attachmentEditID == nil else {
+            setAttachmentNotice("This attachment change was not accepted while another save was pending. Try again after it finishes.", folder: folder, id: id)
+            return
+        }
         do {
-            let data = try encoder.encode(manifest)
-            try data.write(to: attachmentsManifestURL(for: session), options: [.atomic])
+            let owner = try TranscriptPersistenceStore.shared.start(in: folder, onCompletion: { [weak self] result in
+                Task { @MainActor [weak self] in
+                    guard let self, self.attachmentEditID == id else { return }
+                    self.attachmentEditID = nil
+                    switch result {
+                    case .success(let snapshot):
+                        if self.currentSession?.folderURL == folder, self.diagnosticSourceID == sourceID {
+                            self.currentAttachments = snapshot.attachments
+                        }
+                        if self.attachmentNoticeOwners[folder.path] == id {
+                            self.setAttachmentNotice(snapshot.cleanupNotice, folder: folder, id: id)
+                        }
+                    case .failure(let error):
+                        if self.attachmentNoticeOwners[folder.path] == id {
+                            self.setAttachmentNotice("Attachment change was not saved: \(error.localizedDescription)", folder: folder, id: id)
+                        }
+                    }
+                }
+            }, operation: operation)
+            attachmentEditID = id
+            setAttachmentNotice("Saving attachment…", folder: folder, id: id)
+            Task { @MainActor [weak self] in
+                let result = await owner.wait(timeoutSeconds: 5)
+                guard let self, self.attachmentEditID == id, self.attachmentNoticeOwners[folder.path] == id else { return }
+                switch result {
+                case .timedOut, .cancelled:
+                    self.setAttachmentNotice("The attachment save is still pending. Its original disk operation remains active.", folder: folder, id: id)
+                case .completed, .failed: break // The original callback publishes the actual result.
+                }
+            }
         } catch {
-            appendBackendLog("Failed to save attachments manifest: \(error.localizedDescription)", toTail: true)
+            setAttachmentNotice("Attachment change was not accepted: \(error.localizedDescription)", folder: folder, id: id)
         }
     }
 
-    private func loadAttachments(from folderURL: URL) {
-        currentAttachments = []
-        let manifestURL = folderURL.appendingPathComponent("attachments.json")
-        guard FileManager.default.fileExists(atPath: manifestURL.path) else { return }
-
-        do {
-            let data = try Data(contentsOf: manifestURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let manifest = try decoder.decode(AttachmentsManifest.self, from: data)
-            currentAttachments = manifest.attachments
-        } catch {
-            appendBackendLog("Failed to load attachments manifest: \(error.localizedDescription)", toTail: true)
-        }
+    private func setAttachmentNotice(_ message: String?, folder: URL, id: UUID) {
+        attachmentNotices[folder.path] = message
+        attachmentNoticeOwners[folder.path] = message == nil ? nil : id
     }
 
     private func clearAttachments() {
@@ -3301,9 +3283,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem) {
+    func applySpeakerMappings(_ mappings: [SpeakerIdentifier.SpeakerMapping], for meeting: MeetingHistoryItem, basis: SpeakerIdentificationBasis) {
         guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL,
               canEditTranscript(in: meeting.folderURL) else { return }
+        guard basis.matches(transcriptModel), !metadataEdits.isPending(in: meeting.folderURL) else {
+            transcriptLoadError = "The transcript or speaker names changed. Identify speakers again before applying suggestions."
+            return
+        }
         var assignments: [String: String] = [:]
         for mapping in mappings {
             let id = mapping.speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3311,7 +3297,8 @@ final class AppModel: ObservableObject {
             guard !id.isEmpty, !name.isEmpty else { continue }
             assignments.merge(transcriptModel.speakerNameAssignments(id: id, name: name)) { _, latest in latest }
         }
-        submitSpeakerNames(assignments, to: meeting.folderURL)
+        meetingCatalog.invalidate()
+        metadataEdits.submitNames(assignments, in: meeting.folderURL, contentGeneration: basis.contentGeneration, expectedNames: basis.names)
     }
 
     func runBatchRediarization(
@@ -3326,35 +3313,12 @@ final class AppModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Select the backend folder before reprocessing."]
             )
         }
-        guard startBackendAccess(for: backendProjectRoot) else {
-            throw NSError(
-                domain: "Muesli",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Backend folder access denied. Re-select the folder."]
-            )
-        }
-        defer { stopBackendAccess() }
-
-        switch resolveBackendPython(for: backendProjectRoot) {
-        case .failure(let error):
-            throw NSError(
-                domain: "Muesli",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: error.message]
-            )
-        case .success(let backendPython):
-            let rediarizer = BatchRediarizer()
-            return try await rediarizer.run(
-                meetingDirectory: meeting.folderURL,
-                backendPython: backendPython,
-                backendRoot: backendProjectRoot,
-                stream: stream,
-                progressHandler: progressHandler
-            )
-        }
+        return try await batchRediarizer.run(meetingDirectory: meeting.folderURL,
+            backendRoot: backendProjectRoot, stream: stream, progressHandler: progressHandler)
     }
 
     func applyBatchRediarization(_ result: BatchRediarizer.Result, requestID: UUID, for meeting: MeetingHistoryItem) async throws {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         guard case .viewing(let current) = activeScreen, current.folderURL == meeting.folderURL else {
             throw TranscriptPersistenceStore.Failure.superseded
         }
@@ -3380,6 +3344,7 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func renameMeeting(folderURL: URL, to newTitle: String) async throws -> String {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { throw ShutdownWorkRegistry.Failure.sealed }
         try transcriptModel.assertNoPendingReplacement(in: folderURL)
         meetingCatalog.invalidate()
         return try await metadataEdits.rename(in: folderURL, to: newTitle)
@@ -3404,6 +3369,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteMeeting(_ item: MeetingHistoryItem) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
         let folder = item.folderURL
         guard !isFinalizing, currentSession?.folderURL != folder,
               !metadataEdits.isPending(in: folder), pendingDeletes[folder.path] == nil else {
@@ -3452,11 +3418,14 @@ final class AppModel: ObservableObject {
     }
 
     func resumeMeeting(_ item: MeetingHistoryItem) {
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        let resumeIntent = ApplicationQuitCoordinator.shared.startIntent
         guard !isPreparingResume, !isStartingMeeting, !isCapturing, !isFinalizing else { return }
         isPreparingResume = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { isPreparingResume = false }
+            guard ApplicationQuitCoordinator.shared.canContinueStart(resumeIntent) else { return }
             await startMeeting(resuming: item)
         }
     }
@@ -3467,41 +3436,8 @@ final class AppModel: ObservableObject {
     }
 
     func exportTranscriptFiles(for meeting: MeetingHistoryItem) {
-        let panel = NSSavePanel()
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "\(meeting.title)-transcript.txt"
-        panel.prompt = "Export"
-        panel.message = "Export transcript as .txt (JSONL will be written alongside)."
-
-        if panel.runModal() == .OK, let url = panel.url {
-            let jsonlURL = url.deletingPathExtension().appendingPathExtension("jsonl")
-
-            let transcriptURL = meeting.folderURL.appendingPathComponent("transcript.jsonl")
-            let jsonlData: Data?
-            if FileManager.default.fileExists(atPath: transcriptURL.path),
-               let diskData = try? Data(contentsOf: transcriptURL) {
-                jsonlData = diskData
-            } else {
-                let jsonlString = buildTranscriptJSONL(from: transcriptModel.segments)
-                jsonlData = jsonlString.data(using: .utf8)
-            }
-            writeTranscriptData(
-                jsonlData,
-                to: jsonlURL,
-                encodeFailure: "Failed to encode exported transcript JSONL.",
-                writeFailure: "Failed to export transcript JSONL"
-            )
-
-            let textString = transcriptModel.asPlainText()
-            let textData = textString.data(using: .utf8)
-            writeTranscriptData(
-                textData,
-                to: url,
-                encodeFailure: "Failed to encode exported transcript text.",
-                writeFailure: "Failed to export transcript text"
-            )
-        }
+        guard ShutdownWorkRegistry.shared.acceptsUserWork else { return }
+        presentTranscriptExport(sourceDirectory: meeting.folderURL, title: meeting.title)
     }
 
     @Published var transcriptLoadError: String?

@@ -47,6 +47,49 @@ nonisolated private final class FakeMicMonotonicClock: MicMonotonicClock, @unche
 /// makes ahead of it, and must only reset via the meeting-scoped
 /// `beginMeeting`/`endMeeting` pair.
 final class MicAudioForwarderTests: XCTestCase {
+    func testDeliveryCarriesIndependentReceiptTimestamp() async throws {
+        let clock = FakeMicMonotonicClock()
+        let forwarder = MicAudioForwarder(sampleRate: 16000, channels: 1, clock: clock)
+        await forwarder.beginMeeting()
+        await forwarder.beginGeneration(7, writer: nil)
+        let before = Date()
+        let delivered = await forwarder.deliver(packet(makeSampleData(), clock: clock, generation: 7))
+        let result = try XCTUnwrap(delivered)
+        let snapshot = await forwarder.snapshot()
+        XCTAssertEqual(result.receivedAt, snapshot.lastFrameAt)
+        XCTAssertGreaterThanOrEqual(result.receivedAt, before)
+        XCTAssertLessThanOrEqual(result.receivedAt, Date())
+        var health = CaptureSourceHealth()
+        health.begin(generation: 7, now: before)
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: result.totalFrameCount, generation: 7,
+                                                       receivedAt: result.receivedAt, now: result.receivedAt.addingTimeInterval(15)))
+        XCTAssertNotEqual(health.phase, .healthy)
+    }
+
+    func testCoalescedUIDeliveryKeepsLatestReceiptWithoutRefreshingItsAge() async {
+        let received = Date(timeIntervalSince1970: 100)
+        let consumed = TaskCompletion()
+        var health = CaptureSourceHealth()
+        health.begin(generation: 7, now: received)
+        let display = MicDeliveryDisplayMailbox { result in
+            XCTAssertEqual(result.totalFrameCount, 2)
+            XCTAssertEqual(result.receivedAt, received.addingTimeInterval(1))
+            XCTAssertTrue(result.isFirstFrame, "Recovery flags survive coalescing independently of receipt time")
+            XCTAssertFalse(health.observeMicrophoneProgress(frames: result.totalFrameCount, generation: 7,
+                                                           receivedAt: result.receivedAt, now: received.addingTimeInterval(16)))
+            XCTAssertNotEqual(health.phase, .healthy)
+            consumed.markCompleted()
+        }
+        // No suspension: the real mailbox cannot run its MainActor callback
+        // until both publications have coalesced. Only the observation clock advances.
+        display.publish(.init(level: 0, frameSampleCount: 160, totalFrameCount: 1, receivedAt: received,
+                              elapsedSeconds: 0, isFirstFrame: true, isResumptionAfterGap: false))
+        display.publish(.init(level: 0, frameSampleCount: 160, totalFrameCount: 2, receivedAt: received.addingTimeInterval(1),
+                              elapsedSeconds: 1, isFirstFrame: false, isResumptionAfterGap: false))
+        let outcome = await consumed.wait(timeoutSeconds: 2)
+        XCTAssertEqual(outcome, .completed)
+    }
+
     private func packet(_ data: Data, clock: MicMonotonicClock, generation: Int) -> CapturedMicAudio {
         CapturedMicAudio(data: data, captureTimeUs: clock.nowMicroseconds(), generation: generation,
                          nativeSampleRate: 16000, nativeChannels: 1, nativeFrameCount: data.count / 2, formatEpoch: 1,

@@ -1,8 +1,12 @@
-# Unapplied runtime compatibility proposal
+# Authorised isolated runtime compatibility experiment
 
-Prototype location: `/private/tmp/muesli-inference-xpc`, frozen implementation `bc702fa`, independently reviewed proposal `c16199f`. The prototype is not integrated into the application.
+Prototype location: `/private/tmp/muesli-inference-xpc`, original implementation `bc702fa`, reviewed proposal `c16199f`, authorised experiment frozen at `fe1a744464c14c2071d4bdce841b77950a5d10c7`. The prototype is not integrated into the application.
 
-Status: **Not applied; requires explicit user authorization.** This document is a reviewable proposal, not an entitlement file or an instruction to change security settings.
+Status, 6 September 2026: **The user explicitly authorised this helper-only experiment. Its actual inference and bounded security checks passed, followed by an independent Astra review.** The exception is applied only in the isolated prototype. This is not approval or evidence of a finished production integration, installation or distribution.
+
+The exact frozen development-signed proof passed generated Parakeet ASR and Senko on committed PCM and legacy WAV, native IPv4/IPv6 TCP/UDP denial with positive controls, wrong-peer rejection, actual service/decoder termination on cancellation, and unchanged source hashes. Independent audit verified all 254 native signatures, exact entitlement sets and runtime flags, 17 packaged backend modules and 13 recorded source/overlay hashes. A diagnostic native decoder also denied an unbookmarked generated private-home control with `EPERM`; its original real-decoder bundle stayed unchanged. Evidence: `/private/tmp/muesli-xpc-fe1a744-results.json`, `-comparison.json`, `-child-report.json`, and `/private/tmp/muesli-xpc-astra-frozen-audit.json` / `-policy.jsonl`.
+
+**Open boundary:** a private-home bookmark from the nonsandboxed proof host failed admission. A separate diagnostic host with only App Sandbox and user-selected read-only entitlements is ready to test a visible selection of the generated fixture, but the Mac was locked. Temporary-directory success and the negative home control do not prove a successful private-source grant. Current backend/source lease, continuous live protocol, journal/client ownership and packaged model identity integration are also pending. In particular, the current Python child lease opens existing locks read/write; read-only shared-lock admission must be qualified before using a read-only source grant. The frozen proof uses an older staged runtime plus an explicit four-module overlay, not the full current application backend.
 
 The development-signed proof embeds CPython directly inside `paidiaconsulting.MuesliApp.InferenceService.xpc`, through `PythonBridge.m`. There is no separately launched Python executable. FFmpeg is a separate child with only App Sandbox inheritance entitlements. The proposed exception therefore belongs only to the XPC service executable. It does not belong to the main Muesli app, the proof host, FFmpeg, or any global machine setting.
 
@@ -16,7 +20,7 @@ Add the following single Boolean entitlement to `release/inference-service/Servi
 
 The existing service entitlements remain `com.apple.security.app-sandbox = true` and `com.apple.security.cs.allow-jit = true`. The proposed resulting set contains exactly those three keys. The signing command retains `--options runtime`; library validation stays enabled. Neither `com.apple.security.network.client` nor `com.apple.security.network.server` is added. No `disable-library-validation`, `disable-executable-page-protection`, `get-task-allow`, sandbox exception, arbitrary command, environment, module, or import-path RPC is proposed.
 
-Automatic approval review rejected this exact entitlement addition: “Adding the persistent allow-unsigned-executable-memory entitlement materially weakens code-execution protections for the helper, and the user authorized local inference generally but not this exact broad security exception.” The entitlement file remains unchanged after that rejection.
+Before the user's explicit authorisation, automatic approval review rejected this exact entitlement addition: “Adding the persistent allow-unsigned-executable-memory entitlement materially weakens code-execution protections for the helper, and the user authorized local inference generally but not this exact broad security exception.” The experiment remained unapplied at that earlier checkpoint. The later user decision authorised the isolated test; it did not add the exception to the main app or decoder.
 
 ## Why this is requested
 
@@ -46,7 +50,7 @@ Existing local evidence from 2026-09-05:
 - `/Users/david/Library/Logs/DiagnosticReports/InferenceService-2026-09-05-205925.ips`: the exact code-signing crash and LLVM stack above.
 - `/private/tmp/muesli-xpc-workspace-tests.log`: 22 tests pass, including source preservation and cleanup on decoder failure.
 
-If authorized, first apply only the stated key to the isolated proof service, re-sign it, verify the exact entitlements and hardened-runtime flags, repeat native network denial and rejected-peer checks, and run the actual speech transcription plus Senko diarization. Verify unchanged source hashes, container-only derived audio, cancellation under blocked output, actual owner exit, and child decoder inheritance. Do not integrate the service into the main app or call inference qualified until these tests succeed and another Astra reviewer approves the implementation.
+The authorised experiment completed the original requested entitlement, inference, native-network, peer, cancellation and child-inheritance checks, followed by an independent Astra review. Preserve the remaining private-source and current-application integration gates above. A bounded isolated pass is not a claim that installed private-folder inference is qualified. The user has deferred distribution credentials/notarisation and requested a local build and installation for subsequent manual testing once the preceding work is ready.
 
 Primary sources:
 

@@ -1,0 +1,42 @@
+--- a/MuesliApp/MuesliAppTests/StreamingAudioConverterTests.swift
++++ b/MuesliApp/MuesliAppTests/StreamingAudioConverterTests.swift
+@@ -2,6 +2,39 @@
+ import XCTest
+ 
+ final class StreamingAudioConverterTests: XCTestCase {
++    func testContinuousNativeClockDriftDoesNotBecomeRecordedSourceLoss() async throws {
++        for ppm in [-100.0, 100.0] {
++            let store = ConverterPacketStore()
++            let processor = MicCaptureProcessor(generation: 1) { store.append($0) }
++            let callbackFrames = 4800
++            for index in 0..<600 {
++                let buffer = makeBuffer(rate: 48_000, channels: 1,
++                    start: index * callbackFrames, count: callbackFrames) { sample, _ in
++                    Float(0.2 * sin(Double(sample) * 2 * .pi * 700 / 48_000))
++                }
++                let nativeHostTime = Int64((Double(index) * 100_000 * (1 + ppm / 1_000_000)).rounded())
++                processor.receive(buffer, captureTimeUs: nativeHostTime)
++            }
++            processor.finish()
++            let packets = store.snapshot()
++            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++            defer { try? FileManager.default.removeItem(at: directory) }
++            let recorder = try LocalAudioRecorder(directory: directory, maxPendingBytes: 8 * 1024 * 1024)
++            for packet in packets {
++                XCTAssertTrue(recorder.record(source: .mic, ptsUs: packet.captureTimeUs, payload: packet.data))
++            }
++            let completion = await recorder.finish(timeoutSeconds: 10)
++            let manifest = try XCTUnwrap(completion)
++            let gap = manifest.streams["mic"]?.gap_frames ?? -1
++            let overlap = manifest.streams["mic"]?.overlap_frames ?? -1
++            print("clock_drift_ppm=\(ppm) epochs=\(processor.snapshot().formatEpoch) loss_count=\(manifest.losses.count) gap=\(gap) overlap=\(overlap)")
++            XCTAssertEqual(processor.snapshot().formatEpoch, 1, "Continuous native buffers must retain SRC history through smooth clock drift")
++            XCTAssertTrue(manifest.losses.isEmpty, "No source callback was missing or overlapped")
++            XCTAssertTrue(manifest.completed, "Clock drift must not manufacture an incomplete source")
++        }
++    }
++
+     nonisolated private func makeBuffer(rate: Double, channels: Int, start: Int, count: Int,
+                                         sample: (Int, Int) -> Float) -> AVAudioPCMBuffer {
+         let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels))!

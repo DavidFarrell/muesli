@@ -1,0 +1,142 @@
+{
+  "type": "result",
+  "turns": [
+    {
+      "speaker_id": "mic:one",
+      "stream": "mic",
+      "t0": 0.0,
+      "t1": 1.0,
+      "text": "fixture",
+      "source_session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794"
+    },
+    {
+      "speaker_id": "system:one",
+      "stream": "system",
+      "t0": 0.0,
+      "t1": 1.0,
+      "text": "fixture",
+      "source_session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794"
+    }
+  ],
+  "speakers": [
+    "mic:one",
+    "system:one"
+  ],
+  "duration": 1.0,
+  "sources": [
+    {
+      "source_session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+      "audio_folder": "audio",
+      "timeline_offset_seconds": 0.0,
+      "duration_seconds": 1.0,
+      "storage_kind": "committed_pcm"
+    }
+  ],
+  "runtime_identity": {
+    "fixture_only": true,
+    "qualification": "synthetic models; no runtime claim"
+  },
+  "processing": {
+    "requested_streams": [
+      "system",
+      "mic"
+    ],
+    "recovery_requested": true,
+    "schema_version": 1,
+    "complete": true,
+    "entries": [
+      {
+        "source_session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+        "audio_folder": "audio",
+        "stream": "system",
+        "status": "processed",
+        "availability": "present",
+        "source_input": {
+          "relative_path": "audio/system.pcm",
+          "byte_count": 32000,
+          "sha256": "73a5a47262ba077c459b08e1aef633b44d45d2b7e184918f9cdc6fe540b104e1",
+          "storage_kind": "committed_pcm",
+          "manifest_sha256": "1b3e6e1de092305610435e583e23fb0c0083242e46434bafe06d5f7bede16d0a",
+          "manifest_revision": 2,
+          "committed_bytes": 32000,
+          "session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+          "timeline_offset_us": 0,
+          "completed": true,
+          "sample_rate": 16000,
+          "channels": 1,
+          "frame_count": 16000,
+          "encoding": "PCM_16"
+        },
+        "model_input": {
+          "format": "wav_pcm_s16le",
+          "sample_rate": 16000,
+          "channels": 1,
+          "frame_count": 16000,
+          "byte_count": 32044,
+          "sha256": "e9cb13e48621929dace9db11cf1a02c750e846bf739c70d5ab0b74925eaf3ec0"
+        },
+        "asr_word_count": 1,
+        "diarization_segment_count": 1,
+        "turn_count": 1,
+        "failure_code": null,
+        "recovery": {
+          "outcome": "not_needed",
+          "planned_window_count": 0,
+          "attempted_window_count": 0,
+          "failed_window_count": 0,
+          "empty_window_count": 0,
+          "recovered_window_count": 0,
+          "recovered_word_count": 0,
+          "failure_code": null,
+          "windows": []
+        }
+      },
+      {
+        "source_session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+        "audio_folder": "audio",
+        "stream": "mic",
+        "status": "processed",
+        "availability": "present",
+        "source_input": {
+          "relative_path": "audio/mic.pcm",
+          "byte_count": 32000,
+          "sha256": "af57289e572ce0454cbe70f6ea5f084509d10830bb468452bf522290e87ce815",
+          "storage_kind": "committed_pcm",
+          "manifest_sha256": "1b3e6e1de092305610435e583e23fb0c0083242e46434bafe06d5f7bede16d0a",
+          "manifest_revision": 2,
+          "committed_bytes": 32000,
+          "session_id": "9B739D5D-5CDF-4058-8334-6680BD4E9794",
+          "timeline_offset_us": 0,
+          "completed": true,
+          "sample_rate": 16000,
+          "channels": 1,
+          "frame_count": 16000,
+          "encoding": "PCM_16"
+        },
+        "model_input": {
+          "format": "wav_pcm_s16le",
+          "sample_rate": 16000,
+          "channels": 1,
+          "frame_count": 16000,
+          "byte_count": 32044,
+          "sha256": "c609857a643af2f0b7e2e5f48c82535025de760fff03ae023fc29ac6f55259cc"
+        },
+        "asr_word_count": 1,
+        "diarization_segment_count": 1,
+        "turn_count": 1,
+        "failure_code": null,
+        "recovery": {
+          "outcome": "not_needed",
+          "planned_window_count": 0,
+          "attempted_window_count": 0,
+          "failed_window_count": 0,
+          "empty_window_count": 0,
+          "recovered_window_count": 0,
+          "recovered_word_count": 0,
+          "failure_code": null,
+          "windows": []
+        }
+      }
+    ]
+  }
+}

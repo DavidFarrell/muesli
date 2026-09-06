@@ -33,6 +33,12 @@ struct RootView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.12))
             }
+            if let notice = model.transcriptExportNotice {
+                Label(notice, systemImage: "square.and.arrow.up")
+                    .font(.callout).padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.10))
+            }
             content
         }
             .padding(.top, 28)
@@ -358,6 +364,34 @@ struct NewMeetingView: View {
                 .padding(8)
             }
 
+            GroupBox("Merge integration") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let state = model.archiveListenerState {
+                        switch state.phase {
+                        case .listening:
+                            Text("Ready for local Merge requests.")
+                        case .starting:
+                            Text("Starting local Merge access…")
+                        case .stopping:
+                            Text("Closing local Merge access…")
+                        case .failed:
+                            Text("Local Merge access is unavailable.")
+                                .foregroundStyle(.red)
+                            Button("Retry Merge access") { model.startArchiveIntegration() }
+                                .buttonStyle(.bordered)
+                        case .stopped:
+                            Text("Local Merge access is closed.")
+                        }
+                    } else {
+                        Text("Starting local Merge access…")
+                    }
+                    Text("Source recordings remain protected until processing and saved outputs pass validation.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+            }
+
             GroupBox("Transcription sources") {
                 VStack(alignment: .leading, spacing: 8) {
                     Toggle("System audio", isOn: $model.transcribeSystem)
@@ -666,22 +700,6 @@ struct Permissions {
 }
 
 // MARK: - ScreenCaptureKit Helpers
-
-enum ScreenCaptureKitHelpers {
-    static func fetchShareableContent(excludingDesktopWindows: Bool, onScreenWindowsOnly: Bool) async throws -> SCShareableContent {
-        try await withCheckedThrowingContinuation { cont in
-            SCShareableContent.getExcludingDesktopWindows(excludingDesktopWindows, onScreenWindowsOnly: onScreenWindowsOnly) { content, error in
-                if let error {
-                    cont.resume(throwing: error)
-                } else if let content {
-                    cont.resume(returning: content)
-                } else {
-                    cont.resume(throwing: NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "No shareable content returned"]))
-                }
-            }
-        }
-    }
-}
 
 // MARK: - Audio Devices
 

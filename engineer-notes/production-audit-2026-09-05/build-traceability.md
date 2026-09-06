@@ -13,3 +13,13 @@ New meetings store the originating build identity; each new source session store
 The stopped-session transaction extracts the matching identity only from the journal reader's acknowledged byte range; losing the UI event cannot lose persisted provenance. If the process never reaches the session handshake, the session's observed identity remains unknown. Batch results carry `runtime_identity` separately and save it as `last_reprocess_identity`, preserving capture build/runtime provenance. Unknown fields in a runtime event are not copied into diagnostics. Default Copy Debug exports only the current build, a validated observed-runtime record, numeric counters and sandbox state; it excludes paths, device names, meeting titles/text, source UUIDs, error strings and raw logs.
 
 Validation covers generated JSON/Swift equivalence, deterministic clean identities, dirty and ignored compiler input, missing archive inputs, non-Git exports, compiler overrides without path disclosure, actual selected model bytes, legacy metadata, per-source Resume identity, durable journal tail boundaries and separate batch identity. Full Swift/Python suites and ad-hoc Release are run before review; these do not claim signed or packaged release qualification.
+
+
+The effective `ENABLE_CODE_COVERAGE` setting is included in the hashed compiler
+flags. Identical clean source built with coverage YES, coverage NO or an absent
+setting now has distinct build IDs; repeating the same setting stays stable.
+The generator does not change coverage behavior. The separate Release project
+setting and verification command disable instrumentation, while the verifier's
+scoped profiling fallback keeps diagnostic output outside the source checkout.
+No profiling path or additional environment value is exported in build identity.
+The build-identity suite includes a clean identified Release YES/NO regression.

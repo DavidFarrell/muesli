@@ -13,7 +13,7 @@ actor MicEngine: MicCapturing {
     private var engine: AVAudioEngine?
     private var isRunning = false
     private var processor: MicCaptureProcessor?
-    private var onConfigurationChange: (() -> Void)?
+    private var onConfigurationChange: (@Sendable () -> Void)?
     private var configChangeObserver: NSObjectProtocol?
     private var retiredEngines: [UUID: AVAudioEngine] = [:]
     private let engineRetainDurationNs: UInt64 = 2_000_000_000
@@ -137,7 +137,8 @@ actor MicEngine: MicCapturing {
                 guard let processor else { throw AudioConverterHelper.ConversionError.invalidFormat }
                 inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { buffer, time in
                     processor.receive(buffer, captureTimeUs: time.isHostTimeValid
-                        ? CaptureTimeline.microseconds(hostTime: time.hostTime) : nil)
+                        ? CaptureTimeline.microseconds(hostTime: time.hostTime) : nil,
+                        nativeSampleTime: time.isSampleTimeValid && time.sampleRate == buffer.format.sampleRate ? time.sampleTime : nil)
                 }
 
                 // Fire when the OS moves the route under a running engine (the event we

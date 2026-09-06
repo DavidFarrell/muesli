@@ -9,11 +9,13 @@ nonisolated protocol FrameSending: AnyObject, Sendable {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
     func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String)
     func reportFailure(stream: StreamID, message: String)
+    func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection)
 }
 
 extension FrameSending {
     nonisolated func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {}
     nonisolated func reportFailure(stream: StreamID, message: String) {}
+    nonisolated func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection) {}
 }
 
 /// Abstraction over a monotonic time source, used for the forwarder's
@@ -250,6 +252,8 @@ actor MicAudioForwarder {
         let level: Float
         let frameSampleCount: Int
         let totalFrameCount: Int
+        /// Receipt on the independent forwarding actor, before any UI queue delay.
+        let receivedAt: Date
         /// Seconds since the MEETING epoch (`beginMeeting`), not since this
         /// generation started - restores the pre-2026-07-06 meaning of the
         /// old `debugMicPTS` display value. See `MicAudioForwarder`'s and
@@ -267,7 +271,7 @@ actor MicAudioForwarder {
 
         func mergingRecoveryFlags(from previous: DeliveryResult?) -> DeliveryResult {
             DeliveryResult(level: level, frameSampleCount: frameSampleCount, totalFrameCount: totalFrameCount,
-                           elapsedSeconds: elapsedSeconds,
+                           receivedAt: receivedAt, elapsedSeconds: elapsedSeconds,
                            isFirstFrame: isFirstFrame || previous?.isFirstFrame == true,
                            isResumptionAfterGap: isResumptionAfterGap || previous?.isResumptionAfterGap == true)
         }
@@ -288,6 +292,9 @@ actor MicAudioForwarder {
     /// forever (see that type's doc comment).
     func deliver(_ packet: CapturedMicAudio) -> DeliveryResult? {
         guard packet.generation == generation, let meetingEpochUs else { return nil }
+        if let correction = packet.clockCorrection, correction.generation == generation {
+            writer?.reportClockCorrection(stream: stream, correction: correction)
+        }
         let data = packet.data
         let now = Date()
         if startedAt == nil { startedAt = now }
@@ -338,6 +345,7 @@ actor MicAudioForwarder {
             level: level,
             frameSampleCount: data.count / 2,
             totalFrameCount: frameCount,
+            receivedAt: now,
             elapsedSeconds: Double(ptsUs) / 1_000_000.0,
             isFirstFrame: isFirstFrame,
             isResumptionAfterGap: mustSurface && !isFirstFrame

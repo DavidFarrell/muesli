@@ -5,6 +5,8 @@ import Foundation
 /// Process control/callback state is protected by `processLock`; output is
 /// owned by BackendOutputReader's separate queue. No event journal operation
 /// or stdout delivery depends on the UI actor.
+nonisolated enum BackendLaunchCheckpoint: Sendable { case beforeRun, afterRun }
+
 nonisolated final class BackendProcess: @unchecked Sendable {
     private let process = Process()
     private let stdinPipe = Pipe()
@@ -12,6 +14,9 @@ nonisolated final class BackendProcess: @unchecked Sendable {
     private let stderrPipe = Pipe()
     private let output: BackendOutputReader
     private let processLock = NSLock()
+    private let processQueue = DispatchQueue(label: "muesli.backend-native", qos: .utility)
+    private let launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)?
+    private var attemptedStart = false
     private let exitCompletion = TaskCompletion()
     private let callbackQueue = DispatchQueue(label: "muesli.backend-exit", qos: .utility)
     private var started = false
@@ -38,10 +43,12 @@ nonisolated final class BackendProcess: @unchecked Sendable {
 
     init(command: [String], workingDirectory: URL? = nil, environment: [String: String]? = nil,
          eventJournalURL: URL? = nil, maximumStdoutLineBytes: Int = 4 * 1024 * 1024,
-         beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil) throws {
+         beforeEventJournalIO: (@Sendable (BackendJournalCheckpoint) throws -> Void)? = nil,
+         launchCheckpoint: (@Sendable (BackendLaunchCheckpoint) throws -> Void)? = nil) throws {
         guard !command.isEmpty else {
             throw NSError(domain: "Muesli", code: -1, userInfo: [NSLocalizedDescriptionKey: "Empty command"])
         }
+        self.launchCheckpoint = launchCheckpoint
         process.executableURL = URL(fileURLWithPath: command[0])
         process.arguments = Array(command.dropFirst())
         process.standardInput = stdinPipe
@@ -60,14 +67,58 @@ nonisolated final class BackendProcess: @unchecked Sendable {
         stdoutLines = output.lines
     }
 
-    func start() throws {
-        try output.prepare()
+    /// Pass only the fixed source identity contract to package initialization.
+    /// Child descriptors are acquired independently; no parent fd inheritance
+    /// or app lifetime assumption can authorize recreating a moved source.
+    func installMeetingLease(access: MeetingFileAccess, backendLease: FileHandle) throws {
+        try access.validate()
+        var value = stat(), current = stat()
+        let path = access.folderURL.appendingPathComponent(".backend-owner.lock").path
+        guard fstat(backendLease.fileDescriptor, &value) == 0, lstat(path, &current) == 0,
+              value.st_mode & S_IFMT == S_IFREG, value.st_nlink == 1, value.st_uid == geteuid(),
+              value.st_dev == current.st_dev, value.st_ino == current.st_ino else {
+            throw BackendAdmissionOwner.Failure(message: "The backend ownership file changed before child launch.")
+        }
+        let identity = access.identity
+        let token: [String: Any] = [
+            "version": 1,
+            "folder": access.folderURL.path,
+            "directory": ["device": identity.directoryDevice, "inode": identity.directoryInode],
+            "locks": [
+                ".meeting-access.lock": ["device": identity.lockDevice, "inode": identity.lockInode],
+                ".backend-owner.lock": ["device": UInt64(value.st_dev), "inode": value.st_ino]
+            ]
+        ]
+        let encoded = String(decoding: try JSONSerialization.data(withJSONObject: token, options: [.sortedKeys]), as: UTF8.self)
+        try processQueue.sync {
+            guard !processLock.withLock({ attemptedStart }) else {
+                throw BackendAdmissionOwner.Failure(message: "Cannot change meeting identity after child launch begins.")
+            }
+            var environment = process.environment ?? ProcessInfo.processInfo.environment
+            environment["MUESLI_MEETING_LEASE"] = encoded
+            process.environment = environment
+        }
+    }
+
+    /// Called by BackendAdmissionOwner's worker. The cheap state lock is never
+    /// held across native launch, journal work, or process-control calls.
+    typealias LaunchScope = @Sendable (@escaping @Sendable () throws -> Void) throws -> Void
+
+    func start(checkAdmission: @escaping @Sendable () throws -> Void = {},
+               withNativeLaunch: LaunchScope = { try $0() }) throws {
+        try processLock.withLock {
+            guard !attemptedStart else {
+                throw NSError(domain: "Muesli", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Backend process cannot be restarted"])
+            }
+            attemptedStart = true
+        }
         do {
-            try processLock.withLock {
-                guard !started else {
-                    throw NSError(domain: "Muesli", code: -1,
-                                  userInfo: [NSLocalizedDescriptionKey: "Backend process cannot be restarted"])
-                }
+            try checkAdmission()
+            try output.prepare()
+            try checkAdmission()
+            try processQueue.sync {
+                try checkAdmission()
                 process.terminationHandler = { [weak self] process in
                     guard let self else { return }
                     let status = process.terminationStatus
@@ -79,8 +130,15 @@ nonisolated final class BackendProcess: @unchecked Sendable {
                     // Exit is NOT stdout EOF: output may still be in the pipe.
                     self.callbackQueue.async { callback?(status) }
                 }
-                try process.run()
-                started = true
+                try launchCheckpoint?(.beforeRun)
+                // An archive-specific source transaction may own this actual
+                // invocation. The process queue stays serialized until return.
+                try withNativeLaunch { [self] in
+                    try checkAdmission()
+                    try process.run()
+                    processLock.withLock { started = true }
+                    try launchCheckpoint?(.afterRun)
+                }
             }
         } catch {
             output.cleanup()
@@ -99,14 +157,17 @@ nonisolated final class BackendProcess: @unchecked Sendable {
         return processLock.withLock { exitStatus }
     }
 
+    /// Control requests are queued even during Process.run. In particular a
+    /// UI cancellation handler never waits behind the native launch operation.
     func terminate() {
-        processLock.withLock { if process.isRunning { process.terminate() } }
+        processQueue.async { [self] in if process.isRunning { process.terminate() } }
     }
 
-    var isRunning: Bool { processLock.withLock { process.isRunning } }
+    var hasStarted: Bool { processLock.withLock { started } }
+    var isRunning: Bool { processLock.withLock { started && exitStatus == nil } }
 
     func forceKill() {
-        processLock.withLock {
+        processQueue.async { [self] in
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }
@@ -166,6 +227,8 @@ nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
     /// actually executed on `writeQueue` - the observable fact the
     /// `closeStdinAndWait` teardown barrier waits for.
     private var stdinCloseHasRun = false
+    private var stdinCloseEnqueueCount = 0
+    private let stdinCloseCompletion = TaskCompletion()
     /// Diagnostics beyond the tracker's backlog accounting: queued writes
     /// that threw (EPIPE after the child died, or writes landing after the
     /// handle closed) and sends rejected because `forceCloseStdin` already
@@ -260,17 +323,27 @@ nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
         enqueueStdinClose()
     }
 
-    /// The single place the stdin handle is ever closed - always on
-    /// `writeQueue`, preserving single-queue handle ownership (round-2 gate
-    /// blocker: BackendProcess.cleanup used to close the same handle
-    /// cross-thread while this queue could be mid-write). Idempotent: a
-    /// second queued close lands on an already-closed handle and `try?`
-    /// swallows it.
+    /// One queue-owned close shared by all deadline waits. Keep admission
+    /// closed and avoid accumulating closure jobs behind a blocked pipe write.
     private func enqueueStdinClose() {
+        let enqueue = stateLock.withLock {
+            isForceClosed = true
+            guard stdinCloseEnqueueCount == 0 else { return false }
+            stdinCloseEnqueueCount = 1
+            return true
+        }
+        guard enqueue else { return }
         writeQueue.async {
             try? self.handle.close()
             self.stateLock.withLock { self.stdinCloseHasRun = true }
+            self.stdinCloseCompletion.markCompleted()
         }
+    }
+
+    /// Actual queued operation count and completion, including while the queue
+    /// is blocked. This also lets teardown diagnostics distinguish a pending close.
+    var stdinCloseSnapshot: (enqueued: Int, closed: Bool) {
+        stateLock.withLock { (stdinCloseEnqueueCount, stdinCloseHasRun) }
     }
 
     /// Teardown barrier: reject further sends, enqueue the close, and wait
@@ -283,19 +356,10 @@ nonisolated final class FramedWriter: FrameSending, @unchecked Sendable {
     /// on `false` (or task cancellation) the caller must simply proceed
     /// WITHOUT touching stdin itself - the queued close still runs whenever
     /// the queue unblocks, and the pipe's deinit is the final backstop.
-    func closeStdinAndWait(timeoutSeconds: Double) async -> Bool {
-        stateLock.withLock { isForceClosed = true }
+    @concurrent func closeStdinAndWait(timeoutSeconds: Double) async -> Bool {
         enqueueStdinClose()
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if stateLock.withLock({ self.stdinCloseHasRun }) { return true }
-            do {
-                try await Task.sleep(nanoseconds: 50_000_000)
-            } catch {
-                break // cancelled: report the current state promptly
-            }
-        }
-        return stateLock.withLock { self.stdinCloseHasRun }
+        _ = await stdinCloseCompletion.wait(timeoutSeconds: timeoutSeconds)
+        return stateLock.withLock { stdinCloseHasRun }
     }
 
     /// Stop-path hardening for a wedged reader (2026-07-16 RCA rec #6).
