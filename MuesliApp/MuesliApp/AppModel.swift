@@ -862,10 +862,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startNativeMicrophone(_ engine: any MicCapturing, ingress: MicAudioIngress,
+    private func nativeMicrophoneStartRequest(_ engine: any MicCapturing, ingress: MicAudioIngress,
                                       generation: Int, voiceProcessing: Bool, resolvedID: UInt32,
                                       pinned: Bool, preview: Bool, meetingAccess: MeetingFileAccess? = nil,
-                                      adoption: (@MainActor @Sendable (CaptureOperationOwner.Claim) -> Void)? = nil) async throws {
+                                      adoption: (@MainActor @Sendable (CaptureOperationOwner.Claim) -> Void)? = nil) -> CaptureOperationOwner.Request {
         let access = meetingAccess ?? (preview ? nil : currentMeetingAccess)
         let problem = ingress.problemCallback()
         let invalidation = CaptureInvalidationMailbox(onInvalidated: {
@@ -874,7 +874,7 @@ final class AppModel: ObservableObject {
             self?.invalidateMicrophone(generation: generation, preview: preview)
         }
         let changed = invalidation.callback()
-        try await micOperationOwner.perform(preservesRecording: !preview, onFailure: { error in
+        return CaptureOperationOwner.Request(onFailure: { error in
             problem(.unknown(generation: generation, message: "Microphone start failed: \(error.localizedDescription)"))
         }, operation: {
             defer { withExtendedLifetime(access) {} }
@@ -919,13 +919,14 @@ final class AppModel: ObservableObject {
         let generation = preview ? previewMicGeneration : micEngineGeneration
         let problem = ingress?.problemCallback()
         do {
-            try await micOperationOwner.perform(preservesRecording: !preview, onFailure: { error in
+            let stopRequest = CaptureOperationOwner.Request(onFailure: { error in
                 problem?(.unknown(generation: generation, message: "Microphone stop failed: \(error.localizedDescription)"))
-            }) {
+            }, operation: {
                 defer { withExtendedLifetime(access) {} }
                 await engine.stop()
                 await ingress?.finish()
-            }
+            })
+            try await micOperationOwner.perform(stopRequest, preservesRecording: !preview)
             return true
         } catch {
             if let failure = error as? CaptureOperationOwner.Failure, case .busy = failure { return false }
@@ -1209,9 +1210,10 @@ final class AppModel: ObservableObject {
                                                onProblem: await forwarder.captureFailureHandler())
         previewMicAudioIngress = ingress
         do {
-            try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
+            let request = nativeMicrophoneStartRequest(engine, ingress: ingress, generation: generation,
                                             voiceProcessing: previewVoiceProcessingRequested,
                                             resolvedID: resolvedID, pinned: pinned, preview: true)
+            try await micOperationOwner.perform(request)
         } catch {
             await previewMicAudioIngress?.finish()
             lastRetiredPreviewMicIngress = previewMicAudioIngress?.snapshot() ?? lastRetiredPreviewMicIngress
@@ -1461,13 +1463,14 @@ final class AppModel: ObservableObject {
         micAudioIngress = ingress
 
         micHealth.begin(generation: generation)
-        try await startNativeMicrophone(engine, ingress: ingress, generation: generation,
+        let request = nativeMicrophoneStartRequest(engine, ingress: ingress, generation: generation,
                                         voiceProcessing: enableVPIO, resolvedID: resolvedID, pinned: pinned, preview: false,
                                         meetingAccess: context.access, adoption: { [self] claim in
             guard isCurrentMicStart(context), generation == micEngineGeneration, claim.claim() else { return }
             micEngine = engine
             micEngineStartedAt = Date()
         })
+        try await micOperationOwner.perform(request, preservesRecording: true)
         guard isCurrentMicStart(context), generation == micEngineGeneration else { return }
         // Only open the pipe once the backend has acknowledged
         // MSG_MEETING_START (2026-07-16 RCA §9 startup-ordering defect: mic

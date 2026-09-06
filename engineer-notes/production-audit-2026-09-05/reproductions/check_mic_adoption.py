@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 APP = 'MuesliApp/MuesliApp/'
 parser = argparse.ArgumentParser()
 parser.add_argument('--source-ref')
+parser.add_argument('--optimized', action='store_true')
 args = parser.parse_args()
 
 def source(name):
@@ -58,6 +59,10 @@ else:
         entered.markCompleted(); _ = await nativeReturn.wait(timeoutSeconds: 10)
     }, cleanupIfAbandoned: { cleaned.markCompleted() })
     await model.adopt(generation: 1, engine: engine, ingress: 0, context: context)'''
+if 'final class Request:' in source('CaptureOperationOwner.swift'):
+    launch = launch.replace('try? await owner.perform(operation:',
+                            'let request = CaptureOperationOwner.Request(operation:')
+    launch += '\n    try? await owner.perform(request)'
 current_source = block(model, 'private func isCurrentSource(')
 program = r'''
 import Foundation
@@ -124,6 +129,6 @@ with tempfile.TemporaryDirectory(prefix='muesli-mic-adoption-', dir='/private/tm
         path = work / name; path.write_text(source(name)); files.append(str(path))
     main = work / 'main.swift'; main.write_text(program)
     subprocess.run(['xcrun', 'swiftc', '-parse-as-library', '-swift-version', '6', '-default-isolation', 'MainActor',
-        '-module-cache-path', str(work / 'modules'), *files, str(main), '-o', str(work / 'run')], check=True)
+        '-module-cache-path', str(work / 'modules'), *(['-O'] if args.optimized else []), *files, str(main), '-o', str(work / 'run')], check=True)
     result = subprocess.run([str(work / 'run')], timeout=20)
     raise SystemExit(result.returncode)

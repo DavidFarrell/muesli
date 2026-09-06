@@ -242,16 +242,18 @@ final class CaptureEngine: NSObject {
                 try stream.addRecordingOutput(output)
                 recordingOutput = output
             }
-            try await operationOwner.perform(preservesRecording: native.preservesRecording, onFailure: { error in
+            let startRequest = CaptureOperationOwner.Request(onFailure: { error in
                 reportProblem(.unknown(generation: currentGeneration, message: "System audio start failed: \(error.localizedDescription)"))
             }, operation: { try await native.start() }, cleanupIfAbandoned: { try? await native.stop() })
+            try await operationOwner.perform(startRequest, preservesRecording: native.preservesRecording)
             guard desiredIntent.matches(intent) else { throw CaptureOperationOwner.Failure.cancelled }
         } catch {
             if !desiredIntent.matches(intent) {
                 // A public Stop superseded this start. The same native owner
                 // must finish cleanup; an old continuation cannot restore intent.
                 if !native.isRetired, !operationOwner.isBusy {
-                    try? await operationOwner.perform(preservesRecording: native.preservesRecording) { try await native.stop() }
+                    let retirementRequest = CaptureOperationOwner.Request(operation: { try await native.stop() })
+                    try? await operationOwner.perform(retirementRequest, preservesRecording: native.preservesRecording)
                 }
                 if nativeSource === native {
                     if native.isRetired { clearRetiredSource(); if request == nil { health.reset() } }
@@ -267,7 +269,10 @@ final class CaptureEngine: NSObject {
                 retirementPending = true
                 health.fail(error.localizedDescription, quarantined: true)
             } else {
-                do { try await operationOwner.perform(preservesRecording: native.preservesRecording) { try await native.stop() } }
+                do {
+                    let cleanupRequest = CaptureOperationOwner.Request(operation: { try await native.stop() })
+                    try await operationOwner.perform(cleanupRequest, preservesRecording: native.preservesRecording)
+                }
                 catch { retirementPending = true }
                 if !retirementPending { clearRetiredSource() }
                 health.fail(error.localizedDescription, quarantined: retirementPending)
@@ -296,9 +301,10 @@ final class CaptureEngine: NSObject {
             return false
         }
         do {
-            try await operationOwner.perform(preservesRecording: native.preservesRecording, onFailure: { error in
+            let stopRequest = CaptureOperationOwner.Request(onFailure: { error in
                 writer?.reportFailure(stream: .system, message: "System audio stop failed: \(error.localizedDescription)")
-            }) { try await native.stop() }
+            }, operation: { try await native.stop() })
+            try await operationOwner.perform(stopRequest, preservesRecording: native.preservesRecording)
             clearRetiredSource()
             if !preserveRequest { request = nil }
             if request == nil { health.reset() }

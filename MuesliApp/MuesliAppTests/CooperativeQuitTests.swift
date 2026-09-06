@@ -152,8 +152,8 @@ final class CooperativeQuitTests: XCTestCase {
         let registry = ShutdownWorkRegistry(), gate = Gate(), cleanup = Gate()
         let owner = CaptureOperationOwner(shutdown: registry)
         let pending = Task {
-            try await owner.perform(timeoutSeconds: 0.02, preservesRecording: true,
-                                    operation: { gate.block() }, cleanupIfAbandoned: { cleanup.block() })
+            let request = CaptureOperationOwner.Request(operation: { gate.block() }, cleanupIfAbandoned: { cleanup.block() })
+            try await owner.perform(request, timeoutSeconds: 0.02, preservesRecording: true)
         }
         let observed7641 = await gate.entered.wait(timeoutSeconds: 2)
         XCTAssertEqual(observed7641, .completed)

@@ -187,13 +187,14 @@ final class MeetingFileAccessTests: XCTestCase {
         let root = try folder(), native = Gate(), cleanup = Gate(), owner = CaptureOperationOwner()
         let attempt = Task {
             let access = try MeetingFileAccess.acquire(in: root)
-            try await owner.perform(timeoutSeconds: 0.05, operation: {
+            let request = CaptureOperationOwner.Request(operation: {
                 defer { withExtendedLifetime(access) {} }
                 native.block()
             }, cleanupIfAbandoned: {
                 defer { withExtendedLifetime(access) {} }
                 cleanup.block()
             })
+            try await owner.perform(request, timeoutSeconds: 0.05)
         }
         let entered = await native.entered.wait(timeoutSeconds: 2)
         XCTAssertEqual(entered, .completed)

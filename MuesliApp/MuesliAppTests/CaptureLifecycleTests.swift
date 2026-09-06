@@ -58,7 +58,8 @@ final class CaptureLifecycleTests: XCTestCase {
         for attempt in 1...3 {
             health.begin(generation: attempt, now: now)
             do {
-                try await owner.perform { throw TestCaptureFailure.injected }
+                let request = CaptureOperationOwner.Request(operation: { throw TestCaptureFailure.injected })
+                try await owner.perform(request)
                 XCTFail("Expected injected native failure")
             } catch { health.fail(error.localizedDescription, now: now) }
             XCTAssertFalse(owner.isBusy)
@@ -127,19 +128,23 @@ final class CaptureLifecycleTests: XCTestCase {
         let cleanupReturn = TaskCompletion()
         let start = ContinuousClock.now
         do {
-            try await owner.perform(timeoutSeconds: 0.02, operation: {
+            let request = CaptureOperationOwner.Request(operation: {
                 _ = await nativeReturn.wait(timeoutSeconds: 10)
             }, cleanupIfAbandoned: {
                 cleanupStarted.markCompleted()
                 _ = await cleanupReturn.wait(timeoutSeconds: 10)
             })
+            try await owner.perform(request, timeoutSeconds: 0.02)
             XCTFail("Expected deadline")
         } catch {
             guard case CaptureOperationOwner.Failure.timedOut = error else { return XCTFail("Unexpected \(error)") }
         }
         XCTAssertLessThan(start.duration(to: .now), .seconds(1))
         XCTAssertTrue(owner.isBusy)
-        do { try await owner.perform { XCTFail("A competing owner must never start") }; XCTFail("Expected busy") }
+        do {
+            let request = CaptureOperationOwner.Request(operation: { XCTFail("A competing owner must never start") })
+            try await owner.perform(request); XCTFail("Expected busy")
+        }
         catch { guard case CaptureOperationOwner.Failure.busy = error else { return XCTFail("Unexpected \(error)") } }
         nativeReturn.markCompleted()
         let cleanup = await cleanupStarted.wait(timeoutSeconds: 1)
@@ -149,17 +154,26 @@ final class CaptureLifecycleTests: XCTestCase {
         let deadline = ContinuousClock.now.advanced(by: .seconds(1))
         while owner.isBusy, ContinuousClock.now < deadline { await Task.yield() }
         XCTAssertFalse(owner.isBusy)
-        do { try await owner.perform {} } catch { XCTFail("Confirmed retirement permits a new owner: \(error)") }
+        do {
+            let request = CaptureOperationOwner.Request(operation: {})
+            try await owner.perform(request)
+        } catch { XCTFail("Confirmed retirement permits a new owner: \(error)") }
     }
 
     func testTimedOutMicrophoneDoesNotBlockIndependentSystemOwner() async {
         let microphone = CaptureOperationOwner()
         let system = CaptureOperationOwner()
         let returnFromMic = TaskCompletion()
-        do { try await microphone.perform(timeoutSeconds: 0.01) { _ = await returnFromMic.wait(timeoutSeconds: 10) } }
+        do {
+            let request = CaptureOperationOwner.Request(operation: { _ = await returnFromMic.wait(timeoutSeconds: 10) })
+            try await microphone.perform(request, timeoutSeconds: 0.01)
+        }
         catch { }
         XCTAssertTrue(microphone.isBusy)
-        do { try await system.perform {} } catch { XCTFail("System source must remain independent") }
+        do {
+            let request = CaptureOperationOwner.Request(operation: {})
+            try await system.perform(request)
+        } catch { XCTFail("System source must remain independent") }
         returnFromMic.markCompleted()
     }
 
@@ -201,9 +215,10 @@ final class CaptureLifecycleTests: XCTestCase {
         let nativeReturn = TaskCompletion()
         let recorded = DispatchSemaphore(value: 0)
         let operation = Task.detached {
-            try? await owner.perform(timeoutSeconds: 0.02, onFailure: { _ in recorded.signal() }) {
+            let request = CaptureOperationOwner.Request(onFailure: { _ in recorded.signal() }, operation: {
                 _ = await nativeReturn.wait(timeoutSeconds: 10)
-            }
+            })
+            try? await owner.perform(request, timeoutSeconds: 0.02)
         }
         XCTAssertEqual(recorded.wait(timeout: .now() + 2), .success)
         XCTAssertTrue(owner.isBusy)
@@ -235,10 +250,11 @@ final class CaptureLifecycleTests: XCTestCase {
         let stopReturned = TaskCompletion()
         var restarted = false
         let recovery = Task { @MainActor in
-            try? await owner.perform {
+            let request = CaptureOperationOwner.Request(operation: {
                 stopStarted.markCompleted()
                 _ = await stopReturned.wait(timeoutSeconds: 10)
-            }
+            })
+            try? await owner.perform(request)
             if intent.matches(original) { restarted = true }
         }
         let started = await stopStarted.wait(timeoutSeconds: 1)
@@ -268,16 +284,18 @@ final class CaptureLifecycleTests: XCTestCase {
         let entered = TaskCompletion()
         let release = TaskCompletion()
         let existing = Task {
-            try? await owner.perform {
+            let request = CaptureOperationOwner.Request(operation: {
                 entered.markCompleted()
                 _ = await release.wait(timeoutSeconds: 10)
-            }
+            })
+            try? await owner.perform(request)
         }
         let started = await entered.wait(timeoutSeconds: 1)
         XCTAssertEqual(started, .completed)
         let reported = TaskCompletion()
         do {
-            try await owner.perform(onFailure: { _ in reported.markCompleted() }) { XCTFail("Competing native start") }
+            let request = CaptureOperationOwner.Request(onFailure: { _ in reported.markCompleted() }, operation: { XCTFail("Competing native start") })
+            try await owner.perform(request)
             XCTFail("Expected busy")
         } catch { }
         let failure = await reported.wait(timeoutSeconds: 0.1)
@@ -312,7 +330,7 @@ final class CaptureLifecycleTests: XCTestCase {
         var source = UUID(), adopted: UUID?
         let original = source
         let start = Task {
-            try? await owner.perform(operation: {
+            let request = CaptureOperationOwner.Request(operation: {
                 entered.markCompleted()
                 _ = await nativeReturn.wait(timeoutSeconds: 10)
             }, adoption: { claim in
@@ -322,6 +340,7 @@ final class CaptureLifecycleTests: XCTestCase {
                 cleanupEntered.markCompleted()
                 _ = await cleanupReturn.wait(timeoutSeconds: 10)
             })
+            try? await owner.perform(request)
         }
         let didEnter = await entered.wait(timeoutSeconds: 1)
         XCTAssertEqual(didEnter, .completed)
@@ -333,16 +352,20 @@ final class CaptureLifecycleTests: XCTestCase {
         XCTAssertEqual(cleanup, .completed)
         XCTAssertNil(adopted)
         XCTAssertTrue(owner.isBusy)
-        do { try await owner.perform { XCTFail("A new source competed with old microphone cleanup") }; XCTFail("Expected busy") }
+        do {
+            let request = CaptureOperationOwner.Request(operation: { XCTFail("A new source competed with old microphone cleanup") })
+            try await owner.perform(request); XCTFail("Expected busy")
+        }
         catch { }
         cleanupReturn.markCompleted(); await start.value
         XCTAssertFalse(owner.isBusy)
         let replacement = source
         do {
-            try await owner.perform(operation: {}, adoption: { claim in
+            let request = CaptureOperationOwner.Request(operation: {}, adoption: { claim in
                 guard source == replacement, claim.claim() else { return }
                 adopted = replacement
             })
+            try await owner.perform(request)
         } catch { XCTFail("Fresh source could not start after actual cleanup: \(error)") }
         XCTAssertEqual(adopted, replacement)
     }
@@ -352,14 +375,16 @@ final class CaptureLifecycleTests: XCTestCase {
         let owner = CaptureOperationOwner()
         var claimed = false
         do {
-            try await owner.perform(operation: {}, adoption: { claim in
+            let startRequest = CaptureOperationOwner.Request(operation: {}, adoption: { claim in
                 XCTAssertTrue(owner.isBusy)
                 claimed = claim.claim()
                 XCTAssertTrue(claimed)
                 XCTAssertFalse(owner.isBusy, "Stop must be able to reserve the lane immediately after engine assignment")
                 XCTAssertFalse(claim.claim())
             }, cleanupIfAbandoned: { XCTFail("An adopted microphone was cleaned up by its old start") })
-            try await owner.perform { }
+            try await owner.perform(startRequest)
+            let stopRequest = CaptureOperationOwner.Request(operation: { })
+            try await owner.perform(stopRequest)
         } catch { XCTFail("Unexpected \(error)") }
         XCTAssertTrue(claimed)
     }
@@ -371,7 +396,7 @@ final class CaptureLifecycleTests: XCTestCase {
         let cleanupReturn = TaskCompletion()
         var adopted = false
         let start = Task.detached {
-            try? await owner.perform(timeoutSeconds: 0.03, operation: {
+            let request = CaptureOperationOwner.Request(operation: {
                 nativeEntered.signal()
             }, adoption: { claim in
                 if claim.claim() { adopted = true }
@@ -379,6 +404,7 @@ final class CaptureLifecycleTests: XCTestCase {
                 cleanupEntered.signal()
                 _ = await cleanupReturn.wait(timeoutSeconds: 10)
             })
+            try? await owner.perform(request, timeoutSeconds: 0.03)
         }
         XCTAssertEqual(nativeEntered.wait(timeout: .now() + 2), .success)
         XCTAssertEqual(cleanupEntered.wait(timeout: .now() + 2), .success,
@@ -400,12 +426,13 @@ final class CaptureLifecycleTests: XCTestCase {
         var quitIntent = UUID(), adopted = false
         let originalQuitIntent = quitIntent
         let start = Task {
-            try? await owner.perform(operation: {
+            let request = CaptureOperationOwner.Request(operation: {
                 entered.markCompleted(); _ = await nativeReturn.wait(timeoutSeconds: 10)
             }, adoption: { claim in
                 guard quitIntent == originalQuitIntent, claim.claim() else { return }
                 adopted = true
             }, cleanupIfAbandoned: { cleanup.markCompleted() })
+            try? await owner.perform(request)
         }
         _ = await entered.wait(timeoutSeconds: 1)
         quitIntent = UUID() // Accepted Quit retires this even if Cancel follows immediately.
@@ -421,11 +448,11 @@ final class CaptureLifecycleTests: XCTestCase {
         let registry = ShutdownWorkRegistry(), cleanupEntered = TaskCompletion(), cleanupReturn = TaskCompletion()
         let owner = CaptureOperationOwner(shutdown: registry)
         let start = Task {
-            try? await owner.perform(timeoutSeconds: 0.03, preservesRecording: true,
-                operation: {}, adoption: { _ in }, cleanupIfAbandoned: {
+            let request = CaptureOperationOwner.Request(operation: {}, adoption: { _ in }, cleanupIfAbandoned: {
                     cleanupEntered.markCompleted()
                     _ = await cleanupReturn.wait(timeoutSeconds: 10)
                 })
+            try? await owner.perform(request, timeoutSeconds: 0.03, preservesRecording: true)
         }
         _ = await cleanupEntered.wait(timeoutSeconds: 1)
         registry.beginQuit()
@@ -449,9 +476,8 @@ final class CaptureLifecycleTests: XCTestCase {
         let cleanup = DispatchSemaphore(value: 0), returned = DispatchSemaphore(value: 0), released = DispatchSemaphore(value: 0)
         let start = Task.detached {
             do {
-                try await owner.perform(timeoutSeconds: 0.03, preservesRecording: true,
-                    operation: {}, adoption: try makeOwnedMicOffer(folder: folder, released: released, registry: registry),
-                    cleanupIfAbandoned: { cleanup.signal() })
+                let request = CaptureOperationOwner.Request(operation: {}, adoption: try makeOwnedMicOffer(folder: folder, released: released, registry: registry), cleanupIfAbandoned: { cleanup.signal() })
+                try await owner.perform(request, timeoutSeconds: 0.03, preservesRecording: true)
             } catch { }
             returned.signal()
         }
@@ -464,6 +490,158 @@ final class CaptureLifecycleTests: XCTestCase {
         let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
         try exclusive.validate()
         await start.value
+    }
+
+    @MainActor
+    func testExecutingMicOfferRetainsSourceAndQuitOwnershipThroughActualCallbackReturn() async throws {
+        // Both a rejected offer and an already-claimed offer may still be
+        // executing when the caller's deadline expires. Claim transfers the
+        // native lane; neither outcome permits premature callback disposal.
+        for accepts in [false, true] {
+            let folder = URL(fileURLWithPath: "/private/tmp/muesli-running-mic-offer-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let registry = ShutdownWorkRegistry(), owner = CaptureOperationOwner(shutdown: registry)
+            let entered = TaskCompletion(), returned = TaskCompletion(), empty = TaskCompletion()
+            let callbackReturn = DispatchSemaphore(value: 0), released = DispatchSemaphore(value: 0)
+            // Install the empty observer after actual admission, from the
+            // callback, so the initial empty snapshot is not mistaken for close.
+            registry.observe { _ = registry.snapshot() }
+            let monitor = Task.detached {
+                _ = await entered.wait(timeoutSeconds: 2)
+                registry.observe {
+                    if registry.snapshot().pending.isEmpty { empty.markCompleted() }
+                }
+                _ = await returned.wait(timeoutSeconds: 2)
+                registry.beginQuit()
+                let closedWhileExecuting = await empty.wait(timeoutSeconds: 0.2)
+                XCTAssertEqual(closedWhileExecuting, .timedOut,
+                    "The callback is still executing with its actual source lease")
+                XCTAssertFalse(registry.sealIfFinished())
+                XCTAssertEqual(owner.isBusy, !accepts)
+                let next = CaptureOperationOwner.Request(operation: {
+                    XCTAssertTrue(accepts, "An unclaimed source must keep its lane")
+                })
+                do {
+                    try await owner.perform(next, preservesRecording: true)
+                    XCTAssertTrue(accepts, "Only a successful Claim permits the next native operation")
+                } catch {
+                    XCTAssertFalse(accepts)
+                    guard case CaptureOperationOwner.Failure.busy = error else {
+                        callbackReturn.signal(); return XCTFail("Unexpected \(error)")
+                    }
+                }
+                XCTAssertFalse(registry.snapshot().pending.isEmpty)
+                callbackReturn.signal()
+            }
+            let start = Task.detached {
+                do {
+                    let request = CaptureOperationOwner.Request(operation: {},
+                        adoption: try makeExecutingMicOffer(folder: folder, released: released, registry: registry,
+                            entered: entered, callbackReturn: callbackReturn, accepts: accepts))
+                    try await owner.perform(request, timeoutSeconds: 0.03, preservesRecording: true)
+                } catch { }
+                returned.markCompleted()
+            }
+            await start.value
+            await monitor.value
+            XCTAssertEqual(released.wait(timeout: .now() + 2), .success)
+            let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
+            try exclusive.validate()
+            let finished = await empty.wait(timeoutSeconds: 2)
+            XCTAssertEqual(finished, .completed)
+        }
+    }
+
+    func testAcceptedNativeFailureAndCleanupCapturesCloseBeforeWorkToken() async throws {
+        let folder = URL(fileURLWithPath: "/private/tmp/muesli-all-mic-captures-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let registry = ShutdownWorkRegistry(), owner = CaptureOperationOwner(shutdown: registry)
+        let nativeReturn = TaskCompletion(), failureEntered = TaskCompletion(), cleanupEntered = TaskCompletion()
+        let failureReturn = DispatchSemaphore(value: 0), released = DispatchSemaphore(value: 0)
+        let request = try makeAllOwnedMicCallbacks(folder: folder, registry: registry, released: released,
+            nativeReturn: nativeReturn, failureEntered: failureEntered, failureReturn: failureReturn,
+            cleanupEntered: cleanupEntered)
+        let start = Task.detached {
+            do { try await owner.perform(request, timeoutSeconds: 0.03, preservesRecording: true) }
+            catch { }
+        }
+        let failing = await failureEntered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(failing, .completed)
+        nativeReturn.markCompleted()
+        let cleanup = await cleanupEntered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(cleanup, .completed)
+        registry.beginQuit()
+        XCTAssertFalse(registry.snapshot().pending.isEmpty)
+        XCTAssertFalse(registry.sealIfFinished())
+        failureReturn.signal()
+        await start.value
+        for _ in 0..<3 { XCTAssertEqual(released.wait(timeout: .now() + 2), .success) }
+        let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
+        try exclusive.validate()
+        // Retaining the emptied Request, or its completed caller Task, does not
+        // retain the original callback captures or native source descriptors.
+        withExtendedLifetime(request) { XCTAssertFalse(owner.isBusy) }
+    }
+
+    func testBusyAndThrownRequestsDisposeEveryUninvokedCaptureBeforeTokenClose() async throws {
+        for busy in [false, true] {
+            let folder = URL(fileURLWithPath: "/private/tmp/muesli-refused-mic-captures-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let registry = ShutdownWorkRegistry(), owner = CaptureOperationOwner(shutdown: registry)
+            let entered = TaskCompletion(), nativeReturn = TaskCompletion()
+            let blocker = Task {
+                if busy {
+                    let request = CaptureOperationOwner.Request(operation: {
+                        entered.markCompleted(); _ = await nativeReturn.wait(timeoutSeconds: 5)
+                    })
+                    try? await owner.perform(request)
+                } else { entered.markCompleted() }
+            }
+            _ = await entered.wait(timeoutSeconds: 2)
+            let released = DispatchSemaphore(value: 0)
+            let request = try makeRejectedOwnedMicCallbacks(folder: folder, registry: registry, released: released)
+            do { try await owner.perform(request, preservesRecording: true); XCTFail("Expected rejection") }
+            catch { }
+            for _ in 0..<4 { XCTAssertEqual(released.wait(timeout: .now() + 2), .success) }
+            XCTAssertTrue(registry.snapshot().pending.isEmpty)
+            let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
+            try exclusive.validate()
+            nativeReturn.markCompleted(); await blocker.value
+            withExtendedLifetime(request) { XCTAssertFalse(owner.isBusy) }
+        }
+    }
+
+    func testActualCaptureDisposalStallRetainsLaneAndShutdownWork() async throws {
+        let folder = URL(fileURLWithPath: "/private/tmp/muesli-mic-disposal-stall-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let registry = ShutdownWorkRegistry(), owner = CaptureOperationOwner(shutdown: registry)
+        let closing = TaskCompletion(), closed = TaskCompletion(), closeReturn = DispatchSemaphore(value: 0)
+        let request = try makeDisposalGatedMicRequest(folder: folder, registry: registry,
+            closing: closing, closed: closed, closeReturn: closeReturn)
+        let start = Task { () -> Result<Void, Error> in
+            do { try await owner.perform(request, timeoutSeconds: 0.03, preservesRecording: true); return .success(()) }
+            catch { return .failure(error) }
+        }
+        let entered = await closing.wait(timeoutSeconds: 2)
+        XCTAssertEqual(entered, .completed, "Disposal begins only after the native action returned")
+        let nativeResult = await start.value
+        XCTAssertNoThrow(try nativeResult.get(), "Known native completion remains successful while its callback captures close")
+        XCTAssertTrue(owner.isBusy)
+        let competing = CaptureOperationOwner.Request(operation: { XCTFail("Disposal must retain the native lane") })
+        do { try await owner.perform(competing); XCTFail("Expected busy") }
+        catch { guard case CaptureOperationOwner.Failure.busy = error else { return XCTFail("Unexpected \(error)") } }
+        registry.beginQuit()
+        XCTAssertFalse(registry.sealIfFinished())
+        XCTAssertThrowsError(try MeetingFileAccess.acquire(in: folder, mode: .archive))
+        closeReturn.signal()
+        let finished = await closed.wait(timeoutSeconds: 2)
+        XCTAssertEqual(finished, .completed)
+        let exclusive = try MeetingFileAccess.acquire(in: folder, mode: .archive)
+        try exclusive.validate()
     }
 
 }
@@ -491,4 +669,75 @@ nonisolated private func makeOwnedMicOffer(folder: URL, released: DispatchSemaph
     -> @MainActor @Sendable (CaptureOperationOwner.Claim) -> Void {
     let lease = try MicOfferLease(folder: folder, released: released, registry: registry)
     return { claim in withExtendedLifetime(lease) { _ = claim.claim() } }
+}
+
+nonisolated private func makeExecutingMicOffer(folder: URL, released: DispatchSemaphore,
+    registry: ShutdownWorkRegistry, entered: TaskCompletion, callbackReturn: DispatchSemaphore,
+    accepts: Bool) throws -> @MainActor @Sendable (CaptureOperationOwner.Claim) -> Void {
+    let lease = try MicOfferLease(folder: folder, released: released, registry: registry)
+    return { claim in
+        withExtendedLifetime(lease) {
+            if accepts { XCTAssertTrue(claim.claim()) }
+            entered.markCompleted()
+            XCTAssertEqual(callbackReturn.wait(timeout: .now() + 5), .success, "Fail-safe releases blocked UI")
+        }
+    }
+}
+
+nonisolated private func makeAllOwnedMicCallbacks(folder: URL, registry: ShutdownWorkRegistry,
+    released: DispatchSemaphore, nativeReturn: TaskCompletion, failureEntered: TaskCompletion,
+    failureReturn: DispatchSemaphore, cleanupEntered: TaskCompletion) throws -> CaptureOperationOwner.Request {
+    let operationLease = try MicOfferLease(folder: folder, released: released, registry: registry)
+    let failureLease = try MicOfferLease(folder: folder, released: released, registry: registry)
+    let cleanupLease = try MicOfferLease(folder: folder, released: released, registry: registry)
+    return CaptureOperationOwner.Request(onFailure: { _ in
+        withExtendedLifetime(failureLease) {
+            failureEntered.markCompleted()
+            XCTAssertEqual(failureReturn.wait(timeout: .now() + 5), .success)
+        }
+    }, operation: {
+        defer { withExtendedLifetime(operationLease) {} }
+        _ = await nativeReturn.wait(timeoutSeconds: 5)
+    }, cleanupIfAbandoned: {
+        withExtendedLifetime(cleanupLease) { cleanupEntered.markCompleted() }
+    })
+}
+
+nonisolated private func makeRejectedOwnedMicCallbacks(folder: URL, registry: ShutdownWorkRegistry,
+    released: DispatchSemaphore) throws -> CaptureOperationOwner.Request {
+    let operation = try MicOfferLease(folder: folder, released: released, registry: registry)
+    let adoption = try MicOfferLease(folder: folder, released: released, registry: registry)
+    let failure = try MicOfferLease(folder: folder, released: released, registry: registry)
+    let cleanup = try MicOfferLease(folder: folder, released: released, registry: registry)
+    return CaptureOperationOwner.Request(onFailure: { _ in withExtendedLifetime(failure) {} },
+        operation: { withExtendedLifetime(operation) {}; throw TestCaptureFailure.injected },
+        adoption: { _ in withExtendedLifetime(adoption) { XCTFail("Failed native start cannot offer ownership") } },
+        cleanupIfAbandoned: { withExtendedLifetime(cleanup) {} })
+}
+
+nonisolated private final class MicDisposalGate: @unchecked Sendable {
+    private var access: MeetingFileAccess?
+    private let registry: ShutdownWorkRegistry
+    private let closing: TaskCompletion, closed: TaskCompletion
+    private let closeReturn: DispatchSemaphore
+    init(folder: URL, registry: ShutdownWorkRegistry, closing: TaskCompletion,
+         closed: TaskCompletion, closeReturn: DispatchSemaphore) throws {
+        access = try MeetingFileAccess.acquire(in: folder)
+        self.registry = registry; self.closing = closing; self.closed = closed; self.closeReturn = closeReturn
+    }
+    deinit {
+        XCTAssertFalse(Thread.isMainThread)
+        XCTAssertFalse(registry.snapshot().pending.isEmpty)
+        closing.markCompleted()
+        XCTAssertEqual(closeReturn.wait(timeout: .now() + 5), .success)
+        access = nil
+        XCTAssertFalse(registry.snapshot().pending.isEmpty)
+        closed.markCompleted()
+    }
+}
+nonisolated private func makeDisposalGatedMicRequest(folder: URL, registry: ShutdownWorkRegistry,
+    closing: TaskCompletion, closed: TaskCompletion, closeReturn: DispatchSemaphore) throws -> CaptureOperationOwner.Request {
+    let lease = try MicDisposalGate(folder: folder, registry: registry,
+        closing: closing, closed: closed, closeReturn: closeReturn)
+    return CaptureOperationOwner.Request(operation: { withExtendedLifetime(lease) {} })
 }
