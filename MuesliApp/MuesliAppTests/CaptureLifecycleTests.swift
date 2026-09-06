@@ -1,6 +1,40 @@
 import XCTest
 
 final class CaptureLifecycleTests: XCTestCase {
+    func testDelayedMicrophoneObservationCannotResetRetriesOrVerifyRefresh() {
+        var health = CaptureSourceHealth()
+        let received = Date(timeIntervalSince1970: 100), delivered = Date(timeIntervalSince1970: 115)
+        health.begin(generation: 7, now: received)
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 1, generation: 7, receivedAt: received, now: delivered))
+        XCTAssertEqual(health.phase, .recovering)
+        XCTAssertEqual(health.attempts, 1, "An old packet is not successful recovery")
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 1, generation: 7, receivedAt: received, now: delivered))
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 1, generation: 7, receivedAt: nil, now: delivered))
+        XCTAssertEqual(health.attempts, 1)
+        health.observeExpectedProgress(now: delivered)
+        XCTAssertNotEqual(health.phase, .healthy, "Refresh must not verify the delayed final packet")
+        XCTAssertTrue(health.shouldRecover(now: delivered.addingTimeInterval(1), requireContinuousCallbacks: true))
+        XCTAssertFalse(health.shouldRecover(now: delivered.addingTimeInterval(2), requireContinuousCallbacks: true), "Stale repeated observations must not rearm reserved recovery")
+        XCTAssertTrue(health.observeMicrophoneProgress(frames: 2, generation: 7, receivedAt: delivered, now: delivered))
+        XCTAssertEqual(health.phase, .healthy, "Fresh digital silence can recover the same generation")
+        XCTAssertEqual(health.lastProgressAt, delivered)
+    }
+
+    func testMicrophoneReceiptRetainsGenerationAndInvalidationFences() {
+        var health = CaptureSourceHealth()
+        let received = Date(timeIntervalSince1970: 100)
+        health.begin(generation: 7, now: received)
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 9, generation: 6, receivedAt: received, now: received))
+        XCTAssertEqual(health.frameCount, 0)
+        XCTAssertTrue(health.observeMicrophoneProgress(frames: 2, generation: 7, receivedAt: received, now: received.addingTimeInterval(1)))
+        XCTAssertEqual(health.lastProgressAt, received, "UI observation time is not source receipt time")
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 1, generation: 7, receivedAt: received.addingTimeInterval(2), now: received.addingTimeInterval(2)))
+        XCTAssertEqual(health.lastProgressAt, received)
+        XCTAssertTrue(health.invalidate(generation: 7, now: received))
+        XCTAssertFalse(health.observeMicrophoneProgress(frames: 3, generation: 7, receivedAt: received, now: received))
+        XCTAssertEqual(health.phase, .recovering)
+    }
+
     func testSameDeviceInvalidationIsGenerationBoundAndCoalesced() {
         var health = CaptureSourceHealth()
         let now = Date(timeIntervalSince1970: 100)

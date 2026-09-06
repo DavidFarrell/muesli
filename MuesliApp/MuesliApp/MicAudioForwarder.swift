@@ -250,6 +250,8 @@ actor MicAudioForwarder {
         let level: Float
         let frameSampleCount: Int
         let totalFrameCount: Int
+        /// Receipt on the independent forwarding actor, before any UI queue delay.
+        let receivedAt: Date
         /// Seconds since the MEETING epoch (`beginMeeting`), not since this
         /// generation started - restores the pre-2026-07-06 meaning of the
         /// old `debugMicPTS` display value. See `MicAudioForwarder`'s and
@@ -267,7 +269,7 @@ actor MicAudioForwarder {
 
         func mergingRecoveryFlags(from previous: DeliveryResult?) -> DeliveryResult {
             DeliveryResult(level: level, frameSampleCount: frameSampleCount, totalFrameCount: totalFrameCount,
-                           elapsedSeconds: elapsedSeconds,
+                           receivedAt: receivedAt, elapsedSeconds: elapsedSeconds,
                            isFirstFrame: isFirstFrame || previous?.isFirstFrame == true,
                            isResumptionAfterGap: isResumptionAfterGap || previous?.isResumptionAfterGap == true)
         }
@@ -338,6 +340,7 @@ actor MicAudioForwarder {
             level: level,
             frameSampleCount: data.count / 2,
             totalFrameCount: frameCount,
+            receivedAt: now,
             elapsedSeconds: Double(ptsUs) / 1_000_000.0,
             isFirstFrame: isFirstFrame,
             isResumptionAfterGap: mustSurface && !isFirstFrame

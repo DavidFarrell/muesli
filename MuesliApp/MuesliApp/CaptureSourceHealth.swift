@@ -40,6 +40,20 @@ nonisolated struct CaptureSourceHealth: Sendable {
         return true
     }
 
+    /// Microphone observations may wait on the UI executor. An old observation
+    /// must not reset the retry budget or advertise a successful recovery. Use
+    /// the same receipt-time rule for UI notifications and independent snapshots.
+    /// System capture deliberately uses its separate, silence-tolerant policy.
+    mutating func observeMicrophoneProgress(frames: Int, generation: Int, receivedAt: Date?,
+                                           now: Date = Date(), stallThreshold: TimeInterval = 4) -> Bool {
+        guard generation == self.generation, !invalidated else { return false }
+        guard let receivedAt, now.timeIntervalSince(receivedAt) <= stallThreshold else {
+            observeExpectedProgress(now: now, stallThreshold: stallThreshold)
+            return false
+        }
+        return progress(frames: frames, generation: generation, at: receivedAt)
+    }
+
     mutating func fail(_ message: String, retryable: Bool = true, quarantined: Bool = false, now: Date = Date()) {
         self.message = message
         // Repeated failures from one bad generation must not push its retry

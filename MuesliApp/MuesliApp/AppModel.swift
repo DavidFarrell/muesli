@@ -714,7 +714,8 @@ final class AppModel: ObservableObject {
         guard generation == micEngineGeneration else { return }
         guard transcribeMic else { return }
         guard !micHealth.invalidated else { return }
-        _ = micHealth.progress(frames: result.totalFrameCount, generation: generation)
+        guard micHealth.observeMicrophoneProgress(frames: result.totalFrameCount, generation: generation,
+                                                  receivedAt: result.receivedAt) else { return }
         debugMicErrorMessage = "-"
         publishMicError()
 
@@ -748,7 +749,7 @@ final class AppModel: ObservableObject {
         // actual STALL DETECTION reads `micAudioForwarder.snapshot()`
         // directly instead (ground truth, updated even when this MainActor
         // hop is delayed) - see `startMicFramesWatchdog`.
-        lastMicAudioAt = Date()
+        lastMicAudioAt = result.receivedAt
         micFrameCount = result.totalFrameCount
         debugMicFormat = "s16le sr=\(micOutputSampleRate) ch=\(micOutputChannels)"
         publishMicMeters()
@@ -756,7 +757,8 @@ final class AppModel: ObservableObject {
 
     private func handlePreviewMicAudio(_ result: MicAudioForwarder.DeliveryResult) {
         guard !previewMicHealth.invalidated else { return }
-        _ = previewMicHealth.progress(frames: result.totalFrameCount, generation: previewMicGeneration)
+        guard previewMicHealth.observeMicrophoneProgress(frames: result.totalFrameCount, generation: previewMicGeneration,
+                                                         receivedAt: result.receivedAt) else { return }
         debugMicErrorMessage = "-"
         publishMicError()
         meters.clearMicAlert()
@@ -1617,8 +1619,8 @@ final class AppModel: ObservableObject {
                     }
                     if let forwarder = previewMicForwarder {
                         let snapshot = await forwarder.snapshot()
-                        if previewMicHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
-                                                      at: snapshot.lastFrameAt ?? Date()) {
+                        if previewMicHealth.observeMicrophoneProgress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                                                     receivedAt: snapshot.lastFrameAt) {
                             debugMicErrorMessage = "-"
                             publishMicError()
                             meters.clearMicAlert()
@@ -1636,8 +1638,8 @@ final class AppModel: ObservableObject {
                         micHealth.fail("The previous microphone operation has finished.")
                     }
                     let snapshot = await micAudioForwarder.snapshot()
-                    if micHealth.progress(frames: snapshot.frameCount, generation: snapshot.generation,
-                                           at: snapshot.lastFrameAt ?? Date()) {
+                    if micHealth.observeMicrophoneProgress(frames: snapshot.frameCount, generation: snapshot.generation,
+                                                          receivedAt: snapshot.lastFrameAt) {
                         resetMicRecoveryLadder()
                         debugMicErrorMessage = "-"
                         publishMicError()
@@ -1775,12 +1777,17 @@ final class AppModel: ObservableObject {
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
         while ContinuousClock.now < deadline {
+            if preview { previewMicHealth.observeExpectedProgress() }
+            else if transcribeMic { micHealth.observeExpectedProgress() }
             let microphone = preview ? previewMicHealth.phase : micHealth.phase
             _ = captureEngine.supervise(allowRecovery: false)
             if (microphone == .healthy || (!preview && !transcribeMic)), captureEngine.health.phase == .healthy { break }
             if microphone == .failed || microphone == .quarantined { break }
             do { try await Task.sleep(for: .milliseconds(50)) } catch { break }
         }
+        // The final suspension may itself outlive the last fresh sample.
+        if preview { previewMicHealth.observeExpectedProgress() }
+        else if transcribeMic { micHealth.observeExpectedProgress() }
         func outcome(_ phase: CaptureSourceHealth.Phase) -> AudioRefreshResult.Outcome {
             switch phase {
             case .healthy: return .healthy
