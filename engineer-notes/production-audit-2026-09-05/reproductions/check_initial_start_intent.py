@@ -122,7 +122,7 @@ nonisolated final class NativeProbe: @unchecked Sendable {
  func startMeetingMicEngine(expectedSourceIntent: UUID? = nil) async {
   ENTRY
   let engine = UUID(), generation = micEngineGeneration, probe = self.probe
-  try? await owner.perform(operation: { probe.record() }, adoption: { [self] claim in ADOPT }, cleanupIfAbandoned: {})
+  NATIVE_ADMISSION
  }
  func enqueueEstablishedRecovery() async {
   enqueueMicLifecycle("established-recovery") { model in await model.startMeetingMicEngine() }
@@ -182,6 +182,13 @@ nonisolated final class NativeProbe: @unchecked Sendable {
  }
 }
 '''
+# Keep the same extracted admission/adoption cases across the owned-Request
+# API migration; this changes only the synthetic invocation shape.
+if 'final class Request:' in (app / 'CaptureOperationOwner.swift').read_text():
+    native_admission = 'let request = CaptureOperationOwner.Request(operation: { probe.record() }, adoption: { [self] claim in ADOPT }, cleanupIfAbandoned: {})\n  try? await owner.perform(request)'
+else:
+    native_admission = 'try? await owner.perform(operation: { probe.record() }, adoption: { [self] claim in ADOPT }, cleanupIfAbandoned: {})'
+program = program.replace('NATIVE_ADMISSION', native_admission)
 for key, value in [('COORDINATOR', coordinator), ('CONTEXT', context), ('METHODS', methods),
                    ('INITIAL', initial), ('AFTER_MIC', after_mic), ('BEFORE_SYSTEM', before_system),
                    ('BEFORE_BACKEND', before_backend), ('FAILURE_BODY', failure_body), ('ENTRY', entry), ('ADOPT', adopt)]:
