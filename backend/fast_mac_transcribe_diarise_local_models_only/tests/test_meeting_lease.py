@@ -216,7 +216,7 @@ import Foundation
 }
 ''')
     binary = folder / "ParentHarness"
-    sources = ["MeetingFileAccess.swift", "ShutdownWorkRegistry.swift", "BackendAdmissionOwner.swift", "BackendProcess.swift",
+    sources = ["CapturedMicAudio.swift", "MeetingFileAccess.swift", "ShutdownWorkRegistry.swift", "BackendAdmissionOwner.swift", "BackendProcess.swift",
                "BackendOutputReader.swift", "TaskCompletion.swift", "WriteBacklogTracker.swift"]
     result = subprocess.run(["/usr/bin/xcrun", "swiftc", "-parse-as-library", "-swift-version", "6",
                              "-default-isolation", "MainActor", "-strict-concurrency=complete", "-warnings-as-errors",

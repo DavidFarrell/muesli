@@ -37,6 +37,77 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         // Optional additive fields keep manifests from older app versions readable.
         var power_events: [PowerEvent]?
         var power_events_omitted: Int64?
+        var clock_corrections: [String: ClockCorrectionSummary]?
+    }
+
+    /// Fixed-size per-stream observations, including the latest generation in
+    /// the totals. These count conversion work, never persisted PCM or losses.
+    /// Historical generations are folded into totals before replacing latest.
+    struct ClockCorrectionSummary: Codable, Sendable, Equatable {
+        var generation_count: Int64 = 1
+        var native_frames: Int64
+        var nominal_output_frames: Int64
+        var host_output_frames: Int64
+        var observed_intervals: Int64
+        var uncertain_intervals: Int64
+        var min_rate_ratio: Double?
+        var max_rate_ratio: Double?
+        var counters_saturated = false
+        var latest: CapturedClockCorrection
+
+        init(_ correction: CapturedClockCorrection) {
+            latest = correction
+            native_frames = correction.native_frames
+            nominal_output_frames = correction.nominal_output_frames
+            host_output_frames = correction.host_output_frames
+            observed_intervals = correction.observed_intervals
+            uncertain_intervals = correction.uncertain_intervals
+            min_rate_ratio = correction.min_rate_ratio
+            max_rate_ratio = correction.max_rate_ratio
+        }
+
+        mutating func observe(_ correction: CapturedClockCorrection) {
+            guard correction.isValid, correction.generation >= latest.generation else { return }
+            let sameGeneration = correction.generation == latest.generation
+            if sameGeneration {
+                guard correction.native_frames >= latest.native_frames,
+                      correction.nominal_output_frames >= latest.nominal_output_frames,
+                      correction.host_output_frames >= latest.host_output_frames,
+                      correction.observed_intervals >= latest.observed_intervals,
+                      correction.uncertain_intervals >= latest.uncertain_intervals else { return }
+            }
+            var saturated = counters_saturated
+            func add(_ total: Int64, _ current: Int64, _ previous: Int64) -> Int64 {
+                let sum = total.addingReportingOverflow(current - (sameGeneration ? previous : 0))
+                if sum.overflow { saturated = true; return Int64.max }
+                return sum.partialValue
+            }
+            native_frames = add(native_frames, correction.native_frames, latest.native_frames)
+            nominal_output_frames = add(nominal_output_frames, correction.nominal_output_frames, latest.nominal_output_frames)
+            host_output_frames = add(host_output_frames, correction.host_output_frames, latest.host_output_frames)
+            observed_intervals = add(observed_intervals, correction.observed_intervals, latest.observed_intervals)
+            uncertain_intervals = add(uncertain_intervals, correction.uncertain_intervals, latest.uncertain_intervals)
+            if !sameGeneration {
+                let count = generation_count.addingReportingOverflow(1)
+                generation_count = count.overflow ? Int64.max : count.partialValue
+                saturated = saturated || count.overflow
+            }
+            counters_saturated = saturated
+            min_rate_ratio = [min_rate_ratio, correction.min_rate_ratio].compactMap { $0 }.min()
+            max_rate_ratio = [max_rate_ratio, correction.max_rate_ratio].compactMap { $0 }.max()
+            latest = correction
+        }
+
+        var isValid: Bool {
+            generation_count > 0 && latest.isValid
+                && native_frames >= latest.native_frames && nominal_output_frames >= latest.nominal_output_frames
+                && host_output_frames >= latest.host_output_frames && observed_intervals >= latest.observed_intervals
+                && uncertain_intervals >= latest.uncertain_intervals
+                && CapturedClockCorrection(native_frames: native_frames, nominal_output_frames: nominal_output_frames,
+                    host_output_frames: host_output_frames, observed_intervals: observed_intervals,
+                    uncertain_intervals: uncertain_intervals, min_rate_ratio: min_rate_ratio,
+                    max_rate_ratio: max_rate_ratio, generation: latest.generation).isValid
+        }
     }
 
     struct PowerEvent: Codable, Sendable, Equatable {
@@ -133,6 +204,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var omittedLosses: Int64 = 0
     private var pendingPowerEvents: [PowerEvent] = []
     private var omittedPowerEvents: Int64 = 0
+    private var clockCorrections: [Source: ClockCorrectionSummary] = [:]
     private var closedManifest: Manifest?
     private let closeCompletion = TaskCompletion()
     private let quitWork: ShutdownWorkRegistry.Token
@@ -246,6 +318,22 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             Self.addLoss(Loss(source: source.rawValue, reason: "source_failure_unknown_range",
                               start_frame: nil, end_frame: nil, frames: 0),
                          to: &rejectedLosses, omitted: &omittedLosses)
+        }
+    }
+
+    /// Coalesced in memory under the same admission lock as close. The source
+    /// timer/final barrier persists at most two summaries without per-packet I/O.
+    func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection) {
+        guard correction.isValid else { return }
+        let source: Source = stream == .mic ? .mic : .system
+        lock.withLock {
+            guard !closeRequested else { return }
+            if var summary = clockCorrections[source] {
+                summary.observe(correction)
+                clockCorrections[source] = summary
+            } else {
+                clockCorrections[source] = ClockCorrectionSummary(correction)
+            }
         }
     }
 
@@ -423,11 +511,19 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let omitted = omittedLosses
         let power = pendingPowerEvents
         let powerOmitted = omittedPowerEvents
+        let clocks = clockCorrections
         rejectedLosses.removeAll()
         omittedLosses = 0
         pendingPowerEvents.removeAll(keepingCapacity: true)
         omittedPowerEvents = 0
         lock.unlock()
+        if !clocks.isEmpty {
+            let summaries = Dictionary(uniqueKeysWithValues: clocks.map { ($0.key.rawValue, $0.value) })
+            if manifest.clock_corrections != summaries {
+                manifest.clock_corrections = summaries
+                dirty = true
+            }
+        }
         if !power.isEmpty || powerOmitted > 0 {
             var recorded = manifest.power_events ?? []
             let admitted = power.prefix(max(0, 128 - recorded.count))
@@ -574,6 +670,12 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         guard result.schema_version == 1, !result.session_id.isEmpty,
               result.timeline_offset_us >= 0,
               result.streams.count == Source.allCases.count else { throw RecorderError.invalidManifest }
+        if let clocks = result.clock_corrections {
+            guard clocks.count <= Source.allCases.count,
+                  clocks.allSatisfy({ Source(rawValue: $0.key) != nil && $0.value.isValid }) else {
+                throw RecorderError.invalidManifest
+            }
+        }
         guard (result.power_events?.count ?? 0) <= 128, (result.power_events_omitted ?? 0) >= 0,
               result.power_events?.allSatisfy({ $0.process_continuous_us >= 0 && ($0.source_time_us ?? 0) >= 0 && ($0.observed_pause_us ?? 0) >= 0 }) ?? true else {
             throw RecorderError.invalidManifest

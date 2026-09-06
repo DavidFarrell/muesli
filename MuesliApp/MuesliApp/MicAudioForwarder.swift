@@ -9,11 +9,13 @@ nonisolated protocol FrameSending: AnyObject, Sendable {
     func send(type: MsgType, stream: StreamID, ptsUs: Int64, payload: Data)
     func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String)
     func reportFailure(stream: StreamID, message: String)
+    func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection)
 }
 
 extension FrameSending {
     nonisolated func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {}
     nonisolated func reportFailure(stream: StreamID, message: String) {}
+    nonisolated func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection) {}
 }
 
 /// Abstraction over a monotonic time source, used for the forwarder's
@@ -290,6 +292,9 @@ actor MicAudioForwarder {
     /// forever (see that type's doc comment).
     func deliver(_ packet: CapturedMicAudio) -> DeliveryResult? {
         guard packet.generation == generation, let meetingEpochUs else { return nil }
+        if let correction = packet.clockCorrection, correction.generation == generation {
+            writer?.reportClockCorrection(stream: stream, correction: correction)
+        }
         let data = packet.data
         let now = Date()
         if startedAt == nil { startedAt = now }

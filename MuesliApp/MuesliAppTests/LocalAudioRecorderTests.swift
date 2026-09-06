@@ -2,6 +2,134 @@ import Foundation
 import XCTest
 
 final class LocalAudioRecorderTests: XCTestCase {
+    func testForwardedClockSummariesPreserveGenerationsAndIndependentSourcesWithoutChangingAudio() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url)
+        let microphone = MicAudioForwarder(sampleRate: 16000, channels: 1)
+        let system = MicAudioForwarder(sampleRate: 16000, channels: 1, stream: .system)
+        let epoch = CaptureTimeline(epochMicroseconds: 1_000_000)
+        await microphone.beginMeeting(epoch: epoch)
+        await system.beginMeeting(epoch: epoch)
+        await microphone.beginGeneration(4, writer: recorder, outputEnabled: true)
+        await system.beginGeneration(4, writer: recorder, outputEnabled: true)
+        let first = clockCorrection(generation: 4, native: 480, nominal: 160, host: 160, observed: 1)
+        _ = await microphone.deliver(clockPacket(generation: 4, time: 1_000_000, correction: first))
+        recorder.reportClockCorrection(stream: .mic, correction: first) // Same cumulative observation is idempotent.
+        _ = await system.deliver(clockPacket(generation: 4, time: 1_000_000,
+            correction: clockCorrection(generation: 4, native: 480, nominal: 159, host: 160, observed: 2, uncertain: 1)))
+
+        await microphone.beginGeneration(7, writer: recorder, outputEnabled: true)
+        let next = clockCorrection(generation: 7, native: 480, nominal: 160, host: 160, observed: 1, uncertain: 1)
+        _ = await microphone.deliver(clockPacket(generation: 7, time: 1_010_000, correction: next))
+        // The actual forwarder rejects both audio and diagnostics from a retired packet.
+        _ = await microphone.deliver(clockPacket(generation: 4, time: 1_020_000,
+            correction: clockCorrection(generation: 4, native: 9999, nominal: 9999, host: 9999, observed: 9999)))
+        // A correction with a different generation cannot hitchhike on current audio.
+        _ = await microphone.deliver(clockPacket(generation: 7, time: 1_020_000, correction: first))
+        let finalObservation = clockCorrection(generation: 7, native: 1440, nominal: 479, host: 480, observed: 3, uncertain: 2)
+        _ = await microphone.deliver(clockPacket(generation: 7, time: 1_030_000, correction: finalObservation))
+        let result = try await finish(recorder)
+        let saved = try LocalAudioRecorder.readManifest(directory: url)
+        XCTAssertEqual(result.clock_corrections, saved.clock_corrections)
+        XCTAssertEqual(saved.clock_corrections?.count, 2)
+        let mic = try XCTUnwrap(saved.clock_corrections?["mic"])
+        XCTAssertEqual(mic.generation_count, 2)
+        XCTAssertEqual(mic.native_frames, 1920)
+        XCTAssertEqual(mic.nominal_output_frames, 639)
+        XCTAssertEqual(mic.host_output_frames, 640)
+        XCTAssertEqual(mic.observed_intervals, 4)
+        XCTAssertEqual(mic.uncertain_intervals, 2)
+        XCTAssertEqual(mic.latest, finalObservation)
+        XCTAssertEqual(saved.clock_corrections?["system"]?.generation_count, 1)
+        XCTAssertEqual(saved.clock_corrections?["system"]?.uncertain_intervals, 1)
+        XCTAssertTrue(saved.completed, "Clock correction and uncertainty are diagnostics, not capture loss")
+        XCTAssertEqual(saved.problem_count, 0)
+        XCTAssertTrue(saved.losses.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("mic.pcm")), samples(640))
+        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("system.pcm")), samples(160))
+    }
+
+    func testClockDiagnosticsCommitBeforeStopAndRejectLateOrRegressingObservations() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url, commitInterval: 0.05)
+        let accepted = clockCorrection(generation: 8, native: 480, nominal: 160, host: 160, observed: 2, uncertain: 1)
+        recorder.reportClockCorrection(stream: .mic, correction: accepted)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while try LocalAudioRecorder.readManifest(directory: url).clock_corrections == nil,
+              ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(try LocalAudioRecorder.readManifest(directory: url).clock_corrections?["mic"]?.latest, accepted)
+        recorder.reportClockCorrection(stream: .mic, correction: clockCorrection(generation: 7, native: 9999, nominal: 9999, host: 9999, observed: 9999))
+        recorder.reportClockCorrection(stream: .mic, correction: clockCorrection(generation: 8, native: 479, nominal: 160, host: 160, observed: 2))
+        for ratio in [Double.nan, Double.infinity, -1, 0, 2.01] {
+            recorder.reportClockCorrection(stream: .mic, correction: clockCorrection(generation: 9, native: 1000, nominal: 1000, host: 1000, observed: 10, ratio: ratio))
+        }
+        recorder.requestFinish()
+        recorder.reportClockCorrection(stream: .mic, correction: clockCorrection(generation: 9, native: 1000, nominal: 1000, host: 1000, observed: 10))
+        let result = try await finish(recorder)
+        XCTAssertEqual(result.clock_corrections?["mic"]?.latest, accepted)
+        XCTAssertEqual(result.clock_corrections?["mic"]?.generation_count, 1)
+        XCTAssertTrue(result.completed)
+        let bytes = try Data(contentsOf: url.appendingPathComponent(LocalAudioRecorder.manifestName))
+        recorder.reportClockCorrection(stream: .system, correction: accepted)
+        _ = await recorder.finish()
+        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent(LocalAudioRecorder.manifestName)), bytes)
+    }
+
+    func testClockSummaryStorageRemainsBoundedAcrossManyGenerationsAndSaturatesExplicitly() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url)
+        for generation in 0..<5000 {
+            recorder.reportClockCorrection(stream: .mic, correction: clockCorrection(generation: generation,
+                native: 480, nominal: 160, host: 160, observed: 1, uncertain: 1))
+        }
+        recorder.reportClockCorrection(stream: .system, correction: clockCorrection(generation: 1,
+            native: Int64.max, nominal: Int64.max, host: Int64.max, observed: Int64.max, uncertain: Int64.max))
+        recorder.reportClockCorrection(stream: .system, correction: clockCorrection(generation: 2,
+            native: 1, nominal: 1, host: 1, observed: 1, uncertain: 1))
+        let result = try await finish(recorder)
+        XCTAssertEqual(result.clock_corrections?["mic"]?.generation_count, 5000)
+        XCTAssertEqual(result.clock_corrections?["mic"]?.native_frames, 2_400_000)
+        XCTAssertEqual(result.clock_corrections?["mic"]?.latest.generation, 4999)
+        let system = try XCTUnwrap(result.clock_corrections?["system"])
+        XCTAssertTrue(system.counters_saturated)
+        XCTAssertEqual(system.native_frames, Int64.max)
+        XCTAssertEqual(system.nominal_output_frames, Int64.max)
+        XCTAssertEqual(system.host_output_frames, Int64.max)
+        XCTAssertEqual(system.observed_intervals, Int64.max)
+        XCTAssertEqual(system.uncertain_intervals, Int64.max)
+        XCTAssertLessThan(try JSONEncoder().encode(result.clock_corrections).count, 4096)
+        XCTAssertTrue(try LocalAudioRecorder.readManifest(directory: url).completed)
+    }
+
+    func testOldManifestWithoutClockDiagnosticsStillDecodesAndInvalidSummaryIsRejected() async throws {
+        let url = try folder()
+        let recorder = try LocalAudioRecorder(directory: url)
+        let result = try await finish(recorder)
+        let oldBytes = try JSONEncoder().encode(result)
+        XCTAssertNil(try LocalAudioRecorder.decodeManifest(oldBytes).clock_corrections)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: oldBytes) as? [String: Any])
+        XCTAssertNil(object["clock_corrections"], "Unused additive diagnostics are omitted from old-shaped manifests")
+        let valid = LocalAudioRecorder.ClockCorrectionSummary(clockCorrection(generation: 1, native: 1, nominal: 1, host: 1, observed: 1))
+        var summary = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(valid)) as? [String: Any])
+        summary["native_frames"] = -1
+        object["clock_corrections"] = ["mic": summary]
+        XCTAssertThrowsError(try LocalAudioRecorder.decodeManifest(JSONSerialization.data(withJSONObject: object)))
+        object["clock_corrections"] = ["unknown": try JSONSerialization.jsonObject(with: JSONEncoder().encode(valid))]
+        XCTAssertThrowsError(try LocalAudioRecorder.decodeManifest(JSONSerialization.data(withJSONObject: object)))
+    }
+
+    private func clockCorrection(generation: Int, native: Int64, nominal: Int64, host: Int64,
+                                 observed: Int64, uncertain: Int64 = 0, ratio: Double = 1.0001) -> CapturedClockCorrection {
+        CapturedClockCorrection(native_frames: native, nominal_output_frames: nominal, host_output_frames: host,
+            observed_intervals: observed, uncertain_intervals: uncertain, min_rate_ratio: ratio,
+            max_rate_ratio: ratio, generation: generation)
+    }
+
+    private func clockPacket(generation: Int, time: Int64, correction: CapturedClockCorrection) -> CapturedMicAudio {
+        CapturedMicAudio(data: samples(160), captureTimeUs: time, generation: generation, nativeSampleRate: 48000,
+            nativeChannels: 1, nativeFrameCount: 480, formatEpoch: 1, outputSampleRate: 16000, clockCorrection: correction)
+    }
+
     func testPerStreamWriteFailurePreservesLaterHealthySourcePackets() async throws {
         let url = try folder()
         let recorder = try LocalAudioRecorder(directory: url, commitInterval: 0.01, beforeIO: { checkpoint in
