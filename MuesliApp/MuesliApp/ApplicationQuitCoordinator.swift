@@ -34,6 +34,12 @@ final class ApplicationQuitCoordinator: ObservableObject {
     func canContinueStart(_ capturedIntent: UUID) -> Bool {
         registry.acceptsUserWork && startIntent == capturedIntent
     }
+    /// Initial setup keeps the token captured before its first suspension.
+    /// Cancel Quit reopens admission for new work, never that retired setup.
+    func requireCurrentStart(_ capturedIntent: UUID) throws {
+        try Task.checkCancellation()
+        guard canContinueStart(capturedIntent) else { throw CancellationError() }
+    }
     func requestQuit(reply: @escaping @MainActor (Bool) -> Void) {
         guard requestID == nil else { return }
         let id = UUID()

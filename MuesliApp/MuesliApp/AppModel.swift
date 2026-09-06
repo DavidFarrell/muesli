@@ -2357,6 +2357,7 @@ final class AppModel: ObservableObject {
             sourceTimeline = captureTimeline
             await micAudioForwarder.beginMeeting(epoch: captureTimeline)
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
             try await captureEngine.startCapture(
                 contentFilter: audioFilter,
                 writer: recorder,
@@ -2365,19 +2366,23 @@ final class AppModel: ObservableObject {
                 audioOutputEnabled: true, meetingAccess: prepared.access
             )
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             resetMicDebugState()
             micStartTime = Date()
             let initialMicIntent = micSourceIntent
             enqueueMicLifecycle("meeting-initial-microphone") { model in
-                guard let initialMicIntent, model.micSourceIntent == initialMicIntent else { return }
+                guard let initialMicIntent, model.micSourceIntent == initialMicIntent,
+                      ApplicationQuitCoordinator.shared.canContinueStart(startIntent) else { return }
                 await model.startMeetingMicEngine(expectedSourceIntent: initialMicIntent)
             }
             await micLifecycleTask?.value
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             let formats = await captureEngine.waitForAudioFormats(timeoutSeconds: 2.0)
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
             let systemSampleRate = 16_000
             let systemChannels = 1
             let micSampleRate = micOutputSampleRate
@@ -2392,7 +2397,10 @@ final class AppModel: ObservableObject {
             if let backendProjectRoot {
                 do {
                     try await launchLiveInference(backendProjectRoot: backendProjectRoot, audioDir: audioDir,
-                                                  folderURL: folderURL, recorder: recorder, eventsURL: sessionEventsURL)
+                                                  folderURL: folderURL, recorder: recorder, eventsURL: sessionEventsURL,
+                                                  startIntent: startIntent)
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
                     reportInferenceFailure(error.localizedDescription)
@@ -2401,6 +2409,7 @@ final class AppModel: ObservableObject {
                 reportInferenceFailure("No local transcription backend is configured.")
             }
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
+            try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
 
             let meta: [String: Any] = [
                 "protocol_version": 1,
@@ -2455,10 +2464,14 @@ final class AppModel: ObservableObject {
             guard isCurrentSource(recorder, eventsURL: sessionEventsURL) else { return }
             isFinalizing = true
             defer { isFinalizing = false; isCapturing = false; activeScreen = .start }
-            let pythonPath = backendPythonCandidatePath ?? "(unknown)"
-            let nsError = error as NSError
-            let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
-            shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) sandboxed=\(isSandboxed) \(details)"
+            if error is CancellationError {
+                shareableContentError = "Meeting start was cancelled before setup finished. Its captured source files were retained."
+            } else {
+                let pythonPath = backendPythonCandidatePath ?? "(unknown)"
+                let nsError = error as NSError
+                let details = "domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)"
+                shareableContentError = "Failed to start backend or capture: \(error). Python: \(pythonPath) sandboxed=\(isSandboxed) \(details)"
+            }
             appendBackendLog("Start failure: \(shareableContentError ?? "\(error)")", toTail: true)
             await teardownFailedMeetingStart(session: session, wasResume: meeting != nil, priorMetadata: metadata)
         }
@@ -2470,7 +2483,8 @@ final class AppModel: ObservableObject {
 
     /// Live inference may be absent or fail; source recording has a separate owner.
     private func launchLiveInference(backendProjectRoot: URL, audioDir: URL, folderURL: URL,
-                                     recorder: LocalAudioRecorder, eventsURL: URL) async throws {
+                                     recorder: LocalAudioRecorder, eventsURL: URL, startIntent: UUID) async throws {
+        try ApplicationQuitCoordinator.shared.requireCurrentStart(startIntent)
         let transcribeStream = transcribeSystem && transcribeMic ? "both" : (transcribeSystem ? "system" : "mic")
         let sessionLogHandle = backendLogHandle
         let onExit: @Sendable (Int32) -> Void = { [weak self] status in
@@ -2504,7 +2518,8 @@ final class AppModel: ObservableObject {
             }
         }
         let outcome = await attempt.waitUntilReady()
-        guard ShutdownWorkRegistry.shared.acceptsUserWork, isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
+        guard ApplicationQuitCoordinator.shared.canContinueStart(startIntent),
+              isCurrentSource(recorder, eventsURL: eventsURL), !Task.isCancelled else {
             attempt.cancel()
             throw CancellationError()
         }

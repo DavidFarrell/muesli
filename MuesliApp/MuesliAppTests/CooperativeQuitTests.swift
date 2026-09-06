@@ -6,6 +6,12 @@ final class CooperativeQuitTests: XCTestCase {
     nonisolated private final class Gate: @unchecked Sendable {
         let entered = TaskCompletion()
         let release = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var blockedOnce = false
+        func blockOnce() {
+            guard lock.withLock({ if blockedOnce { return false }; blockedOnce = true; return true }) else { return }
+            block()
+        }
         func block() {
             XCTAssertFalse(Thread.isMainThread)
             entered.markCompleted()
@@ -309,8 +315,10 @@ final class CooperativeQuitTests: XCTestCase {
         coordinator.cancelQuit()
         XCTAssertTrue(registry.acceptsUserWork)
         XCTAssertFalse(coordinator.canContinueStart(oldIntent), "reopening admission must not restore the old generation")
+        XCTAssertThrowsError(try coordinator.requireCurrentStart(oldIntent))
         let nextIntent = coordinator.startIntent
         XCTAssertTrue(coordinator.canContinueStart(nextIntent), "a newly requested Start remains usable")
+        XCTAssertNoThrow(try coordinator.requireCurrentStart(nextIntent))
         // Use the same production admission predicate and cleanup owner as
         // AppModel's post-prepare handoff; no hardware-backed AppModel needed.
         if coordinator.canContinueStart(oldIntent) { XCTFail("old capture would be adopted") }
@@ -324,6 +332,55 @@ final class CooperativeQuitTests: XCTestCase {
         XCTAssertEqual(metadata.status, .interrupted)
         XCTAssertEqual(metadata.sessions.last?.sourceSessionID, prepared.sourceID)
         XCTAssertThrowsError(try prepared.logHandle.write(contentsOf: Data([1])))
+    }
+
+    func testRetiredInitialContinuationRetainsRealSourceUntilActualClose() async throws {
+        let registry = ShutdownWorkRegistry(), coordinator = ApplicationQuitCoordinator(registry: registry)
+        let source = try folder().appendingPathComponent("audio"), gate = Gate()
+        defer { gate.release.signal() }
+        let recorder = try LocalAudioRecorder(directory: source, commitInterval: 60, shutdown: registry,
+            beforeIO: { if case .manifest = $0 { gate.blockOnce() } })
+        let bytes = Data(repeating: 7, count: 320)
+        recorder.send(type: .audio, stream: .system, ptsUs: 0, payload: bytes)
+        let startWork = try registry.begin("Original initial continuation")
+        let originalIntent = coordinator.startIntent, entered = TaskCompletion(), release = TaskCompletion()
+        var admittedNextStage = false, asyncQuitPreparations = 0
+        coordinator.configure(prepare: { asyncQuitPreparations += 1 }, cancelled: {})
+        let pending = Task { @MainActor in
+            defer { startWork.finish() }
+            entered.markCompleted(); _ = await release.wait(timeoutSeconds: 3)
+            do {
+                try coordinator.requireCurrentStart(originalIntent)
+                admittedNextStage = true
+            } catch {
+                // This is the actual source owner used by failed initial setup.
+                // Its own work token must survive a bounded cleanup waiter.
+                recorder.reportFailure(stream: .mic, message: "Initial setup was retired before microphone admission.")
+                return await recorder.finish(timeoutSeconds: 0.02)
+            }
+            return nil
+        }
+        let didEnter = await entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(didEnter, .completed)
+        coordinator.requestQuit { _ in }; coordinator.cancelQuit()
+        release.markCompleted()
+        let didStartClose = await gate.entered.wait(timeoutSeconds: 2)
+        XCTAssertEqual(didStartClose, .completed)
+        let boundedResult = await pending.value
+        XCTAssertNil(boundedResult)
+        XCTAssertFalse(admittedNextStage)
+        XCTAssertEqual(asyncQuitPreparations, 0)
+        XCTAssertThrowsError(try LocalAudioRecorder.withInactiveSource(directory: source) {})
+        registry.beginQuit()
+        XCTAssertFalse(registry.sealIfFinished(), "Actual recorder close remains owned after the initial continuation returns")
+        gate.release.signal()
+        try await drained(registry)
+        try LocalAudioRecorder.withInactiveSource(directory: source) {}
+        XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("system.pcm")), bytes)
+        let manifest = try LocalAudioRecorder.readManifest(directory: source)
+        XCTAssertFalse(manifest.completed)
+        XCTAssertGreaterThan(manifest.problem_count, 0)
+        XCTAssertEqual(manifest.streams["system"]?.committed_bytes, Int64(bytes.count))
     }
 
 }
