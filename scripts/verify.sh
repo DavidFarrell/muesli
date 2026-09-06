@@ -48,7 +48,7 @@ xcodebuild test -project "$project_root/MuesliApp/MuesliApp.xcodeproj" -scheme M
   -destination 'platform=macOS' -derivedDataPath "$output_root/DerivedData" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > "$output_root/swift-tests.log" 2>&1
 xcodebuild build -project "$project_root/MuesliApp/MuesliApp.xcodeproj" -scheme MuesliApp \
-  -configuration Release -enableCodeCoverage NO -derivedDataPath "$output_root/DerivedData" \
+  -configuration Release ENABLE_CODE_COVERAGE=NO -derivedDataPath "$output_root/DerivedData" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > "$output_root/release-build.log" 2>&1
 archive_cli="$output_root/DerivedData/Build/Products/Release/MuesliApp.app/Contents/Helpers/muesli-archive"
 test -x "$archive_cli"
