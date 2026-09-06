@@ -1,0 +1,251 @@
+{
+  "native-results.json": {
+    "checks": [
+      {
+        "name": "Original direct child and original lock identities produce a bookmark",
+        "passed": true
+      },
+      {
+        "name": "Admission closes both SH pins and child directory before handoff",
+        "passed": true
+      },
+      {
+        "name": "Retained bookmark has no hidden access pin",
+        "passed": true
+      },
+      {
+        "name": "Retained bookmark has no hidden backend pin",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: ",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: .",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: ..",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: /outside",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: ../outside",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: meeting/../outside",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: meeting/audio",
+        "passed": true
+      },
+      {
+        "name": "Reject unsafe child: bad<NUL>tail",
+        "passed": true
+      },
+      {
+        "name": "A symlink to the exact expected meeting inode is rejected",
+        "passed": true
+      },
+      {
+        "name": "A symlink to the exact expected lock inode is rejected",
+        "passed": true
+      },
+      {
+        "name": "A multiply linked ownership file is rejected",
+        "passed": true
+      },
+      {
+        "name": "A changed original lock identity is rejected",
+        "passed": true
+      },
+      {
+        "name": "An active exclusive mutation blocks bookmark admission",
+        "passed": true
+      },
+      {
+        "name": "Failed validation leaves no hidden lock pin",
+        "passed": true
+      },
+      {
+        "name": "A replacement at the selected root pathname is rejected",
+        "passed": true
+      }
+    ],
+    "fixture": "/private/tmp/muesli-source-native-tests.p1vA8z",
+    "passed": true,
+    "scope": "Actual native source admission, generated files only; no sandbox authority or UI qualification"
+  },
+  "owner-results.json": {
+    "checks": [
+      {
+        "name": "Actual native exit evidence has original PID/birth and exit125",
+        "passed": true
+      },
+      {
+        "name": "Authorization transmits only the original root path and dev/ino",
+        "passed": true
+      },
+      {
+        "name": "Pending token is registered before handoff",
+        "passed": true
+      },
+      {
+        "name": "Opaque bookmark and immutable 56-byte lease are unchanged",
+        "passed": true
+      },
+      {
+        "name": "A different actual native process cannot retire this token",
+        "passed": true
+      },
+      {
+        "name": "Shutdown cancels once and retains the original session while a token is active",
+        "passed": true
+      },
+      {
+        "name": "Matching original exit retires exactly once",
+        "passed": true
+      },
+      {
+        "name": "Retired bookmark cannot be reused",
+        "passed": true
+      },
+      {
+        "name": "One remote retirement and session closure follow real death",
+        "passed": true
+      },
+      {
+        "name": "An idle session is not reported as unavailable",
+        "passed": true
+      },
+      {
+        "name": "Graceful retirement preserves active capability without cancellation",
+        "passed": true
+      },
+      {
+        "name": "Graceful retirement signals availability exactly once outside locks",
+        "passed": true
+      },
+      {
+        "name": "Retired admission rejects further source grants",
+        "passed": true
+      },
+      {
+        "name": "Retired admission rejects further authorization",
+        "passed": true
+      },
+      {
+        "name": "Gracefully retained capability closes only at matching kernel exit",
+        "passed": true
+      },
+      {
+        "name": "An authorizing session is not reported as unavailable",
+        "passed": true
+      },
+      {
+        "name": "Retiring preparation notifies once and wakes its original waiter",
+        "passed": true
+      },
+      {
+        "name": "Late unavailability registration fires once and duplicate observers cannot replace it",
+        "passed": true
+      },
+      {
+        "name": "Concurrent authorization opens one original request",
+        "passed": true
+      },
+      {
+        "name": "Both authorization waiters observe one successful session",
+        "passed": true
+      },
+      {
+        "name": "Authorization timeout closes the initial session",
+        "passed": true
+      },
+      {
+        "name": "A late successful authorization cannot reopen the session",
+        "passed": true
+      },
+      {
+        "name": "Termination replay during registration prevents all source RPCs",
+        "passed": true
+      },
+      {
+        "name": "Terminal-before-request still closes its remote job ID once",
+        "passed": true
+      },
+      {
+        "name": "In-flight acquire is owned before its reply",
+        "passed": true
+      },
+      {
+        "name": "Actual exit before reply prevents late bookmark delivery",
+        "passed": true
+      },
+      {
+        "name": "Actual termination is not reported as capability loss",
+        "passed": true
+      },
+      {
+        "name": "Late reply cannot recreate a retired job",
+        "passed": true
+      },
+      {
+        "name": "Source acquire fails within its two-second caller bound",
+        "passed": true
+      },
+      {
+        "name": "Timeout and late reply retain ownership until actual exit",
+        "passed": true
+      },
+      {
+        "name": "Timed-out pending token drains after original native exit",
+        "passed": true
+      },
+      {
+        "name": "Broker loss cancels each active job exactly once without retiring it",
+        "passed": true
+      },
+      {
+        "name": "One original exit cannot drain another active process",
+        "passed": true
+      },
+      {
+        "name": "Broker-loss session closes only after both original processes exit",
+        "passed": true
+      },
+      {
+        "name": "Concurrent duplicate kernel events retire once",
+        "passed": true
+      },
+      {
+        "name": "Concurrent retirement emits one remote retirement while session remains active",
+        "passed": true
+      },
+      {
+        "name": "Invalid bookmark size 0 cancels without releasing the token",
+        "passed": true
+      },
+      {
+        "name": "Invalid bookmark size 1048577 cancels without releasing the token",
+        "passed": true
+      },
+      {
+        "name": "A path outside the original Meetings root is rejected before registration",
+        "passed": true
+      },
+      {
+        "name": "Invalid immutable wire version is rejected before registration",
+        "passed": true
+      }
+    ],
+    "passed": true,
+    "scope": "Actual owner with test-only transport callbacks and real native process-exit evidence; no UI or sandbox grant claim"
+  }
+}
