@@ -1,6 +1,6 @@
-# Native archive semantic adapter (inactive)
+# Native archive semantic adapter
 
-This slice consumes native process completion, source eligibility, saved-output evidence, image-copy provenance and the durable move journal. It does not activate a listener, change AppModel, edit the external Merge skill, launch an installed socket, or authorize a production archive workflow. All move tests use a private temporary fixture and `FileManager.moveItem`; no test invokes Finder Trash or touches user recordings.
+This slice consumes native process completion, source eligibility, saved-output evidence, image-copy provenance and the durable move journal. Its original standalone implementation was inactive. The separately reviewed application bridge now wires it into app startup in source; the installed app and external Merge skill remain unchanged and production archive acceptance is still unqualified. All move tests use a private temporary fixture and `FileManager.moveItem`; no test invokes Finder Trash or touches user recordings.
 
 ## Native API and trust boundary
 
