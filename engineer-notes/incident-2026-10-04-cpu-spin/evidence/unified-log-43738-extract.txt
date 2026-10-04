@@ -1,0 +1,143 @@
+# MuesliApp unified log, Muesli subsystem + display/sleep notifications only (process 43738, 1-4 Oct)
+2026-10-01 08:18:37.526 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] server port 0x0000db07, session port 0x0000db07
+2026-10-01 08:18:37.529 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] New connection 0x10588b main
+2026-10-01 08:45:23.923 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 08:45:23.923 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 08:45:23.923 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 26 -> 27
+2026-10-01 08:45:23.984 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 08:45:23.984 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 27 -> 28
+2026-10-01 10:22:32.067 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 10:22:32.067 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 28 -> 29
+2026-10-01 10:22:32.070 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-01 11:12:47.583 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 11:12:47.583 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 11:12:47.583 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 29 -> 30
+2026-10-01 11:12:47.686 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 11:12:47.686 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 31 -> 31
+2026-10-01 13:56:34.389 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 13:56:34.389 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 31 -> 32
+2026-10-01 13:56:34.392 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-01 13:58:37.167 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 13:58:37.167 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 13:58:37.167 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 32 -> 33
+2026-10-01 13:58:37.191 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 13:58:37.191 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 34 -> 34
+2026-10-01 14:17:54.164 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 14:17:54.164 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 34 -> 35
+2026-10-01 14:17:54.165 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-01 14:31:04.742 F  MuesliApp[43738:141982] [com.apple.runtime-issues:SwiftUI] Publishing changes from within view updates is not allowed, this will cause undefined behavior.
+2026-10-01 14:31:04.742 F  MuesliApp[43738:141982] [com.apple.runtime-issues:SwiftUI] Publishing changes from within view updates is not allowed, this will cause undefined behavior.
+2026-10-01 14:31:04.742 F  MuesliApp[43738:141982] [com.apple.runtime-issues:SwiftUI] Publishing changes from within view updates is not allowed, this will cause undefined behavior.
+2026-10-01 16:11:34.274 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 16:11:34.274 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 16:11:34.274 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 35 -> 36
+2026-10-01 16:11:34.337 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 16:11:34.337 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 36 -> 37
+2026-10-01 16:11:35.231 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 16:11:35.231 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 37 -> 38
+2026-10-01 16:11:35.233 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-01 16:11:35.260 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 16:11:35.260 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 16:11:35.260 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 38 -> 39
+2026-10-01 16:11:35.437 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 16:11:35.437 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 40 -> 40
+2026-10-01 18:20:15.442 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 18:20:15.442 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 40 -> 41
+2026-10-01 18:20:15.442 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-01 19:55:26.780 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-01 19:55:26.780 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 19:55:26.780 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 41 -> 42
+2026-10-01 19:55:26.821 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-01 19:55:26.821 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 43 -> 43
+2026-10-02 06:36:22.719 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 06:36:22.719 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 43 -> 44
+2026-10-02 06:36:22.800 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 07:39:38.173 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 07:39:38.173 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 07:39:38.173 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 44 -> 45
+2026-10-02 07:39:38.173 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 07:39:38.173 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 46 -> 46
+2026-10-02 08:23:14.188 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 08:23:14.188 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 46 -> 47
+2026-10-02 08:23:14.192 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 08:23:18.367 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 08:23:18.367 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 08:23:18.367 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 47 -> 48
+2026-10-02 08:23:18.412 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 08:23:18.412 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 49 -> 49
+2026-10-02 11:51:01.634 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 11:51:01.634 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 49 -> 50
+2026-10-02 11:51:01.634 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 12:27:47.041 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 12:27:47.041 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 12:27:47.041 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 50 -> 51
+2026-10-02 12:27:47.041 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 12:27:47.041 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 52 -> 52
+2026-10-02 12:53:28.972 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 12:53:28.972 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 52 -> 53
+2026-10-02 12:53:28.972 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 15:09:49.065 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 15:09:49.065 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 15:09:49.065 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 53 -> 54
+2026-10-02 15:09:49.110 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 15:09:49.110 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 54 -> 55
+2026-10-02 19:12:20.206 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 19:12:20.206 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 55 -> 56
+2026-10-02 19:12:20.206 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 20:12:56.982 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 20:12:56.982 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 20:12:56.982 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 56 -> 57
+2026-10-02 20:12:57.027 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 20:12:57.027 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 57 -> 58
+2026-10-02 22:48:49.866 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:48:49.866 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 58 -> 59
+2026-10-02 22:48:49.867 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 22:50:13.226 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 22:50:13.226 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:50:13.226 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 59 -> 60
+2026-10-02 22:50:13.639 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:50:13.639 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 61 -> 61
+2026-10-02 22:50:13.639 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:50:13.639 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 61 -> 62
+2026-10-02 22:50:13.640 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-02 22:50:18.661 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-02 22:50:18.661 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:50:18.661 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 62 -> 63
+2026-10-02 22:50:18.661 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-02 22:50:18.661 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 64 -> 64
+2026-10-03 07:47:28.713 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-03 07:47:28.713 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 64 -> 65
+2026-10-03 07:47:28.714 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-03 08:08:17.292 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-03 08:08:17.292 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-03 08:08:17.292 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 65 -> 66
+2026-10-03 08:08:17.309 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-03 08:08:17.309 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 67 -> 67
+2026-10-03 08:08:17.323 E  MuesliApp[43738:567b6d] [com.muesli.audio:device] stream.stopped error=Error Domain=com.apple.ScreenCaptureKit.SCStreamErrorDomain Code=-3815 "Failed to find any displays or windows to capture" UserInfo={NSLocalizedDescription=Failed to find any displays or windows to capture} generation=83
+2026-10-03 08:59:56.769 Df MuesliApp[43738:141982] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]
+2026-10-03 08:59:56.771 Df MuesliApp[43738:141982] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges] finishing enqueued operations
+2026-10-03 08:59:56.772 Df MuesliApp[43738:567862] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]_block_invoke asyncing to main queue
+2026-10-03 08:59:57.447 Df MuesliApp[43738:568125] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]_block_invoke writing records
+2026-10-04 17:08:41.546 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 17:08:41.546 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 67 -> 68
+2026-10-04 17:08:41.549 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-04 17:21:36.771 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-04 17:21:36.771 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 17:21:36.771 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 68 -> 69
+2026-10-04 17:21:36.771 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 17:21:36.771 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 70 -> 70
+2026-10-04 17:25:27.333 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 17:25:27.333 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 70 -> 71
+2026-10-04 17:25:27.349 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake
+2026-10-04 17:27:37.259 Df MuesliApp[43738:141982] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]
+2026-10-04 17:27:37.262 Df MuesliApp[43738:141982] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges] finishing enqueued operations
+2026-10-04 17:27:37.262 Df MuesliApp[43738:5ab0c4] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]_block_invoke asyncing to main queue
+2026-10-04 17:27:37.262 Df MuesliApp[43738:5ac796] [com.apple.AppKit:StateRestoration] -[NSPersistentUIManager flushAllChanges]_block_invoke writing records
+2026-10-04 18:25:40.607 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayWillSleep
+2026-10-04 18:25:40.607 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 18:25:40.607 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 71 -> 72
+2026-10-04 18:25:41.010 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 18:25:41.010 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 73 -> 73
+2026-10-04 20:31:53.211 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDisplaySystemStateChanged
+2026-10-04 20:31:53.211 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: display system state seed 73 -> 74
+2026-10-04 20:31:53.218 Df MuesliApp[43738:141982] [com.apple.SkyLight:default] [43738] CGSDisplayNotifyProc: got notification kCGSDisplayDidWake

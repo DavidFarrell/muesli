@@ -1,0 +1,40 @@
+# segmented census A
+Date/Time:       2026-10-04 20:54:47.799 +0200
+    1033      49584      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+    1030     165280     160.5   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+      18        324      18.0   Swift.Optional<DesignLibrary.(SelectedSegmentState in $24b3475c0)>  Swift   libswiftCore.dylib
+       5      57728   11545.6   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+       5       1280     256.0   SwiftUI.ModifiedContent<DesignLibrary.MacSegmentedControlItem<SwiftUI.Subview>, SwiftUI._PreferenceWritingModifier<DesignLibrary.(SelectedSegmentStateKey in $24b347650)>>  Swift   SwiftUI
+
+# segmented census B
+Date/Time:       2026-10-04 20:55:28.582 +0200
+    3373     161904      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+    3370     539680     160.1   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+      18        324      18.0   Swift.Optional<DesignLibrary.(SelectedSegmentState in $24b3475c0)>  Swift   libswiftCore.dylib
+       5     229760   45952.0   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+       5       1280     256.0   SwiftUI.ModifiedContent<DesignLibrary.MacSegmentedControlItem<SwiftUI.Subview>, SwiftUI._PreferenceWritingModifier<DesignLibrary.(SelectedSegmentStateKey in $24b347650)>>  Swift   SwiftUI
+
+# custom census A
+Date/Time:       2026-10-04 20:54:49.889 +0200
+       7        336      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+       4       1120     280.0   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+       3        384     128.0   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+
+# custom census B
+Date/Time:       2026-10-04 20:55:30.892 +0200
+       7        336      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+       4       1120     280.0   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+       3        384     128.0   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+
+# menu census A
+Date/Time:       2026-10-04 20:56:09.252 +0200
+       7        336      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+       4       1120     280.0   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+       3        384     128.0   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+
+# radio census A
+Date/Time:       2026-10-04 20:56:11.284 +0200
+       7        336      48.0   Observation._ManagedCriticalState<Observation.ObservationRegistrar.(State in $2903fe570)>.(LockedBuffer in $2903fe40c)<>  Swift   libswiftObservation.dylib
+       4       1120     280.0   Swift._DictionaryStorage<Swift.Int, Observation.ObservationRegistrar.(State in $2903fe570).Observation>  Swift   libswiftCore.dylib
+       3        384     128.0   Swift._DictionaryStorage<Swift.ObjectIdentifier, SwiftUI.(ObservationEntry in $239122944)>  Swift   libswiftCore.dylib
+

@@ -189,7 +189,12 @@ struct NewMeetingView: View {
                         Text(mode.rawValue).tag(mode)
                     }
                 }
-                .pickerStyle(.segmented)
+                // Not `.segmented`: on macOS 26.6 the segmented picker leaks one
+                // Observation registrar per segment per render, and the start
+                // screen re-renders at meter rate. See
+                // engineer-notes/incident-2026-10-04-cpu-spin/RCA.md.
+                .pickerStyle(.radioGroup)
+                .horizontalRadioGroupLayout()
                 .frame(maxWidth: 420)
 
                 Spacer()
@@ -303,7 +308,9 @@ struct NewMeetingView: View {
                         Text("On").tag(AECMode.on)
                         Text("Off").tag(AECMode.off)
                     }
-                    .pickerStyle(.segmented)
+                    // Same reason as the Mode picker above: no `.segmented`.
+                    .pickerStyle(.radioGroup)
+                    .horizontalRadioGroupLayout()
 
                     Text("Auto turns echo cancellation on only with the built-in speakers.")
                         .font(.footnote)
