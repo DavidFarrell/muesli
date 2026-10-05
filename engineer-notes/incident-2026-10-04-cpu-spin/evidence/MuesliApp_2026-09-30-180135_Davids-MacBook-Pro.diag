@@ -1,0 +1,256 @@
+Date/Time:        2026-09-30 17:14:20.199 +0200
+End time:         2026-09-30 18:01:34.644 +0200
+OS Version:       macOS 26.6.2 (Build 25G83)
+Architecture:     arm64e
+Report Version:   72
+Incident Identifier: 0F6F846C-E66A-48B9-B0F2-E97339F80F49
+
+Data Source:      Microstackshots
+Shared Cache:     F2E86C53-6052-388B-BA71-5A0C9B569413 slid base address 0x18a964000, slide 0xa964000
+
+Command:          MuesliApp
+Path:             /Applications/MuesliApp.app/Contents/MacOS/MuesliApp
+Identifier:       paidiaconsulting.MuesliApp
+Version:          1.0 (1)
+Team ID:          JA9EPB8K4N
+Is First Party:   No
+Beta Identifier:  ED504523-F08B-5EB8-9D7E-4FBA18F40A58
+Resource Coalition: 1270
+Architecture:     arm64
+PID:              5894
+
+Event:            disk writes
+Action taken:     none
+Writes:           2147.53 MB of file backed memory dirtied over 2834 seconds (757.65 KB per second average), exceeding limit of 24.86 KB per second over 86400 seconds
+Writes limit:     2147.48 MB
+Limit duration:   86400s
+Writes caused:    2147.53 MB
+Writes duration:  2834s
+Duration:         2834.45s
+Duration Sampled: 2782.97s (event starts 51.47s before samples)
+Steps:            164 (1801 samples lost, 10.49 MB/step)
+
+Hardware model:   Mac16,5
+Active cpus:      16
+Memory size:      128 GB
+HW page size:     16384
+VM page size:     16384
+
+Models:           UNKNOWN
+
+OS Cryptex File Extents: 6725
+
+Heaviest stack for the target process:
+  164  start_wqthread + 8 (libsystem_pthread.dylib + 7184) [0x18ae5ec10]
+  164  _pthread_wqthread + 292 (libsystem_pthread.dylib + 11968) [0x18ae5fec0]
+  164  _dispatch_workloop_worker_thread + 720 (libdispatch.dylib + 83764) [0x18acba734]
+  164  _dispatch_root_queue_drain_deferred_wlh + 284 (libdispatch.dylib + 85556) [0x18acbae34]
+  163  _dispatch_lane_invoke + 392 (libdispatch.dylib + 43820) [0x18acb0b2c]
+  146  _dispatch_lane_serial_drain + 740 (libdispatch.dylib + 41008) [0x18acb0030]
+  146  _dispatch_client_callout + 16 (libdispatch.dylib + 111792) [0x18acc14b0]
+  146  _dispatch_call_block_and_release + 32 (libdispatch.dylib + 6696) [0x18aca7a28]
+  146  ??? (MuesliApp + 635632) [0x10479b2f0]
+  81   closure #2 in SessionArtifactStore.submitScreenshot(_:captureTimeUs:onCommitted:) + 488 (SessionArtifactStore.swift:169,21 in MuesliApp + 2302544) [0x104932250]
+  81   implicit closure #1 in default argument 6 of SessionArtifactStore.init(meetingDirectory:sourceSessionID:timeline:timelineOffsetUs:meetingAccess:shutdown:pngWriter:) + 12 (SessionArtifactStore.swift:79,43 in MuesliApp + 2291812) [0x10492f864]
+  81   static SessionArtifactStore.writePNG(_:_:) + 4 (SessionArtifactStore.swift in MuesliApp + 2291812) [0x10492f864]
+  78   specialized static SessionArtifactStore.writePNG(_:_:) + 620 (SessionArtifactStore.swift:392,15 in MuesliApp + 2318324) [0x104935ff4]
+  78   CGImageDestinationFinalize + 196 (ImageIO + 14520) [0x197fa68b8]
+  77   IIOImageDestination::finalizeDestination(unsigned long long*) + 804 (ImageIO + 1203456) [0x1980c8d00]
+  77   PNGWritePlugin::WriteProc(void*, void*, void*, void*) + 200 (ImageIO + 119356) [0x197fc023c]
+  77   PNGWritePlugin::writeAll() + 952 (ImageIO + 120384) [0x197fc0640]
+  77   PNGWritePlugin::writePNG(IIOImagePixelDataProvider*, IIODictionary*) + 1936 (ImageIO + 136948) [0x197fc46f4]
+  77   _cg_png_write_row_sized + 1088 (libPng.dylib + 140220) [0x19d4c43bc]
+  75   png_write_find_filter + 1148 (libPng.dylib + 29948) [0x19d4a94fc]
+  75   png_compress_IDAT + 420 (libPng.dylib + 32012) [0x19d4a9d0c]
+  75   _cg_png_write_complete_chunk + 76 (libPng.dylib + 27356) [0x19d4a8adc]
+  75   _cg_png_write_chunk_data + 56 (libPng.dylib + 27700) [0x19d4a8c34]
+  75   write_fn(png_struct_def*, unsigned char*, unsigned long) + 48 (ImageIO + 134972) [0x197fc3f3c]
+  75   IIOImageWriteSession::putBytes(void const*, unsigned long) + 84 (ImageIO + 15860) [0x197fa6df4]
+  75   fwrite + 300 (libsystem_c.dylib + 132156) [0x18ad1143c]
+  48   __sfvwrite + 228 (libsystem_c.dylib + 19648) [0x18acf5cc0]
+  48   __sflush + 232 (libsystem_c.dylib + 66308) [0x18ad01304]
+  48   _swrite + 108 (libsystem_c.dylib + 74340) [0x18ad03264]
+  48   __write_nocancel + 8 (libsystem_kernel.dylib + 19428) [0x18ae23be4]
+
+
+Powerstats for:   MuesliApp [5894]
+UUID:             8FB35138-B551-38CB-8636-E667E7E67802
+Path:             /Applications/MuesliApp.app/Contents/MacOS/MuesliApp
+Identifier:       paidiaconsulting.MuesliApp
+Version:          1.0 (1)
+Team ID:          JA9EPB8K4N
+Is First Party:   No
+Beta Identifier:  ED504523-F08B-5EB8-9D7E-4FBA18F40A58
+Resource Coalition: 164 samples 1270
+Architecture:     arm64
+Footprint:        73.28 MB -> 342.97 MB (+269.69 MB)
+Pageins:          12 pages
+Start time:       2026-09-30 17:15:11.668 +0200
+End time:         2026-09-30 18:01:34.643 +0200
+Num samples:      164 (100%)
+Energy:           214.74 mWh
+Num threads:      65
+Primary state:    83 samples Non-Frontmost App, Non-Suppressed, Kernel mode, Effective Thread QoS Utility, Requested Thread QoS Utility, Override Thread QoS Unspecified, p-core
+User Activity:    3 samples Idle, 161 samples Active
+Power Source:     0 samples on Battery, 164 samples on AC
+  164  start_wqthread + 8 (libsystem_pthread.dylib + 7184) [0x18ae5ec10]
+    164  _pthread_wqthread + 292 (libsystem_pthread.dylib + 11968) [0x18ae5fec0]
+      164  _dispatch_workloop_worker_thread + 720 (libdispatch.dylib + 83764) [0x18acba734]
+        164  _dispatch_root_queue_drain_deferred_wlh + 284 (libdispatch.dylib + 85556) [0x18acbae34]
+          163  _dispatch_lane_invoke + 392 (libdispatch.dylib + 43820) [0x18acb0b2c]
+            146  _dispatch_lane_serial_drain + 740 (libdispatch.dylib + 41008) [0x18acb0030]
+              146  _dispatch_client_callout + 16 (libdispatch.dylib + 111792) [0x18acc14b0]
+                146  _dispatch_call_block_and_release + 32 (libdispatch.dylib + 6696) [0x18aca7a28]
+                  146  ??? (MuesliApp + 635632) [0x10479b2f0]
+                    81   closure #2 in SessionArtifactStore.submitScreenshot(_:captureTimeUs:onCommitted:) + 488 (SessionArtifactStore.swift:169,21 in MuesliApp + 2302544) [0x104932250]
+                      81   implicit closure #1 in default argument 6 of SessionArtifactStore.init(meetingDirectory:sourceSessionID:timeline:timelineOffsetUs:meetingAccess:shutdown:pngWriter:) + 12 (SessionArtifactStore.swift:79,43 in MuesliApp + 2291812) [0x10492f864]
+                        81   static SessionArtifactStore.writePNG(_:_:) + 4 (SessionArtifactStore.swift in MuesliApp + 2291812) [0x10492f864]
+                          78   specialized static SessionArtifactStore.writePNG(_:_:) + 620 (SessionArtifactStore.swift:392,15 in MuesliApp + 2318324) [0x104935ff4]
+                            78   CGImageDestinationFinalize + 196 (ImageIO + 14520) [0x197fa68b8]
+                              77   IIOImageDestination::finalizeDestination(unsigned long long*) + 804 (ImageIO + 1203456) [0x1980c8d00]
+                                77   PNGWritePlugin::WriteProc(void*, void*, void*, void*) + 200 (ImageIO + 119356) [0x197fc023c]
+                                  77   PNGWritePlugin::writeAll() + 952 (ImageIO + 120384) [0x197fc0640]
+                                    77   PNGWritePlugin::writePNG(IIOImagePixelDataProvider*, IIODictionary*) + 1936 (ImageIO + 136948) [0x197fc46f4]
+                                      77   _cg_png_write_row_sized + 1088 (libPng.dylib + 140220) [0x19d4c43bc]
+                                        75   png_write_find_filter + 1148 (libPng.dylib + 29948) [0x19d4a94fc]
+                                          75   png_compress_IDAT + 420 (libPng.dylib + 32012) [0x19d4a9d0c]
+                                            75   _cg_png_write_complete_chunk + 76 (libPng.dylib + 27356) [0x19d4a8adc]
+                                              75   _cg_png_write_chunk_data + 56 (libPng.dylib + 27700) [0x19d4a8c34]
+                                                75   write_fn(png_struct_def*, unsigned char*, unsigned long) + 48 (ImageIO + 134972) [0x197fc3f3c]
+                                                  75   IIOImageWriteSession::putBytes(void const*, unsigned long) + 84 (ImageIO + 15860) [0x197fa6df4]
+                                                    75   fwrite + 300 (libsystem_c.dylib + 132156) [0x18ad1143c]
+                                                      48   __sfvwrite + 228 (libsystem_c.dylib + 19648) [0x18acf5cc0]
+                                                        48   __sflush + 232 (libsystem_c.dylib + 66308) [0x18ad01304]
+                                                          48   _swrite + 108 (libsystem_c.dylib + 74340) [0x18ad03264]
+                                                            48   __write_nocancel + 8 (libsystem_kernel.dylib + 19428) [0x18ae23be4]
+                                                      27   __sfvwrite + 464 (libsystem_c.dylib + 19884) [0x18acf5dac]
+                                                        27   _swrite + 108 (libsystem_c.dylib + 74340) [0x18ad03264]
+                                                          27   __write_nocancel + 8 (libsystem_kernel.dylib + 19428) [0x18ae23be4]
+                                                            1    <Frontmost App>
+                                        2    png_write_find_filter + 1180 (libPng.dylib + 29980) [0x19d4a951c]
+                                          2    png_compress_IDAT + 420 (libPng.dylib + 32012) [0x19d4a9d0c]
+                                            2    _cg_png_write_complete_chunk + 76 (libPng.dylib + 27356) [0x19d4a8adc]
+                                              2    _cg_png_write_chunk_data + 56 (libPng.dylib + 27700) [0x19d4a8c34]
+                                                2    write_fn(png_struct_def*, unsigned char*, unsigned long) + 48 (ImageIO + 134972) [0x197fc3f3c]
+                                                  2    IIOImageWriteSession::putBytes(void const*, unsigned long) + 84 (ImageIO + 15860) [0x197fa6df4]
+                                                    2    fwrite + 300 (libsystem_c.dylib + 132156) [0x18ad1143c]
+                                                      1    __sfvwrite + 464 (libsystem_c.dylib + 19884) [0x18acf5dac]
+                                                        1    _swrite + 108 (libsystem_c.dylib + 74340) [0x18ad03264]
+                                                          1    __write_nocancel + 8 (libsystem_kernel.dylib + 19428) [0x18ae23be4]
+                                                      1    __sfvwrite + 228 (libsystem_c.dylib + 19648) [0x18acf5cc0]
+                                                        1    __sflush + 232 (libsystem_c.dylib + 66308) [0x18ad01304]
+                                                          1    _swrite + 108 (libsystem_c.dylib + 74340) [0x18ad03264]
+                                                            1    __write_nocancel + 8 (libsystem_kernel.dylib + 19428) [0x18ae23be4]
+                              1    IIOImageDestination::finalizeDestination(unsigned long long*) + 1004 (ImageIO + 1203656) [0x1980c8dc8]
+                                1    IIOImageWriteSession::finalize(int) + 324 (ImageIO + 793052) [0x1980649dc]
+                                  1    __rename + 8 (libsystem_kernel.dylib + 18572) [0x18ae2388c]
+                          3    specialized static SessionArtifactStore.writePNG(_:_:) + 572 (SessionArtifactStore.swift:388,33 in MuesliApp + 2318276) [0x104935fc4]
+                            3    CGImageDestinationCreateWithURL + 464 (ImageIO + 149392) [0x197fc7790]
+                              3    IIOImageDestination::IIOImageDestination(__CFURL const*, IIO_Writer*, __CFString const*, unsigned long, IIODictionary*) + 132 (ImageIO + 1173792) [0x1980c1920]
+                                3    CGImageWriteSessionCreateWithURL + 260 (ImageIO + 346968) [0x197ff7b58]
+                                  3    CGImageWriteSessionCreateWithFile + 76 (ImageIO + 347160) [0x197ff7c18]
+                                    3    IIOImageWriteSession::IIOImageWriteSession(__CFString const*, bool) + 244 (ImageIO + 2591944) [0x19821bcc8]
+                                      3    fopen + 220 (libsystem_c.dylib + 67516) [0x18ad017bc]
+                                        3    __open_nocancel + 8 (libsystem_kernel.dylib + 6472) [0x18ae20948]
+                    48   LocalAudioRecorder.drain() + 624 (LocalAudioRecorder.swift:426,22 in MuesliApp + 1818632) [0x1048bc008]
+                      48   LocalAudioRecorder.append(_:) + 2292 (LocalAudioRecorder.swift:489,24 in MuesliApp + 1827784) [0x1048be3c8]
+                        48   NSFileHandle.write<A>(contentsOf:) + 944 (Foundation + 1582900) [0x18c894734]
+                          48   specialized NSFileHandle.write<A>(contentsOf:) + 2016 (Foundation + 1580508) [0x18c893ddc]
+                            48   write + 8 (libsystem_kernel.dylib + 18484) [0x18ae23834]
+                              33   <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated, e-core>
+                              15   <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated>
+                    16   LocalAudioRecorder.closeOnQueue() + 376 (LocalAudioRecorder.swift:601,26 in MuesliApp + 1824024) [0x1048bd518]
+                      16   static LocalAudioRecorder.exportWAVs(manifest:directory:beforeIO:) + 12 (<compiler-generated> in MuesliApp + 1824024) [0x1048bd518]
+                        16   specialized static LocalAudioRecorder.exportWAVs(manifest:directory:beforeIO:) + 1208 (LocalAudioRecorder.swift:741,28 in MuesliApp + 1834664) [0x1048bfea8]
+                          16   NSFileHandle.write<A>(contentsOf:) + 944 (Foundation + 1582900) [0x18c894734]
+                            16   specialized NSFileHandle.write<A>(contentsOf:) + 2016 (Foundation + 1580508) [0x18c893ddc]
+                              16   write + 8 (libsystem_kernel.dylib + 18484) [0x18ae23834]
+                                16   <Frontmost App, Effective Thread QoS User Initiated, Requested Thread QoS User Initiated>
+                    1    closure #2 in SessionArtifactStore.submitScreenshot(_:captureTimeUs:onCommitted:) + 1136 (SessionArtifactStore.swift:177,21 in MuesliApp + 2303192) [0x1049324d8]
+                      1    SessionArtifactStore.append(_:) + 756 (SessionArtifactStore.swift:365,24 in MuesliApp + 2305124) [0x104932c64]
+                        1    NSFileHandle.write<A>(contentsOf:) + 944 (Foundation + 1582900) [0x18c894734]
+                          1    specialized NSFileHandle.write<A>(contentsOf:) + 2016 (Foundation + 1580508) [0x18c893ddc]
+                            1    write + 8 (libsystem_kernel.dylib + 18484) [0x18ae23834]
+            17   _dispatch_lane_serial_drain + 332 (libdispatch.dylib + 40600) [0x18acafe98]
+              17   _dispatch_source_invoke + 844 (libdispatch.dylib + 97924) [0x18acbde84]
+                17   _dispatch_source_latch_and_call + 392 (libdispatch.dylib + 102832) [0x18acbf1b0]
+                  17   _dispatch_continuation_pop + 596 (libdispatch.dylib + 25032) [0x18acac1c8]
+                    17   _dispatch_client_callout + 16 (libdispatch.dylib + 111792) [0x18acc14b0]
+                      17   ??? (MuesliApp + 635632) [0x10479b2f0]
+                        16   closure #3 in LocalAudioRecorder.init(directory:sessionID:timelineOffsetUs:maxPendingBytes:maximumDurationSeconds:commitInterval:shutdown:beforeIO:) + 60 (LocalAudioRecorder.swift:255,54 in MuesliApp + 1803000) [0x1048b82f8]
+                          15   LocalAudioRecorder.commitIfNeeded() + 3140 (LocalAudioRecorder.swift:569,22 in MuesliApp + 1806164) [0x1048b8f54]
+                            15   static LocalAudioRecorder.writeManifest(_:directory:) + 12 (<compiler-generated> in MuesliApp + 1806164) [0x1048b8f54]
+                              14   specialized static LocalAudioRecorder.writeManifest(_:directory:) + 852 (LocalAudioRecorder.swift:705,38 in MuesliApp + 1842552) [0x1048c1d78]
+                                14   Data.write(to:options:) + 3076 (Foundation + 3936028) [0x18cad2f1c]
+                                  14   closure #1 in writeToFileNoAux(path:buffer:options:attributes:reportProgress:) + 408 (Foundation + 4120128) [0x18caffe40]
+                                    14   write + 8 (libsystem_kernel.dylib + 18484) [0x18ae23834]
+                                      8    <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated, e-core>
+                                      6    <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated>
+                              1    specialized static LocalAudioRecorder.writeManifest(_:directory:) + 1224 (LocalAudioRecorder.swift:710,15 in MuesliApp + 1842924) [0x1048c1eec]
+                                1    __rename + 8 (libsystem_kernel.dylib + 18572) [0x18ae2388c]
+                                  1    <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated>
+                          1    LocalAudioRecorder.commitIfNeeded() + 2484 (LocalAudioRecorder.swift:560,28 in MuesliApp + 1805508) [0x1048b8cc4]
+                            1    -[NSConcreteFileHandle synchronizeAndReturnError:] + 36 (Foundation + 10940384) [0x18d180fe0]
+                              1    fsync + 8 (libsystem_kernel.dylib + 18436) [0x18ae23804]
+                                1    <Effective Thread QoS User Initiated, Requested Thread QoS User Initiated, e-core>
+                        1    partial apply for closure #1 in closure #1 in BackendOutputReader.prepare() + 20 (<compiler-generated> in MuesliApp + 1367068) [0x10484dc1c]
+                          1    closure #1 in closure #1 in BackendOutputReader.prepare() + 68 (MuesliApp + 1355212) [0x10484adcc]
+                            1    BackendOutputReader.readAvailable(isStdout:) + 380 (BackendOutputReader.swift:300,17 in MuesliApp + 1354528) [0x10484ab20]
+                              1    BackendOutputReader.consume(_:isStdout:) + 1720 (BackendOutputReader.swift:337,48 in MuesliApp + 1362324) [0x10484c994]
+                                1    BackendOutputReader.acceptLine(_:requiresCompleteJSON:) + 3128 (BackendOutputReader.swift:383,29 in MuesliApp + 1365652) [0x10484d694]
+                                  1    NSFileHandle.write<A>(contentsOf:) + 944 (Foundation + 1582900) [0x18c894734]
+                                    1    specialized NSFileHandle.write<A>(contentsOf:) + 2016 (Foundation + 1580508) [0x18c893ddc]
+                                      1    write + 8 (libsystem_kernel.dylib + 18484) [0x18ae23834]
+          1    _dispatch_lane_invoke + 448 (libdispatch.dylib + 43876) [0x18acb0b64]
+            1    _dispatch_lane_serial_drain + 332 (libdispatch.dylib + 40600) [0x18acafe98]
+              1    _dispatch_lane_invoke + 448 (libdispatch.dylib + 43876) [0x18acb0b64]
+                1    _dispatch_lane_serial_drain + 740 (libdispatch.dylib + 41008) [0x18acb0030]
+                  1    _dispatch_client_callout + 16 (libdispatch.dylib + 111792) [0x18acc14b0]
+                    1    _dispatch_block_async_invoke2 + 148 (libdispatch.dylib + 69380) [0x18acb6f04]
+                      1    invocation function for block in CI::ProgramNode::create_program_and_arguments(CI::Context*, char const*) + 1664 (CoreImage + 2707948) [0x1985791ec]
+                        1    CI::MetalMainProgram::compileAsync(CI::NodeIndex) + 316 (CoreImage + 2362660) [0x198524d24]
+                          1    _dispatch_lane_barrier_sync_invoke_and_complete + 56 (libdispatch.dylib + 70496) [0x18acb7360]
+                            1    _dispatch_client_callout + 16 (libdispatch.dylib + 111792) [0x18acc14b0]
+                              1    CI::MetalDAGProgram::compile(CI::NodeIndex) + 396 (CoreImage + 2560340) [0x198555154]
+                                1    CI::StitchableFunctionDAGDescriptor::compile(char const*, char const*, CI::CoreImageDylib*, id<MTLDevice>, CI::ProgramDigest) + 216 (CoreImage + 2594992) [0x19855d8b0]
+                                  1    CIMetalComputePipelineStateCreateFromDagDescriptor + 108 (CoreImage + 1483124) [0x19844e174]
+                                    1    CreateStitchedFunctionFromDescriptor + 148 (CoreImage + 1482796) [0x19844e02c]
+                                      1    -[_MTLDevice newLibraryWithStitchedDescriptor:error:] + 296 (Metal + 1058108) [0x1975da53c]
+                                        1    MTLLibraryBuilder::newLibraryWithDAG(NSString*, NSArray<id<MTLFunction>>*, NSError**, std::__1::shared_ptr<NSError**::vector<stitchedAirDescriptor, NSError**::allocator<NSError**::vector>>>, unsigned long, NSArray<id<MTLBinaryArchive>>*, objc_object, objc_object*) + 272 (Metal + 1427380) [0x1976347b4]
+                                          1    MTLLibraryBuilder::newLibraryWithDAG(NSString*, NSArray<id<MTLFunction>>*, void (id<MTLLibrary>, NSError*) block_pointer, bool, std::__1::shared_ptr<void (id<MTLLibrary>, NSError*)::vector<stitchedAirDescriptor, void (id<MTLLibrary>, NSError*)::allocator<std::__1::shared_ptr>>>, unsigned long, NSArray<id<MTLBinaryArchive>>*, std::__1::shared_ptr<void (id<MTLLibrary>, NSError*)::vector<stitchedAirDescriptor, void (id<MTLLibrary>, NSError*)::allocator<std::__1::shared_ptr>>>, objc_object*) + 680 (Metal + 1428312) [0x197634b58]
+                                            1    MultiLevelLibraryCache::newStitchedLibraryWithKey(MTLHashKey const&, std::__1::vector<stitchedAirDescriptor, std::__1::allocator<stitchedAirDescriptor>> const*, MTLLibraryContainer*&, bool&, MTLLibraryData* (NSObject<OS_dispatch_data>*) block_pointer) + 236 (Metal + 236744) [0x197511cc8]
+                                              1    MultiLevelCacheBase::getElement(MTLUINT256_t const*, NSObject<OS_dispatch_data>*&) + 112 (Metal + 231912) [0x1975109e8]
+                                                1    MTLCompilerFSCache::getElementImpl(MTLUINT256_t, void**, unsigned long*) + 132 (Metal + 382588) [0x19753567c]
+                                                  1    MTLCompilerFSCache::openSync() + 428 (Metal + 116016) [0x1974f4530]
+                                                    1    fscache_open_with_key + 92 (libCoreFSCache.dylib + 1916) [0x230ba377c]
+                                                      1    fscache_open_worker + 472 (libCoreFSCache.dylib + 2436) [0x230ba3984]
+                                                        1    fsetxattr + 8 (libsystem_kernel.dylib + 25248) [0x18ae252a0]
+                                                          1    <e-core>
+
+  Binary Images:
+           0x104700000 -        0x104a67fff  paidiaconsulting.MuesliApp 1.0 (1)      <8FB35138-B551-38CB-8636-E667E7E67802>  /Applications/MuesliApp.app/Contents/MacOS/MuesliApp
+           0x18aca6000 -        0x18aced23f  libdispatch.dylib (1542.160.2)          <B2000CD5-F580-314A-A141-E036719D854E>  /usr/lib/system/libdispatch.dylib
+           0x18acf1000 -        0x18ad721e7  libsystem_c.dylib (1752.160.4)          <D77CEB62-AFF6-3CEC-BA9B-4F057FBE2EB5>  /usr/lib/system/libsystem_c.dylib
+           0x18ae1f000 -        0x18ae5c2e7  libsystem_kernel.dylib (12377.161.14)   <C6A4A4CB-92E6-3BAF-AAE0-E8306259209A>  /usr/lib/system/libsystem_kernel.dylib
+           0x18ae5d000 -        0x18ae69b3b  libsystem_pthread.dylib (539.100.4)     <A373F0B0-9880-326A-88B4-DD8BE4E33072>  /usr/lib/system/libsystem_pthread.dylib
+           0x18c712000 -        0x18d6f5a9f  com.apple.Foundation 6.9 (5026.6.7)     <91DACE39-FA28-3191-818D-1FCC6A0E615A>  /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+           0x1974d8000 -        0x1977b1e1f  com.apple.Metal 373.7 (373.7)           <493E76D9-74D4-333B-A3B2-E5F9BC86429D>  /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+           0x197fa3000 -        0x1982e3f1f  com.apple.ImageIO 3.3.0 (2784.6.4)      <C9CF487D-E759-3F94-ABEB-7AE5EB39AF7D>  /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+           0x1982e4000 -        0x1987cef9f  com.apple.CoreImage 19.0.0 (1592.120.2) <0943679D-FF88-3F18-BE4B-D8B4827AB0B5>  /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage
+           0x19d4a2000 -        0x19d4cc01f  libPng.dylib (2784.6.6)                 <C880ABD1-01CC-39F9-9144-E5DE22D0595F>  /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libPng.dylib
+           0x230ba3000 -        0x230baa2c3  libCoreFSCache.dylib (352.2)            <2C410B78-B9A5-30DC-8D83-FFEC1277F34C>  /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreFSCache.dylib
+
+System Profile:
+Network Service: Wi-Fi, AirPort, en0
+Boot Volume File System Type: apfs
+Memory Module: LPDDR5, Hynix
+Thunderbolt Bus: MacBook Pro, Apple Inc.
+Thunderbolt Bus: MacBook Pro, Apple Inc.
+Thunderbolt Bus: MacBook Pro, Apple Inc.
+Display: Color LCD, 3456 x 2234 Retina, Main, MirrorOff, Online
+Model: Mac16,5, BootROM 18000.161.10, proc 16:12:4:0 processors, 128 GB, SMC 
+Graphics: Apple M4 Max, Apple M4 Max, Built-In
+AirPort: spairport_wireless_card_type_wifi (0x14E4, 0x4388), wl0: Jul 10 2026 02:04:56 version 23.50.20.2.41.51.209 FWID 01-fa2c3dc1
+IO80211_driverkit-1566.5 "IO80211_driverkit-1566.5" Jul 31 2026 19:08:25
+AirPort: 
+Bluetooth: Version (null), 0 services, 0 devices, 0 incoming serial ports
