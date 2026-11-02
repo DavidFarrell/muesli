@@ -29,7 +29,8 @@ import Foundation
 /// passed, so trailing fires from the same burst cannot arm the replacement
 /// capture. `reset()` (per capture generation) keeps that fence. Tradeoff: a
 /// genuinely new route failure inside the cooldown is not detected (callers
-/// lift the fence with `liftCooldown()` when a request is withdrawn).
+/// lift the fence with `withdrawRequest()` when a request is withdrawn; the
+/// route window is kept until a restart actually commits and calls `reset()`).
 /// Buffer timestamps may run at most `futureToleranceUs` ahead of now.
 /// All times are host-clock microseconds, as used for capture timestamps.
 nonisolated struct SystemRouteSilenceDetector: Sendable {
@@ -47,6 +48,9 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
     /// Silence-run start seen at the first threshold crossing, and when.
     private var suspectRunStartUs: Int64?
     private var suspectSinceUs: Int64?
+    /// A recovery request is outstanding: no further decisions until it is
+    /// withdrawn or the capture generation is reset by a committed restart.
+    private(set) var requestOutstanding = false
 
     enum Decision: Equatable { case none, expired, suspect, cleared, recover(silentForUs: Int64) }
 
@@ -61,13 +65,19 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
         return true
     }
 
-    /// A withdrawn request was a false alarm: do not let it hide later faults.
-    mutating func liftCooldown() { cooldownUntilUs = nil }
+    /// A withdrawn request was a false alarm: keep the route window armed and
+    /// lift the cooldown so neither can hide a later fault.
+    mutating func withdrawRequest() {
+        requestOutstanding = false
+        cooldownUntilUs = nil
+        suspectRunStartUs = nil; suspectSinceUs = nil
+    }
 
     /// Clears the armed burst for a new capture generation. The cooldown fence survives.
     mutating func reset() {
         routeChangeUs = nil; latestRouteChangeUs = nil
         suspectRunStartUs = nil; suspectSinceUs = nil
+        requestOutstanding = false
     }
 
     /// - Parameters:
@@ -75,7 +85,7 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
     ///   - lastNonZeroEndUs: end time of the most recent buffer that held any
     ///     non-zero sample; nil if none has been seen in this generation.
     mutating func evaluate(nowUs: Int64, lastCaptureUs: Int64?, lastNonZeroEndUs: Int64?) -> Decision {
-        guard let route = routeChangeUs, let latestRoute = latestRouteChangeUs else { return .none }
+        guard !requestOutstanding, let route = routeChangeUs, let latestRoute = latestRouteChangeUs else { return .none }
         let latestRunStart = latestRoute + armWindowUs
         let fresh = lastCaptureUs.map { nowUs - $0 <= callbackFreshnessUs && $0 - nowUs <= futureToleranceUs } ?? false
         if let lastCaptureUs, let runStart = lastNonZeroEndUs, fresh,
@@ -94,7 +104,8 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
                 return .suspect
             }
             guard nowUs - since >= confirmUs else { return .none }
-            reset()
+            suspectRunStartUs = nil; suspectSinceUs = nil
+            requestOutstanding = true
             cooldownUntilUs = nowUs + cooldownUs
             return .recover(silentForUs: lastCaptureUs - runStart)
         }

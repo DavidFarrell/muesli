@@ -526,7 +526,7 @@ final class CaptureEngine: NSObject {
               health.withdrawRecovery(generation: generation) else { return false }
         pendingSilenceRecovery = nil
         awaitingRestore = nil
-        routeSilence.liftCooldown()
+        routeSilence.withdrawRequest()
         AudioLog.event("system.silence-recovery.withdrawn", ["generation": generation])
         return true
     }
@@ -598,6 +598,11 @@ final class CaptureEngine: NSObject {
         guard let request, !operationOwner.isBusy else { return false }
         let intent = desiredIntent.revision
         guard desiredIntent.matches(intent) else { return false }
+        // Last content check before committing anything (video reservation,
+        // native stop): a queued speculative silence restart must not stop
+        // audio that has returned. Nothing below suspends before stopCapture
+        // except the stop itself.
+        if let snapshot = relay?.snapshot(), withdrawSilenceRecoveryIfAudioReturned(snapshot) { return false }
         let recordingURL: URL?
         if request.recordingURL != nil {
             guard let nextURL = recoveryRecordingURLProvider?() else {
@@ -606,9 +611,6 @@ final class CaptureEngine: NSObject {
             }
             recordingURL = nextURL
         } else { recordingURL = nil }
-        // Last content check before committing the native stop: a queued
-        // speculative silence restart must not stop audio that has returned.
-        if let snapshot = relay?.snapshot(), withdrawSilenceRecoveryIfAudioReturned(snapshot) { return false }
         guard await stopCapture(preserveRequest: true), desiredIntent.matches(intent) else { return false }
         do {
             try await startCapture(contentFilter: request.filter, writer: request.writer, recordTo: recordingURL,

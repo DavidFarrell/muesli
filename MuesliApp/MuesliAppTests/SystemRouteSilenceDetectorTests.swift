@@ -90,13 +90,24 @@ final class SystemRouteSilenceDetectorTests: XCTestCase {
         XCTAssertEqual(recoveries(decisions), [113 * s], "Suspected at 111, confirmed at 113")
     }
 
-    func testLiftedCooldownLetsALaterFaultArm() {
+    func testWithdrawalLiftsCooldown() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 100 * s)
         XCTAssertEqual(recoveries(run(&detector, from: 100 * s, to: 110 * s) { _ in 101 * s }).count, 1)
         XCTAssertFalse(detector.noteRouteChange(atUs: 110 * s))
-        detector.liftCooldown() // the request was withdrawn: it was a false alarm
+        detector.withdrawRequest() // the request was a false alarm
         XCTAssertTrue(detector.noteRouteChange(atUs: 111 * s))
+    }
+
+    func testWithdrawalKeepsTheRouteWindowForALaterFault() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        // Zeros from 101 -> request at 106; audio resumes 106.5 -> withdrawn at 107;
+        // persistent zeros from 108, still inside the original window.
+        XCTAssertEqual(recoveries(run(&detector, from: 100 * s, to: 106 * s) { _ in 101 * s }), [106 * s])
+        detector.withdrawRequest()
+        let later = run(&detector, from: 107 * s, to: 130 * s) { $0 < 108 * s ? $0 : 108 * s }
+        XCTAssertEqual(recoveries(later), [113 * s])
     }
 
     func testWithdrawalDecisionBeforeNativeStop() {
