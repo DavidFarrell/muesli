@@ -216,6 +216,9 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
     private var convertedFrames = 0
     private var formatEpoch = 0
     private var lastCaptureTimeUs: Int64?
+    /// End time of the latest callback holding any non-zero converted sample.
+    /// Exact digital silence is how a stalled SCK route presents.
+    private var lastNonZeroEndUs: Int64?
     private var previousNativeEnd: Int64?
     private var previousHostUs: Int64?
     private var previousCallbackFrames = 0
@@ -233,6 +236,7 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
         let conversionFailures: Int
         let formatEpoch: Int
         let lastCaptureTimeUs: Int64?
+        let lastNonZeroEndUs: Int64?
         let nativeSampleRate: Double
         let nativeChannels: Int
         let observedIntervals: Int64
@@ -245,7 +249,7 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
         lock.withLock {
             Snapshot(callbackCount: callbackCount, convertedFrames: convertedFrames,
                      conversionFailures: conversionFailures, formatEpoch: formatEpoch,
-                     lastCaptureTimeUs: lastCaptureTimeUs, nativeSampleRate: nativeRate,
+                     lastCaptureTimeUs: lastCaptureTimeUs, lastNonZeroEndUs: lastNonZeroEndUs, nativeSampleRate: nativeRate,
                      nativeChannels: nativeChannels, observedIntervals: observedIntervals,
                      uncertainIntervals: uncertainIntervals, minimumClockRatio: minimumClockRatio,
                      maximumClockRatio: maximumClockRatio)
@@ -326,6 +330,9 @@ nonisolated final class MicCaptureProcessor: @unchecked Sendable {
                                    hostFrame: Double(captureTimeUs - epochUs) * 16000 / 1_000_000)
             }
             let data = try converter.convertToInt16(buffer: buffer)
+            if data.contains(where: { $0 != 0 }) {
+                lastNonZeroEndUs = captureTimeUs + Int64((Double(buffer.frameLength) * 1_000_000 / buffer.format.sampleRate).rounded())
+            }
             retimer?.append(data)
             nativeFrames += Int64(buffer.frameLength)
             totalNativeFrames += Int64(buffer.frameLength)

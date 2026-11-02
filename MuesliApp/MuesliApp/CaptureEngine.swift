@@ -226,6 +226,13 @@ final class CaptureEngine: NSObject {
     private var stopping = false
     private var lastSourceProblemCount = 0
     private var observedNativeStop = false
+    private var routeSilence = SystemRouteSilenceDetector()
+    private static let silenceRecoveryMessage = "System audio went silent after an output-device change; restarting system capture."
+    /// A speculative restart requested but not yet started: its generation and silence-run start.
+    private var pendingSilenceRecovery: (generation: Int, runStartUs: Int64)?
+    /// After a silence restart: whether audio actually came back is checked
+    /// on later generations (a successful restart alone proves nothing).
+    private var awaitingRestore: (sinceUs: Int64, fromGeneration: Int)?
     private(set) var health = CaptureSourceHealth()
     var recoveryRecordingURLProvider: (() -> URL?)?
     private struct Request {
@@ -270,6 +277,8 @@ final class CaptureEngine: NSObject {
         health.begin(generation: generation)
         lastSourceProblemCount = 0
         observedNativeStop = false
+        routeSilence.reset()
+        pendingSilenceRecovery = nil
         stopping = false
         let currentGeneration = generation
         meetingStartPTS = timeline.epochPTS
@@ -403,6 +412,10 @@ final class CaptureEngine: NSObject {
         if !preserveRequest {
             desiredIntent.retire()
             request = nil
+            // Explicit retirement ends any silence-recovery bookkeeping; it
+            // must not be reported against a later, unrelated capture.
+            pendingSilenceRecovery = nil
+            awaitingRestore = nil
         }
         guard let native = nativeSource else {
             if !operationOwner.isBusy, !preserveRequest { health.reset() }
@@ -458,8 +471,91 @@ final class CaptureEngine: NSObject {
         }
         if !observeSystemSourceProblems(), let snapshot = relay?.snapshot() {
             _ = health.progress(frames: snapshot.convertedFrames, generation: generation)
+            observeSilenceAfterRouteChange(snapshot)
+        } else if let snapshot = relay?.snapshot() {
+            withdrawSilenceRecoveryIfAudioReturned(snapshot)
         }
         return allowRecovery && !operationOwner.isBusy && health.shouldRecover(requireContinuousCallbacks: false)
+    }
+
+    /// Called for every output-route notification, including ones that keep
+    /// the same device ID (a Bluetooth headset re-registering). `hostUs` is
+    /// stamped in the CoreAudio callback, before any main-thread hop.
+    func noteOutputRouteChanged(atHostUs hostUs: Int64) {
+        guard relay != nil, !stopping, !retirementPending else { return }
+        let armed = routeSilence.noteRouteChange(atUs: hostUs)
+        AudioLog.event(armed ? "system.route-change.armed" : "system.route-change.cooldown", ["generation": generation])
+    }
+
+    private static func hostNowUs() -> Int64 {
+        CaptureTimeline.microseconds(hostTime: mach_absolute_time())
+    }
+
+    /// SCK can keep delivering on-time buffers of exact zeros after a route
+    /// change, which callback-based supervision reads as healthy. Fail the
+    /// generation so the existing shouldRecover -> restartCapture path runs.
+    private func observeSilenceAfterRouteChange(_ snapshot: MicCaptureProcessor.Snapshot) {
+        let nowUs = Self.hostNowUs()
+        verifyRestoreAfterSilenceRecovery(snapshot, nowUs: nowUs)
+        guard health.phase == .healthy else { return }
+        switch routeSilence.evaluate(nowUs: nowUs, lastCaptureUs: snapshot.lastCaptureTimeUs,
+                                     lastNonZeroEndUs: snapshot.lastNonZeroEndUs) {
+        case .none: return
+        case .suspect:
+            AudioLog.event("system.route-change.silence-suspected", ["generation": generation])
+        case .cleared:
+            AudioLog.event("system.route-change.audio-continued", ["generation": generation])
+        case .expired:
+            AudioLog.event("system.route-change.no-silence", ["generation": generation])
+        case .recover(let silentForUs):
+            AudioLog.error("system.silent-after-route-change", ["generation": generation, "silent_ms": silentForUs / 1000])
+            pendingSilenceRecovery = (generation, snapshot.lastNonZeroEndUs ?? 0)
+            awaitingRestore = (nowUs, generation)
+            health.fail(Self.silenceRecoveryMessage)
+        }
+    }
+
+    /// Recheck content before the restart is claimed: if non-zero audio has
+    /// arrived since the silence began, the stream is fine; keep it.
+    @discardableResult
+    private func withdrawSilenceRecoveryIfAudioReturned(_ snapshot: MicCaptureProcessor.Snapshot) -> Bool {
+        guard let pending = pendingSilenceRecovery,
+              Self.audioReturned(pendingGeneration: pending.generation, currentGeneration: generation,
+                                 runStartUs: pending.runStartUs, lastNonZeroEndUs: snapshot.lastNonZeroEndUs),
+              health.message == Self.silenceRecoveryMessage, relay?.stopError == nil,
+              health.withdrawRecovery(generation: generation) else { return false }
+        pendingSilenceRecovery = nil
+        awaitingRestore = nil
+        routeSilence.withdrawRequest()
+        AudioLog.event("system.silence-recovery.withdrawn", ["generation": generation])
+        return true
+    }
+
+    /// Automatic (watchdog) restarts act only on a still-failed source; a
+    /// user-initiated restart (Refresh) is unconditional, as before.
+    nonisolated static func automaticRestartStillRequired(isAutomatic: Bool, sourceInvalidated: Bool) -> Bool {
+        !isAutomatic || sourceInvalidated
+    }
+
+    /// Pure decision behind withdrawal, shared by supervision and the pre-stop check.
+    nonisolated static func audioReturned(pendingGeneration: Int, currentGeneration: Int,
+                                          runStartUs: Int64, lastNonZeroEndUs: Int64?) -> Bool {
+        guard pendingGeneration == currentGeneration, let lastNonZeroEndUs else { return false }
+        return lastNonZeroEndUs > runStartUs
+    }
+
+    private func verifyRestoreAfterSilenceRecovery(_ snapshot: MicCaptureProcessor.Snapshot, nowUs: Int64) {
+        guard let awaiting = awaitingRestore, generation != awaiting.fromGeneration else { return }
+        if snapshot.lastNonZeroEndUs != nil {
+            awaitingRestore = nil
+            AudioLog.event("system.silence-recovery.audio-restored", ["generation": generation])
+        } else if nowUs - awaiting.sinceUs > 20_000_000 {
+            awaitingRestore = nil
+            AudioLog.error("system.silence-recovery.still-silent", ["generation": generation])
+            debugSystemErrorMessage = "System capture restarted after an output-device change, but no system audio has returned yet."
+            debugAudioErrors += 1
+            metersModel?.setSystemError(message: debugSystemErrorMessage, errorCount: debugAudioErrors)
+        }
     }
 
     /// The notification task may be behind Refresh or a meter task on
@@ -508,6 +604,17 @@ final class CaptureEngine: NSObject {
         guard let request, !operationOwner.isBusy else { return false }
         let intent = desiredIntent.revision
         guard desiredIntent.matches(intent) else { return false }
+        // A queued automatic recovery whose failure has since been withdrawn
+        // (or otherwise cleared) is no longer required: do nothing.
+        guard Self.automaticRestartStillRequired(isAutomatic: expectedRequest != nil, sourceInvalidated: health.invalidated) else {
+            AudioLog.event("system.restart.skipped-no-longer-required", ["generation": generation])
+            return false
+        }
+        // Last content check before committing anything (video reservation,
+        // native stop): a queued speculative silence restart must not stop
+        // audio that has returned. Nothing below suspends before stopCapture
+        // except the stop itself.
+        if let snapshot = relay?.snapshot(), withdrawSilenceRecoveryIfAudioReturned(snapshot) { return false }
         let recordingURL: URL?
         if request.recordingURL != nil {
             guard let nextURL = recoveryRecordingURLProvider?() else {

@@ -120,6 +120,7 @@
 				CapturedMicAudio.swift,
 				CaptureEngine.swift,
 				CaptureSourceHealth.swift,
+				SystemRouteSilenceDetector.swift,
 				CapturePowerLifecycle.swift,
 				SystemPowerObserver.swift,
 				CaptureOperationOwner.swift,
