@@ -412,6 +412,10 @@ final class CaptureEngine: NSObject {
         if !preserveRequest {
             desiredIntent.retire()
             request = nil
+            // Explicit retirement ends any silence-recovery bookkeeping; it
+            // must not be reported against a later, unrelated capture.
+            pendingSilenceRecovery = nil
+            awaitingRestore = nil
         }
         guard let native = nativeSource else {
             if !operationOwner.isBusy, !preserveRequest { health.reset() }
@@ -513,14 +517,25 @@ final class CaptureEngine: NSObject {
 
     /// Recheck content before the restart is claimed: if non-zero audio has
     /// arrived since the silence began, the stream is fine; keep it.
-    private func withdrawSilenceRecoveryIfAudioReturned(_ snapshot: MicCaptureProcessor.Snapshot) {
-        guard let pending = pendingSilenceRecovery, pending.generation == generation,
+    @discardableResult
+    private func withdrawSilenceRecoveryIfAudioReturned(_ snapshot: MicCaptureProcessor.Snapshot) -> Bool {
+        guard let pending = pendingSilenceRecovery,
+              Self.audioReturned(pendingGeneration: pending.generation, currentGeneration: generation,
+                                 runStartUs: pending.runStartUs, lastNonZeroEndUs: snapshot.lastNonZeroEndUs),
               health.message == Self.silenceRecoveryMessage, relay?.stopError == nil,
-              let lastNonZero = snapshot.lastNonZeroEndUs, lastNonZero > pending.runStartUs,
-              health.withdrawRecovery(generation: generation) else { return }
+              health.withdrawRecovery(generation: generation) else { return false }
         pendingSilenceRecovery = nil
         awaitingRestore = nil
+        routeSilence.liftCooldown()
         AudioLog.event("system.silence-recovery.withdrawn", ["generation": generation])
+        return true
+    }
+
+    /// Pure decision behind withdrawal, shared by supervision and the pre-stop check.
+    nonisolated static func audioReturned(pendingGeneration: Int, currentGeneration: Int,
+                                          runStartUs: Int64, lastNonZeroEndUs: Int64?) -> Bool {
+        guard pendingGeneration == currentGeneration, let lastNonZeroEndUs else { return false }
+        return lastNonZeroEndUs > runStartUs
     }
 
     private func verifyRestoreAfterSilenceRecovery(_ snapshot: MicCaptureProcessor.Snapshot, nowUs: Int64) {
@@ -591,6 +606,9 @@ final class CaptureEngine: NSObject {
             }
             recordingURL = nextURL
         } else { recordingURL = nil }
+        // Last content check before committing the native stop: a queued
+        // speculative silence restart must not stop audio that has returned.
+        if let snapshot = relay?.snapshot(), withdrawSilenceRecoveryIfAudioReturned(snapshot) { return false }
         guard await stopCapture(preserveRequest: true), desiredIntent.matches(intent) else { return false }
         do {
             try await startCapture(contentFilter: request.filter, writer: request.writer, recordTo: recordingURL,

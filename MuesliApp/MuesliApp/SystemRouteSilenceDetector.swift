@@ -27,7 +27,10 @@ import Foundation
 ///
 /// After a recovery request, notifications are ignored until `cooldownUs` has
 /// passed, so trailing fires from the same burst cannot arm the replacement
-/// capture. `reset()` (per capture generation) keeps that fence.
+/// capture. `reset()` (per capture generation) keeps that fence. Tradeoff: a
+/// genuinely new route failure inside the cooldown is not detected (callers
+/// lift the fence with `liftCooldown()` when a request is withdrawn).
+/// Buffer timestamps may run at most `futureToleranceUs` ahead of now.
 /// All times are host-clock microseconds, as used for capture timestamps.
 nonisolated struct SystemRouteSilenceDetector: Sendable {
     var silenceThresholdUs: Int64 = 3_000_000
@@ -36,6 +39,7 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
     var leadSlackUs: Int64 = 1_000_000
     var callbackFreshnessUs: Int64 = 2_000_000
     var cooldownUs: Int64 = 60_000_000
+    var futureToleranceUs: Int64 = 100_000
     /// First and latest notification of the current armed burst.
     private(set) var routeChangeUs: Int64?
     private(set) var latestRouteChangeUs: Int64?
@@ -57,6 +61,9 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
         return true
     }
 
+    /// A withdrawn request was a false alarm: do not let it hide later faults.
+    mutating func liftCooldown() { cooldownUntilUs = nil }
+
     /// Clears the armed burst for a new capture generation. The cooldown fence survives.
     mutating func reset() {
         routeChangeUs = nil; latestRouteChangeUs = nil
@@ -70,7 +77,7 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
     mutating func evaluate(nowUs: Int64, lastCaptureUs: Int64?, lastNonZeroEndUs: Int64?) -> Decision {
         guard let route = routeChangeUs, let latestRoute = latestRouteChangeUs else { return .none }
         let latestRunStart = latestRoute + armWindowUs
-        let fresh = lastCaptureUs.map { abs(nowUs - $0) <= callbackFreshnessUs } ?? false
+        let fresh = lastCaptureUs.map { nowUs - $0 <= callbackFreshnessUs && $0 - nowUs <= futureToleranceUs } ?? false
         if let lastCaptureUs, let runStart = lastNonZeroEndUs, fresh,
            runStart >= route - leadSlackUs, runStart <= latestRunStart,
            lastCaptureUs - runStart >= silenceThresholdUs {
@@ -92,8 +99,9 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
             return .recover(silentForUs: lastCaptureUs - runStart)
         }
         if suspectRunStartUs != nil, let runStart = lastNonZeroEndUs, runStart != suspectRunStartUs {
-            // Non-zero audio arrived after the suspicion: the route change was benign.
-            reset()
+            // Non-zero audio arrived after the suspicion. Drop the suspected
+            // run but keep the route window: a later run inside it still counts.
+            suspectRunStartUs = nil; suspectSinceUs = nil
             return .cleared
         }
         if nowUs > latestRunStart + silenceThresholdUs + confirmUs + callbackFreshnessUs {

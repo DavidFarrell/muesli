@@ -76,6 +76,38 @@ final class SystemRouteSilenceDetectorTests: XCTestCase {
         XCTAssertTrue(recoveries(decisions).isEmpty)
     }
 
+    func testRealFaultAfterAClearedSuspicionInTheSameWindowRecovers() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        // Zeros 101-105 (cleared when audio returns), then the persistent fault from 108.
+        let decisions = run(&detector, from: 100 * s, to: 130 * s) {
+            if $0 < 101 * s { return $0 }
+            if $0 < 105 * s { return 101 * s }
+            if $0 < 108 * s { return $0 }
+            return 108 * s
+        }
+        XCTAssertTrue(decisions.contains { $0.1 == .cleared })
+        XCTAssertEqual(recoveries(decisions), [113 * s], "Suspected at 111, confirmed at 113")
+    }
+
+    func testLiftedCooldownLetsALaterFaultArm() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        XCTAssertEqual(recoveries(run(&detector, from: 100 * s, to: 110 * s) { _ in 101 * s }).count, 1)
+        XCTAssertFalse(detector.noteRouteChange(atUs: 110 * s))
+        detector.liftCooldown() // the request was withdrawn: it was a false alarm
+        XCTAssertTrue(detector.noteRouteChange(atUs: 111 * s))
+    }
+
+    func testWithdrawalDecisionBeforeNativeStop() {
+        XCTAssertTrue(CaptureEngine.audioReturned(pendingGeneration: 4, currentGeneration: 4, runStartUs: 100, lastNonZeroEndUs: 101),
+                      "Speech arrived while the restart was queued: cancel before stopping")
+        XCTAssertFalse(CaptureEngine.audioReturned(pendingGeneration: 4, currentGeneration: 4, runStartUs: 100, lastNonZeroEndUs: 100))
+        XCTAssertFalse(CaptureEngine.audioReturned(pendingGeneration: 4, currentGeneration: 4, runStartUs: 100, lastNonZeroEndUs: nil))
+        XCTAssertFalse(CaptureEngine.audioReturned(pendingGeneration: 3, currentGeneration: 4, runStartUs: 100, lastNonZeroEndUs: 500),
+                       "A replacement generation's audio says nothing about the old one")
+    }
+
     func testTrailingNotificationAfterRecoveryCannotArmTheReplacement() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 100 * s)
@@ -117,9 +149,11 @@ final class SystemRouteSilenceDetectorTests: XCTestCase {
                        "Buffers stopped arriving: a different condition")
         XCTAssertEqual(detector.evaluate(nowUs: 106 * s, lastCaptureUs: 120 * s, lastNonZeroEndUs: 100 * s), .none,
                        "A timestamp from the future is not fresh evidence")
+        XCTAssertEqual(detector.evaluate(nowUs: 103 * s, lastCaptureUs: 104 * s, lastNonZeroEndUs: 101 * s), .none,
+                       "One second ahead cannot shorten the required silence")
     }
 
-    func testHealthWithdrawalBeforeClaimButNotAfter() {
+    func testHealthWithdrawalUntilNativeStop() {
         var health = CaptureSourceHealth()
         let now = Date(timeIntervalSince1970: 100)
         health.begin(generation: 3, now: now)
@@ -132,7 +166,8 @@ final class SystemRouteSilenceDetectorTests: XCTestCase {
         XCTAssertTrue(health.progress(frames: 320, generation: 3, at: now), "Progress counts again after withdrawal")
         health.fail("silent", now: now)
         XCTAssertTrue(health.shouldRecover(now: now.addingTimeInterval(1), requireContinuousCallbacks: false))
-        XCTAssertFalse(health.withdrawRecovery(generation: 3), "A claimed restart stands")
+        XCTAssertTrue(health.withdrawRecovery(generation: 3), "A claimed restart can still be cancelled before the native stop")
+        XCTAssertEqual(health.phase, .healthy)
     }
 
     func testProcessorTracksLastNonZeroSampleAndIgnoresDigitalSilence() {
