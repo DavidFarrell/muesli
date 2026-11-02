@@ -226,6 +226,7 @@ final class CaptureEngine: NSObject {
     private var stopping = false
     private var lastSourceProblemCount = 0
     private var observedNativeStop = false
+    private var routeSilence = SystemRouteSilenceDetector()
     private(set) var health = CaptureSourceHealth()
     var recoveryRecordingURLProvider: (() -> URL?)?
     private struct Request {
@@ -270,6 +271,7 @@ final class CaptureEngine: NSObject {
         health.begin(generation: generation)
         lastSourceProblemCount = 0
         observedNativeStop = false
+        routeSilence.reset()
         stopping = false
         let currentGeneration = generation
         meetingStartPTS = timeline.epochPTS
@@ -458,8 +460,36 @@ final class CaptureEngine: NSObject {
         }
         if !observeSystemSourceProblems(), let snapshot = relay?.snapshot() {
             _ = health.progress(frames: snapshot.convertedFrames, generation: generation)
+            observeSilenceAfterRouteChange(snapshot)
         }
         return allowRecovery && !operationOwner.isBusy && health.shouldRecover(requireContinuousCallbacks: false)
+    }
+
+    /// Called for every output-route notification, including ones that keep
+    /// the same device ID (a Bluetooth headset re-registering). Arms a single
+    /// content-based check; see SystemRouteSilenceDetector.
+    func noteOutputRouteChanged() {
+        guard relay != nil, !stopping, !retirementPending else { return }
+        let nowUs = CaptureTimeline.microseconds(CMClockGetTime(CMClockGetHostTimeClock())) ?? 0
+        routeSilence.noteRouteChange(atUs: nowUs)
+        AudioLog.event("system.route-change.armed", ["generation": generation])
+    }
+
+    /// SCK can keep delivering on-time buffers of exact zeros after a route
+    /// change, which callback-based supervision reads as healthy. Fail the
+    /// generation so the existing shouldRecover -> restartCapture path runs.
+    private func observeSilenceAfterRouteChange(_ snapshot: MicCaptureProcessor.Snapshot) {
+        guard health.phase == .healthy else { return }
+        let nowUs = CaptureTimeline.microseconds(CMClockGetTime(CMClockGetHostTimeClock())) ?? 0
+        switch routeSilence.evaluate(nowUs: nowUs, lastCaptureUs: snapshot.lastCaptureTimeUs,
+                                     lastNonZeroEndUs: snapshot.lastNonZeroEndUs) {
+        case .none: return
+        case .expired:
+            AudioLog.event("system.route-change.no-silence", ["generation": generation])
+        case .recover(let silentForUs):
+            AudioLog.error("system.silent-after-route-change", ["generation": generation, "silent_ms": silentForUs / 1000])
+            health.fail("System audio went silent after an output-device change; restarting system capture.")
+        }
     }
 
     /// The notification task may be behind Refresh or a meter task on

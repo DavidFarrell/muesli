@@ -1884,6 +1884,10 @@ final class AppModel: ObservableObject {
 
     @MainActor
     private func handleOutputDeviceChange() {
+        // Every notification, before the device-ID guard below: a Bluetooth
+        // headset can re-register under the same ID and still leave SCK
+        // delivering digital silence (2 Nov 2026 incident).
+        captureEngine.noteOutputRouteChanged()
         // Honour the output policy: a pin re-asserts itself if the OS moved the
         // default output away from it; a vanished pin resets to follow.
         if case .pinned(let uid) = outputSelection {
