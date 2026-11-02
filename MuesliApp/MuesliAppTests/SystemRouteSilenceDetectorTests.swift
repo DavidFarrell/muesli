@@ -110,6 +110,22 @@ final class SystemRouteSilenceDetectorTests: XCTestCase {
         XCTAssertEqual(recoveries(later), [113 * s])
     }
 
+    func testQueuedAutomaticRestartIsDroppedAfterWithdrawal() {
+        // Queue -> supervision withdraws -> queued restart runs.
+        var health = CaptureSourceHealth()
+        let now = Date(timeIntervalSince1970: 100)
+        health.begin(generation: 5, now: now)
+        XCTAssertTrue(health.progress(frames: 160, generation: 5, at: now))
+        health.fail("silent", now: now)
+        XCTAssertTrue(health.shouldRecover(now: now.addingTimeInterval(1), requireContinuousCallbacks: false), "Watchdog queues the restart")
+        XCTAssertTrue(CaptureEngine.automaticRestartStillRequired(isAutomatic: true, sourceInvalidated: health.invalidated))
+        XCTAssertTrue(health.withdrawRecovery(generation: 5), "Refresh-driven supervision withdraws it")
+        XCTAssertFalse(CaptureEngine.automaticRestartStillRequired(isAutomatic: true, sourceInvalidated: health.invalidated),
+                       "The queued restart must reserve no video and stop nothing")
+        XCTAssertTrue(CaptureEngine.automaticRestartStillRequired(isAutomatic: false, sourceInvalidated: false),
+                      "A user-initiated restart is unaffected")
+    }
+
     func testWithdrawalDecisionBeforeNativeStop() {
         XCTAssertTrue(CaptureEngine.audioReturned(pendingGeneration: 4, currentGeneration: 4, runStartUs: 100, lastNonZeroEndUs: 101),
                       "Speech arrived while the restart was queued: cancel before stopping")

@@ -531,6 +531,12 @@ final class CaptureEngine: NSObject {
         return true
     }
 
+    /// Automatic (watchdog) restarts act only on a still-failed source; a
+    /// user-initiated restart (Refresh) is unconditional, as before.
+    nonisolated static func automaticRestartStillRequired(isAutomatic: Bool, sourceInvalidated: Bool) -> Bool {
+        !isAutomatic || sourceInvalidated
+    }
+
     /// Pure decision behind withdrawal, shared by supervision and the pre-stop check.
     nonisolated static func audioReturned(pendingGeneration: Int, currentGeneration: Int,
                                           runStartUs: Int64, lastNonZeroEndUs: Int64?) -> Bool {
@@ -598,6 +604,12 @@ final class CaptureEngine: NSObject {
         guard let request, !operationOwner.isBusy else { return false }
         let intent = desiredIntent.revision
         guard desiredIntent.matches(intent) else { return false }
+        // A queued automatic recovery whose failure has since been withdrawn
+        // (or otherwise cleared) is no longer required: do nothing.
+        guard Self.automaticRestartStillRequired(isAutomatic: expectedRequest != nil, sourceInvalidated: health.invalidated) else {
+            AudioLog.event("system.restart.skipped-no-longer-required", ["generation": generation])
+            return false
+        }
         // Last content check before committing anything (video reservation,
         // native stop): a queued speculative silence restart must not stop
         // audio that has returned. Nothing below suspends before stopCapture
