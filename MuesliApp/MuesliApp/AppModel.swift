@@ -473,9 +473,9 @@ final class AppModel: ObservableObject {
             AudioLog.event("listener.input.fired", ["snap": AudioDeviceManager.snapshot()])
             self?.loadInputDevices()
         }
-        AudioDeviceManager.observeOutputDeviceChanges { [weak self] in
+        AudioDeviceManager.observeOutputDeviceChanges { [weak self] hostUs in
             AudioLog.event("listener.output.fired", ["snap": AudioDeviceManager.snapshot()])
-            Task { @MainActor in self?.handleOutputDeviceChange() }
+            Task { @MainActor in self?.handleOutputDeviceChange(atHostUs: hostUs) }
         }
         localInferenceSession.observeUnavailability { [weak self] in
             Task { @MainActor [weak self] in
@@ -1883,11 +1883,11 @@ final class AppModel: ObservableObject {
     }
 
     @MainActor
-    private func handleOutputDeviceChange() {
+    private func handleOutputDeviceChange(atHostUs hostUs: Int64) {
         // Every notification, before the device-ID guard below: a Bluetooth
         // headset can re-register under the same ID and still leave SCK
         // delivering digital silence (2 Nov 2026 incident).
-        captureEngine.noteOutputRouteChanged()
+        captureEngine.noteOutputRouteChanged(atHostUs: hostUs)
         // Honour the output policy: a pin re-asserts itself if the OS moved the
         // default output away from it; a vanished pin resets to follow.
         if case .pinned(let uid) = outputSelection {

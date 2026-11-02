@@ -8,36 +8,60 @@ import Foundation
 /// on time, so callback-based supervision stayed healthy, but every sample
 /// was 0 for the last 11 minutes of a live call. The remote side was lost.
 ///
-/// Digital silence alone is not a fault (nothing may be playing), so recovery
-/// requires all of:
-/// - an output-route notification (any fire, not only a device-ID change);
+/// Digital silence alone is not a fault (nothing may be playing), so a
+/// recovery request requires all of:
+/// - an output-route notification, timestamped at the CoreAudio callback
+///   (any fire, not only a device-ID change);
 /// - a trailing exact-zero run that began no earlier than `leadSlackUs`
-///   before the first notification of a burst and within `armWindowUs`
-///   after its latest one, which implies non-zero audio was flowing around
-///   the route change (CoreAudio fires several notifications per change);
-/// - that run lasting at least `silenceThresholdUs`, with buffers still
-///   arriving.
-/// Each burst of notifications permits at most one recovery request.
+///   before the first notification of a burst and within `armWindowUs` of
+///   its latest one, implying non-zero audio was flowing around the change;
+/// - that run reaching `silenceThresholdUs` with buffers still arriving, and
+///   then still unbroken `confirmUs` later (two-stage confirmation).
+///
+/// Speculative-recovery policy: an app that legitimately outputs exact zeros
+/// for several seconds, starting within `armWindowUs` of a route change, can
+/// still cause one unnecessary restart. That costs a sub-second gap and a new
+/// video segment; a missed fault costs the remote side for the rest of the
+/// meeting. In the incident recording there was no other exact-zero second in
+/// 75 minutes of live call audio, pauses included.
+///
+/// After a recovery request, notifications are ignored until `cooldownUs` has
+/// passed, so trailing fires from the same burst cannot arm the replacement
+/// capture. `reset()` (per capture generation) keeps that fence.
 /// All times are host-clock microseconds, as used for capture timestamps.
 nonisolated struct SystemRouteSilenceDetector: Sendable {
     var silenceThresholdUs: Int64 = 3_000_000
-    var armWindowUs: Int64 = 30_000_000
+    var confirmUs: Int64 = 2_000_000
+    var armWindowUs: Int64 = 10_000_000
     var leadSlackUs: Int64 = 1_000_000
     var callbackFreshnessUs: Int64 = 2_000_000
+    var cooldownUs: Int64 = 60_000_000
     /// First and latest notification of the current armed burst.
     private(set) var routeChangeUs: Int64?
     private(set) var latestRouteChangeUs: Int64?
+    private(set) var cooldownUntilUs: Int64?
+    /// Silence-run start seen at the first threshold crossing, and when.
+    private var suspectRunStartUs: Int64?
+    private var suspectSinceUs: Int64?
 
-    enum Decision: Equatable { case none, expired, recover(silentForUs: Int64) }
+    enum Decision: Equatable { case none, expired, suspect, cleared, recover(silentForUs: Int64) }
 
-    mutating func noteRouteChange(atUs now: Int64) {
+    /// Returns false when the notification falls inside the post-recovery cooldown.
+    @discardableResult
+    mutating func noteRouteChange(atUs time: Int64) -> Bool {
+        if let cooldownUntilUs, time < cooldownUntilUs { return false }
         // Keep the burst's first notification: a re-fire after the silence
         // began must not move the window past the run's start.
-        if routeChangeUs == nil { routeChangeUs = now }
-        latestRouteChangeUs = now
+        if routeChangeUs == nil { routeChangeUs = time }
+        latestRouteChangeUs = max(latestRouteChangeUs ?? time, time)
+        return true
     }
 
-    mutating func reset() { routeChangeUs = nil; latestRouteChangeUs = nil }
+    /// Clears the armed burst for a new capture generation. The cooldown fence survives.
+    mutating func reset() {
+        routeChangeUs = nil; latestRouteChangeUs = nil
+        suspectRunStartUs = nil; suspectSinceUs = nil
+    }
 
     /// - Parameters:
     ///   - lastCaptureUs: start time of the most recent delivered buffer.
@@ -46,18 +70,36 @@ nonisolated struct SystemRouteSilenceDetector: Sendable {
     mutating func evaluate(nowUs: Int64, lastCaptureUs: Int64?, lastNonZeroEndUs: Int64?) -> Decision {
         guard let route = routeChangeUs, let latestRoute = latestRouteChangeUs else { return .none }
         let latestRunStart = latestRoute + armWindowUs
-        // Past the point where a qualifying run could still begin and reach
-        // the threshold: this notification is spent.
-        if nowUs > latestRunStart + silenceThresholdUs + callbackFreshnessUs {
+        let fresh = lastCaptureUs.map { abs(nowUs - $0) <= callbackFreshnessUs } ?? false
+        if let lastCaptureUs, let runStart = lastNonZeroEndUs, fresh,
+           runStart >= route - leadSlackUs, runStart <= latestRunStart,
+           lastCaptureUs - runStart >= silenceThresholdUs {
+            // Qualifying run. Checked before expiry so a late watchdog tick
+            // still acts on a fault that began inside the window.
+            guard let suspectStart = suspectRunStartUs, let since = suspectSinceUs else {
+                suspectRunStartUs = runStart; suspectSinceUs = nowUs
+                return .suspect
+            }
+            if suspectStart != runStart {
+                // Audio returned and a new silence began: the original
+                // suspicion was wrong. Track the new run from scratch.
+                suspectRunStartUs = runStart; suspectSinceUs = nowUs
+                return .suspect
+            }
+            guard nowUs - since >= confirmUs else { return .none }
+            reset()
+            cooldownUntilUs = nowUs + cooldownUs
+            return .recover(silentForUs: lastCaptureUs - runStart)
+        }
+        if suspectRunStartUs != nil, let runStart = lastNonZeroEndUs, runStart != suspectRunStartUs {
+            // Non-zero audio arrived after the suspicion: the route change was benign.
+            reset()
+            return .cleared
+        }
+        if nowUs > latestRunStart + silenceThresholdUs + confirmUs + callbackFreshnessUs {
             reset()
             return .expired
         }
-        guard let lastCaptureUs, let runStart = lastNonZeroEndUs,
-              nowUs - lastCaptureUs <= callbackFreshnessUs,
-              runStart >= route - leadSlackUs, runStart <= latestRunStart else { return .none }
-        let silentFor = lastCaptureUs - runStart
-        guard silentFor >= silenceThresholdUs else { return .none }
-        reset()
-        return .recover(silentForUs: silentFor)
+        return .none
     }
 }

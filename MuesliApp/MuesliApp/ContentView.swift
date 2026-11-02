@@ -745,7 +745,7 @@ enum AudioDeviceManager {
     private static var observerInstalled = false
     private static var observerHandler: (() -> Void)?
     private static var outputObserverInstalled = false
-    private static var outputObserverHandler: (() -> Void)?
+    private static var outputObserverHandler: ((Int64) -> Void)?
 
     static func observeInputDeviceChanges(_ onChange: @escaping () -> Void) {
         observerHandler = onChange
@@ -1018,7 +1018,8 @@ enum AudioDeviceManager {
         return source == fourCharCode("ispk")
     }
 
-    static func observeOutputDeviceChanges(_ onChange: @escaping () -> Void) {
+    /// The handler receives the host time (microseconds) of the CoreAudio callback.
+    static func observeOutputDeviceChanges(_ onChange: @escaping (Int64) -> Void) {
         outputObserverHandler = onChange
         guard !outputObserverInstalled else { return }
         outputObserverInstalled = true
@@ -1027,8 +1028,11 @@ enum AudioDeviceManager {
         for addressTemplate in observedOutputAddresses {
             var address = addressTemplate
             let status = AudioObjectAddPropertyListenerBlock(systemObject, &address, observerQueue) { _, _ in
+                // Stamp before the main-thread hop; route-silence detection
+                // compares it with capture timestamps.
+                let hostUs = CaptureTimeline.microseconds(hostTime: mach_absolute_time())
                 DispatchQueue.main.async {
-                    Self.outputObserverHandler?()
+                    Self.outputObserverHandler?(hostUs)
                 }
             }
             if status != noErr {

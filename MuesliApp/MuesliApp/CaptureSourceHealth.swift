@@ -67,6 +67,18 @@ nonisolated struct CaptureSourceHealth: Sendable {
         } else { phase = .failed; retryAt = nil }
     }
 
+    /// Withdraws a speculative recovery that has not been claimed yet, when
+    /// fresh content evidence shows the same generation is working after all.
+    /// Once shouldRecover has reserved the attempt (retryAt cleared), it stands.
+    mutating func withdrawRecovery(generation: Int) -> Bool {
+        guard generation == self.generation, phase == .recovering, retryAt != nil else { return false }
+        invalidated = false
+        phase = .healthy
+        retryAt = nil
+        message = nil
+        return true
+    }
+
     mutating func invalidate(generation: Int, now: Date = Date()) -> Bool {
         guard generation == self.generation, phase != .idle, !invalidated else { return false }
         fail("The audio device configuration changed.", now: now)

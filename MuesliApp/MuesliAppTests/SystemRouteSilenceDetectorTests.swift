@@ -4,92 +4,135 @@ import AVFoundation
 final class SystemRouteSilenceDetectorTests: XCTestCase {
     private let s: Int64 = 1_000_000
 
+    /// Supervision ticks once a second with fresh buffers; returns the
+    /// decisions made, keyed by tick time.
+    private func run(_ detector: inout SystemRouteSilenceDetector, from start: Int64, to end: Int64,
+                     lastNonZero: (Int64) -> Int64?) -> [(Int64, SystemRouteSilenceDetector.Decision)] {
+        var out: [(Int64, SystemRouteSilenceDetector.Decision)] = []
+        var t = start
+        while t <= end {
+            let d = detector.evaluate(nowUs: t, lastCaptureUs: t, lastNonZeroEndUs: lastNonZero(t))
+            if d != .none { out.append((t, d)) }
+            t += s
+        }
+        return out
+    }
+
+    private func recoveries(_ decisions: [(Int64, SystemRouteSilenceDetector.Decision)]) -> [Int64] {
+        decisions.compactMap { if case .recover = $0.1 { return $0.0 } else { return nil } }
+    }
+
     /// Replays the 2 Nov 2026 GuardIAS timeline (seconds into the recording):
-    /// route notifications at 4430 (audio unaffected) and 4515 (samples are
+    /// a notification at 4430 (audio unaffected) and one at 4515 (samples are
     /// exact zeros from 4518 to the end, callbacks still on time).
     func testIncidentTimelineRecoversOnceAfterSilentRouteChange() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 4430 * s)
-        // Audio keeps flowing after the first notification: never recover.
-        var t: Int64 = 4430 * s
-        while t <= 4466 * s {
-            if case .recover = detector.evaluate(nowUs: t, lastCaptureUs: t - s / 10, lastNonZeroEndUs: t) { XCTFail("false recovery at \(t)") }
-            t += s
-        }
+        let benign = run(&detector, from: 4430 * s, to: 4470 * s) { $0 }
+        XCTAssertTrue(recoveries(benign).isEmpty, "Audio kept flowing after the first notification")
         XCTAssertNil(detector.routeChangeUs, "The unaffected notification expires")
 
         detector.noteRouteChange(atUs: 4515 * s)
         let silenceStart = 4518 * s
-        XCTAssertEqual(detector.evaluate(nowUs: 4520 * s, lastCaptureUs: 4520 * s, lastNonZeroEndUs: silenceStart), .none,
-                       "Two seconds of zeros is below the threshold")
-        XCTAssertEqual(detector.evaluate(nowUs: 4521 * s, lastCaptureUs: 4521 * s, lastNonZeroEndUs: silenceStart),
-                       .recover(silentForUs: 3 * s))
-        XCTAssertEqual(detector.evaluate(nowUs: 4530 * s, lastCaptureUs: 4530 * s, lastNonZeroEndUs: silenceStart), .none,
-                       "One recovery request per notification")
+        let decisions = run(&detector, from: 4515 * s, to: 4560 * s) { $0 < silenceStart ? $0 : silenceStart }
+        XCTAssertEqual(decisions.first?.1, .suspect)
+        XCTAssertEqual(decisions.first?.0, 4521 * s, "Three seconds of zeros raises suspicion")
+        XCTAssertEqual(recoveries(decisions), [4523 * s], "Confirmed two seconds later, exactly once")
+    }
+
+    func testNotificationStampedBeforeDelayedDeliveryStillMatches() {
+        var detector = SystemRouteSilenceDetector()
+        // CoreAudio fired at 100 (stamped there); zeros from 101; the main
+        // thread only delivered it at 105. The stamp, not delivery, counts.
+        detector.noteRouteChange(atUs: 100 * s)
+        let decisions = run(&detector, from: 105 * s, to: 115 * s) { _ in 101 * s }
+        XCTAssertEqual(recoveries(decisions).count, 1)
+    }
+
+    func testLateWatchdogStillActsOnAFaultThatBeganInTheWindow() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        // The watchdog was starved until well past the expiry point.
+        XCTAssertEqual(detector.evaluate(nowUs: 140 * s, lastCaptureUs: 140 * s, lastNonZeroEndUs: 103 * s), .suspect)
+        XCTAssertEqual(detector.evaluate(nowUs: 142 * s, lastCaptureUs: 142 * s, lastNonZeroEndUs: 103 * s),
+                       .recover(silentForUs: 39 * s))
+    }
+
+    func testMuteLongAfterTheRouteChangeIsNotAFault() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        // Audio fine after the change; the other side mutes at 115 (exact zeros).
+        let decisions = run(&detector, from: 100 * s, to: 140 * s) { min($0, 115 * s) }
+        XCTAssertTrue(recoveries(decisions).isEmpty)
+    }
+
+    func testPauseThatEndsBeforeConfirmationIsNotAFault() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        // Zeros 101-105 (suspected at 104), speech resumes at 105.
+        let decisions = run(&detector, from: 100 * s, to: 130 * s) { $0 < 101 * s ? $0 : ($0 < 105 * s ? 101 * s : $0) }
+        XCTAssertTrue(decisions.contains { $0.1 == .suspect })
+        XCTAssertTrue(decisions.contains { $0.1 == .cleared })
+        XCTAssertTrue(recoveries(decisions).isEmpty)
+    }
+
+    func testTrailingNotificationAfterRecoveryCannotArmTheReplacement() {
+        var detector = SystemRouteSilenceDetector()
+        detector.noteRouteChange(atUs: 100 * s)
+        XCTAssertEqual(recoveries(run(&detector, from: 100 * s, to: 110 * s) { _ in 101 * s }).count, 1)
+        // Restart: new generation resets the burst but not the cooldown.
+        detector.reset()
+        XCTAssertFalse(detector.noteRouteChange(atUs: 112 * s), "Same burst, inside the cooldown")
+        let after = run(&detector, from: 112 * s, to: 130 * s) { _ in 113 * s }
+        XCTAssertTrue(recoveries(after).isEmpty, "An ordinary pause on the replacement cannot restart it again")
+        XCTAssertTrue(detector.noteRouteChange(atUs: 200 * s), "A genuinely later route change arms again")
     }
 
     func testRepeatedNotificationAfterSilenceBeganStillRecovers() {
         var detector = SystemRouteSilenceDetector()
-        // One burst: fires at 4515 and again at 4519, after zeros began at 4518.
         detector.noteRouteChange(atUs: 4515 * s)
-        XCTAssertEqual(detector.evaluate(nowUs: 4519 * s, lastCaptureUs: 4519 * s, lastNonZeroEndUs: 4518 * s), .none)
+        _ = detector.evaluate(nowUs: 4519 * s, lastCaptureUs: 4519 * s, lastNonZeroEndUs: 4518 * s)
         detector.noteRouteChange(atUs: 4519 * s + s / 2)
-        XCTAssertEqual(detector.evaluate(nowUs: 4521 * s, lastCaptureUs: 4521 * s, lastNonZeroEndUs: 4518 * s),
-                       .recover(silentForUs: 3 * s))
-    }
-
-    func testLaterNotificationExtendsTheWindow() {
-        var detector = SystemRouteSilenceDetector()
-        detector.noteRouteChange(atUs: 100 * s)
-        detector.noteRouteChange(atUs: 125 * s)
-        // Zeros begin 31 s after the first fire but 6 s after the latest.
-        XCTAssertEqual(detector.evaluate(nowUs: 134 * s, lastCaptureUs: 134 * s, lastNonZeroEndUs: 131 * s),
-                       .recover(silentForUs: 3 * s))
+        let decisions = run(&detector, from: 4520 * s, to: 4530 * s) { _ in 4518 * s }
+        XCTAssertEqual(recoveries(decisions).count, 1)
     }
 
     func testSilenceThatBeganBeforeTheRouteChangeIsNotAFault() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 100 * s)
         // Nothing has played since t=50 (for example, between calls).
-        XCTAssertEqual(detector.evaluate(nowUs: 110 * s, lastCaptureUs: 110 * s, lastNonZeroEndUs: 50 * s), .none)
+        XCTAssertTrue(recoveries(run(&detector, from: 100 * s, to: 130 * s) { _ in 50 * s }).isEmpty)
     }
 
     func testNoAudioEverPlayedIsNotAFault() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 100 * s)
-        XCTAssertEqual(detector.evaluate(nowUs: 110 * s, lastCaptureUs: 110 * s, lastNonZeroEndUs: nil), .none)
+        XCTAssertTrue(recoveries(run(&detector, from: 100 * s, to: 130 * s) { _ in nil }).isEmpty)
     }
 
-    func testStaleCallbacksDoNotTrigger() {
+    func testStaleOrFutureCallbacksDoNotTrigger() {
         var detector = SystemRouteSilenceDetector()
         detector.noteRouteChange(atUs: 100 * s)
-        // Buffers stopped arriving at 101; that is a different condition.
-        XCTAssertEqual(detector.evaluate(nowUs: 106 * s, lastCaptureUs: 101 * s, lastNonZeroEndUs: 100 * s), .none)
+        XCTAssertEqual(detector.evaluate(nowUs: 106 * s, lastCaptureUs: 101 * s, lastNonZeroEndUs: 100 * s), .none,
+                       "Buffers stopped arriving: a different condition")
+        XCTAssertEqual(detector.evaluate(nowUs: 106 * s, lastCaptureUs: 120 * s, lastNonZeroEndUs: 100 * s), .none,
+                       "A timestamp from the future is not fresh evidence")
     }
 
-    func testSilenceBeginningJustBeforeTheNotificationCounts() {
-        var detector = SystemRouteSilenceDetector()
-        // The device can change a fraction of a second before CoreAudio notifies.
-        detector.noteRouteChange(atUs: 100 * s)
-        XCTAssertEqual(detector.evaluate(nowUs: 103 * s, lastCaptureUs: 103 * s, lastNonZeroEndUs: 100 * s - s / 2),
-                       .recover(silentForUs: 3 * s + s / 2))
-    }
-
-    func testNotificationExpiresWithoutSilence() {
-        var detector = SystemRouteSilenceDetector()
-        detector.noteRouteChange(atUs: 100 * s)
-        XCTAssertEqual(detector.evaluate(nowUs: 136 * s, lastCaptureUs: 136 * s, lastNonZeroEndUs: 136 * s), .expired)
-        XCTAssertEqual(detector.evaluate(nowUs: 137 * s, lastCaptureUs: 137 * s, lastNonZeroEndUs: 100 * s), .none)
-    }
-
-    func testRecoveryRequestArmsTheExistingHealthRetryPath() {
+    func testHealthWithdrawalBeforeClaimButNotAfter() {
         var health = CaptureSourceHealth()
         let now = Date(timeIntervalSince1970: 100)
         health.begin(generation: 3, now: now)
         XCTAssertTrue(health.progress(frames: 160, generation: 3, at: now))
-        health.fail("System audio went silent after an output-device change; restarting system capture.", now: now)
+        health.fail("silent", now: now)
         XCTAssertEqual(health.phase, .recovering)
+        XCTAssertFalse(health.withdrawRecovery(generation: 2), "Other generations cannot withdraw")
+        XCTAssertTrue(health.withdrawRecovery(generation: 3))
+        XCTAssertEqual(health.phase, .healthy)
+        XCTAssertTrue(health.progress(frames: 320, generation: 3, at: now), "Progress counts again after withdrawal")
+        health.fail("silent", now: now)
         XCTAssertTrue(health.shouldRecover(now: now.addingTimeInterval(1), requireContinuousCallbacks: false))
+        XCTAssertFalse(health.withdrawRecovery(generation: 3), "A claimed restart stands")
     }
 
     func testProcessorTracksLastNonZeroSampleAndIgnoresDigitalSilence() {
