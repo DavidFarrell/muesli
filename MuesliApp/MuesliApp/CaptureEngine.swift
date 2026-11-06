@@ -623,7 +623,23 @@ final class CaptureEngine: NSObject {
             }
             recordingURL = nextURL
         } else { recordingURL = nil }
+        // Identify a committed speculative route-silence recovery BEFORE stop
+        // (stop advances the generation). A Refresh issued while that
+        // failure stands is the same physical situation.
+        let silenceRecovery = pendingSilenceRecovery.flatMap {
+            $0.generation == generation && health.message == Self.silenceRecoveryMessage ? $0 : nil
+        }
         guard await stopCapture(preserveRequest: true), desiredIntent.matches(intent) else { return false }
+        if let silenceRecovery {
+            // The old stream is stopped and drained: no old-generation packet
+            // can reach the recorder after this note, and the new stream has
+            // not started. Session-grid times share the capture host clock.
+            let epoch = request.timeline.epochMicroseconds
+            request.writer?.noteRouteSilenceRestart(
+                stream: .system,
+                suspectedSilenceStartUs: silenceRecovery.runStartUs > 0 ? silenceRecovery.runStartUs - epoch : nil,
+                restartUs: Self.hostNowUs() - epoch)
+        }
         do {
             try await startCapture(contentFilter: request.filter, writer: request.writer, recordTo: recordingURL,
                                    timeline: request.timeline, audioOutputEnabled: request.outputEnabled, meetingAccess: request.meetingAccess)

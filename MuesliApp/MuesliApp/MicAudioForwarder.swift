@@ -10,12 +10,14 @@ nonisolated protocol FrameSending: AnyObject, Sendable {
     func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String)
     func reportFailure(stream: StreamID, message: String)
     func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection)
+    func noteRouteSilenceRestart(stream: StreamID, suspectedSilenceStartUs: Int64?, restartUs: Int64)
 }
 
 extension FrameSending {
     nonisolated func reportLoss(stream: StreamID, ptsUs: Int64, frames: Int64, reason: String) {}
     nonisolated func reportFailure(stream: StreamID, message: String) {}
     nonisolated func reportClockCorrection(stream: StreamID, correction: CapturedClockCorrection) {}
+    nonisolated func noteRouteSilenceRestart(stream: StreamID, suspectedSilenceStartUs: Int64?, restartUs: Int64) {}
 }
 
 /// Abstraction over a monotonic time source, used for the forwarder's

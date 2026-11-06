@@ -20,6 +20,11 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         var gap_frames: Int64 = 0
         var overlap_frames: Int64 = 0
         var dropped_frames: Int64 = 0
+        /// One-frame host-grid timestamp quantization steps that net to at
+        /// most one frame (see `classifyDisplacement`). Still counted in
+        /// gap_frames/overlap_frames; they produce no Loss row and no problem.
+        /// Optional: manifests from older app versions stay decodable.
+        var jitter_events: Int64?
     }
 
     struct Manifest: Codable, Sendable {
@@ -38,6 +43,25 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         var power_events: [PowerEvent]?
         var power_events_omitted: Int64?
         var clock_corrections: [String: ClockCorrectionSummary]?
+        var recovery_events: [RecoveryEvent]?
+        var recovery_events_omitted: Int64?
+    }
+
+    /// Durable evidence of a committed automatic recovery. Diagnostics, not a
+    /// claim of lost speech: the suspected interval contains RECORDED exact
+    /// zeros (counted nowhere as gap/overlap/drop) that may have been real
+    /// audio the source failed to deliver. Frames are on the session grid.
+    struct RecoveryEvent: Codable, Sendable, Equatable {
+        static let routeSilenceRestart = "system_route_silence_restart"
+        let kind: String
+        let source: String
+        /// Start of the trailing exact-zero run, when the generation ever
+        /// delivered non-zero audio; nil means "unknown, possibly the whole
+        /// generation".
+        let suspected_silence_start_frame: Int64?
+        /// Session-grid frame at which the restart was committed (the old
+        /// stream had already stopped).
+        let restart_frame: Int64
     }
 
     /// Fixed-size per-stream observations, including the latest generation in
@@ -171,7 +195,25 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let source: Source
         let ptsUs: Int64
         let payload: Data
+        /// Set at admission on the first packet admitted for a source after a
+        /// committed route-silence restart: the restart's session-grid frame.
+        var routeSilenceRestartFrame: Int64? = nil
     }
+
+    /// Bounded exemption for the interruption caused by our own speculative
+    /// system restart after route silence. Policy, not proof: the 6 Nov 2026
+    /// incident measured 366 ms; anything longer stays a real problem until
+    /// hardware evidence (`source.route-silence-restart-gap` log) says otherwise.
+    static let maxRouteSilenceRestartGapFrames: Int64 = 16_000
+    /// The exempted gap must sit at the restart boundary: the new stream's
+    /// first sample within this window after the committed restart. An arm
+    /// left behind by a failed start can never bless a later generation.
+    static let routeSilenceRestartWindowFrames: Int64 = 32_000
+    /// Host-grid timestamps (`epoch + outputFrames * 1e6 / 16000`, truncated
+    /// to whole microseconds, then rounded to frames here) alternate by one
+    /// frame. Within one converter epoch the net displacement is therefore
+    /// bounded to one frame; a sustained one-direction drift is real loss.
+    static let maxJitterBalanceFrames: Int64 = 1
 
     static let manifestName = "source-recording.json"
     private let directory: URL
@@ -205,6 +247,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var pendingPowerEvents: [PowerEvent] = []
     private var omittedPowerEvents: Int64 = 0
     private var clockCorrections: [Source: ClockCorrectionSummary] = [:]
+    private var routeSilenceRestartArms: [Source: Int64] = [:]
+    private var pendingRecoveryEvents: [RecoveryEvent] = []
+    private var omittedRecoveryEvents: Int64 = 0
     private var closedManifest: Manifest?
     private let closeCompletion = TaskCompletion()
     private let quitWork: ShutdownWorkRegistry.Token
@@ -214,6 +259,9 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
     private var sourceLease: FileHandle?
     private var meetingAccess: MeetingFileAccess? // owned by queue
     private var positions: [Source: Int64] = [:]
+    /// Net signed one-frame jitter per source since the last real
+    /// discontinuity (gap/overlap beyond jitter, or a restart boundary).
+    private var jitterBalance: [Source: Int64] = [:]
     private var manifest: Manifest
     private var dirty = false
     private var processedPackets: Int64 = 0
@@ -293,7 +341,11 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         }
         if acceptedPackets == committedPackets { workStartedAt = ProcessInfo.processInfo.systemUptime }
         acceptedPackets += 1
-        pending.append(Packet(source: source, ptsUs: ptsUs, payload: payload))
+        // Consumed by the first ADMITTED packet whatever its displacement, so
+        // a later gap can never inherit the restart classification. Rejected
+        // packets leave it armed (rejection carries its own loss evidence).
+        let restartFrame = routeSilenceRestartArms.removeValue(forKey: source)
+        pending.append(Packet(source: source, ptsUs: ptsUs, payload: payload, routeSilenceRestartFrame: restartFrame))
         pendingBytes += payload.count
         let schedule = !drainScheduled
         drainScheduled = true
@@ -334,6 +386,26 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             } else {
                 clockCorrections[source] = ClockCorrectionSummary(correction)
             }
+        }
+    }
+
+    /// Called by the system capture owner after the old stream has fully
+    /// stopped and drained (so no old-generation packet can be admitted after
+    /// this) and before the replacement stream starts. Records durable
+    /// recovery evidence and arms a bounded gap exemption for the next
+    /// admitted packet of that source. Never a problem by itself.
+    func noteRouteSilenceRestart(stream: StreamID, suspectedSilenceStartUs: Int64?, restartUs: Int64) {
+        let source: Source = stream == .mic ? .mic : .system
+        guard restartUs >= 0, restartUs <= maximumDurationUs else { return }
+        let frame = { (us: Int64) in (us * 16_000 + 500_000) / 1_000_000 }
+        let silenceStart = suspectedSilenceStartUs.flatMap { $0 >= 0 && $0 <= restartUs ? frame($0) : nil }
+        let event = RecoveryEvent(kind: RecoveryEvent.routeSilenceRestart, source: source.rawValue,
+                                  suspected_silence_start_frame: silenceStart, restart_frame: frame(restartUs))
+        lock.withLock {
+            guard !closeRequested else { return }
+            routeSilenceRestartArms[source] = event.restart_frame
+            if pendingRecoveryEvents.count < 64 { pendingRecoveryEvents.append(event) }
+            else { omittedRecoveryEvents = min(Int64.max - 1, omittedRecoveryEvents) + 1 }
         }
     }
 
@@ -469,20 +541,51 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         var data = packet.payload
         var writeAt = position
         var loss: Loss?
+        // Classify on the FULL timestamp displacement; the clamped overlap
+        // below is only for slicing and dropped-data accounting.
+        let displacement = start - position
+        let classification = Self.classifyDisplacement(displacement, position: position, start: start,
+            jitterBalance: jitterBalance[packet.source, default: 0],
+            routeSilenceRestartFrame: packet.routeSilenceRestartFrame)
+        // Contiguous packets keep the balance: an alternating +1/0/+1/0
+        // pattern is sustained loss and must accumulate. A real discontinuity
+        // or any restart boundary starts a new quantization baseline.
+        switch classification {
+        case .contiguous: break
+        case .jitter: jitterBalance[packet.source, default: 0] += displacement
+        case .problem, .routeSilenceRestartGap: jitterBalance[packet.source] = 0
+        }
+        if packet.routeSilenceRestartFrame != nil { jitterBalance[packet.source] = 0 }
         if start > position {
             // Sparse zeros represent a real source-timestamp gap. Never
             // allocate silence proportional to an arbitrary timestamp jump.
             try handle.seek(toOffset: UInt64(start * 2))
             state.gap_frames += start - position
-            loss = Loss(source: packet.source.rawValue, reason: position == 0 ? "initial_source_alignment" : "source_timestamp_gap",
-                        start_frame: position, end_frame: start, frames: start - position)
+            if classification != .jitter {
+                let reason = position == 0 ? "initial_source_alignment"
+                    : (classification == .routeSilenceRestartGap ? "route_silence_restart_gap" : "source_timestamp_gap")
+                loss = Loss(source: packet.source.rawValue, reason: reason,
+                            start_frame: position, end_frame: start, frames: start - position)
+            }
             writeAt = start
         } else if start < position {
             let overlap = min(position - start, count)
             state.overlap_frames += overlap
-            loss = Loss(source: packet.source.rawValue, reason: "overlapping_source_timestamp",
-                        start_frame: start, end_frame: start + overlap, frames: overlap)
+            if classification != .jitter {
+                loss = Loss(source: packet.source.rawValue, reason: "overlapping_source_timestamp",
+                            start_frame: start, end_frame: start + overlap, frames: overlap)
+            }
             data = data.dropFirst(Int(overlap * 2))
+        }
+        if classification == .jitter {
+            state.jitter_events = (state.jitter_events ?? 0) + 1
+        }
+        if let restartFrame = packet.routeSilenceRestartFrame {
+            AudioLog.event("source.route-silence-restart-gap", [
+                "stream": packet.source.rawValue, "session": manifest.session_id,
+                "displacement_frames": displacement, "restart_frame": restartFrame,
+                "first_sample_frame": start, "previous_end_frame": position,
+                "classification": "\(classification)"])
         }
         if !data.isEmpty {
             try beforeIO?(.write(packet.source))
@@ -492,7 +595,7 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         }
         if let loss {
             appendManifestLoss(loss)
-            if loss.reason != "initial_source_alignment" {
+            if classification == .problem {
                 let message = "Source audio has a timestamp discontinuity (" + loss.reason + ")."
                 manifest.problem_count += 1
                 manifest.last_problem = message
@@ -501,6 +604,28 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         }
         manifest.streams[packet.source.rawValue] = state
         dirty = true
+    }
+
+    enum DisplacementClass: Equatable { case contiguous, jitter, routeSilenceRestartGap, problem }
+
+    /// Pure classification of one packet's timestamp displacement
+    /// (`start - position`, in session frames). Only `.problem` raises the
+    /// persistent recorder error and marks the source incomplete.
+    nonisolated static func classifyDisplacement(_ displacement: Int64, position: Int64, start: Int64,
+                                                 jitterBalance: Int64,
+                                                 routeSilenceRestartFrame: Int64?) -> DisplacementClass {
+        if displacement == 0 { return .contiguous }
+        // The first sample of a session is alignment, recorded but not a problem.
+        if position == 0 && displacement > 0 { return .contiguous }
+        if abs(displacement) == 1, abs(jitterBalance + displacement) <= maxJitterBalanceFrames {
+            return .jitter
+        }
+        if let restartFrame = routeSilenceRestartFrame, displacement > 0,
+           displacement <= maxRouteSilenceRestartGapFrames,
+           start >= restartFrame, start - restartFrame <= routeSilenceRestartWindowFrames {
+            return .routeSilenceRestartGap
+        }
+        return .problem
     }
 
     private func commitIfNeeded() {
@@ -512,6 +637,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         let power = pendingPowerEvents
         let powerOmitted = omittedPowerEvents
         let clocks = clockCorrections
+        let recoveries = pendingRecoveryEvents
+        let recoveriesOmitted = omittedRecoveryEvents
+        pendingRecoveryEvents.removeAll(keepingCapacity: true)
+        omittedRecoveryEvents = 0
         rejectedLosses.removeAll()
         omittedLosses = 0
         pendingPowerEvents.removeAll(keepingCapacity: true)
@@ -533,6 +662,19 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
             let total = (manifest.power_events_omitted ?? 0).addingReportingOverflow(lost.partialValue)
             manifest.power_events_omitted = lost.overflow || total.overflow ? Int64.max : total.partialValue
             manifest.completed = false
+            dirty = true
+        }
+        if !recoveries.isEmpty || recoveriesOmitted > 0 {
+            // Evidence only: deliberately does NOT clear `completed`.
+            var recorded = manifest.recovery_events ?? []
+            let admitted = recoveries.prefix(max(0, 64 - recorded.count))
+            recorded.append(contentsOf: admitted)
+            manifest.recovery_events = recorded
+            let lost = recoveriesOmitted.addingReportingOverflow(Int64(recoveries.count - admitted.count))
+            let total = (manifest.recovery_events_omitted ?? 0).addingReportingOverflow(lost.partialValue)
+            if lost.overflow || total.overflow || total.partialValue > 0 {
+                manifest.recovery_events_omitted = lost.overflow || total.overflow ? Int64.max : total.partialValue
+            }
             dirty = true
         }
         for loss in losses {
@@ -675,6 +817,10 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
                   clocks.allSatisfy({ Source(rawValue: $0.key) != nil && $0.value.isValid }) else {
                 throw RecorderError.invalidManifest
             }
+        }
+        guard (result.recovery_events?.count ?? 0) <= 64, (result.recovery_events_omitted ?? 0) >= 0,
+              result.recovery_events?.allSatisfy({ $0.restart_frame >= 0 && ($0.suspected_silence_start_frame ?? 0) >= 0 }) ?? true else {
+            throw RecorderError.invalidManifest
         }
         guard (result.power_events?.count ?? 0) <= 128, (result.power_events_omitted ?? 0) >= 0,
               result.power_events?.allSatisfy({ $0.process_continuous_us >= 0 && ($0.source_time_us ?? 0) >= 0 && ($0.observed_pause_us ?? 0) >= 0 }) ?? true else {
