@@ -201,6 +201,11 @@ nonisolated enum ArchiveSourceEligibility {
                 let power = try decode(PowerEvidence.self, manifestData)
                 try require((power.power_events ?? []).isEmpty && (power.power_events_omitted ?? 0) == 0,
                             "Recorded power interruption or unavailable monitoring requires review before automatic archiving.")
+                // Typed via the manifest: a recovery records a suspected silence
+                // interval that may have hidden real audio, even when the
+                // restart itself left no gap.
+                try require((manifest.recovery_events ?? []).isEmpty && (manifest.recovery_events_omitted ?? 0) == 0,
+                            "A recorded automatic capture recovery requires review before automatic archiving.")
                 try require(manifest.schema_version == 1 && manifest.session_id == sourceID
                             && manifest.timeline_offset_us >= 0
                             && abs(Double(manifest.timeline_offset_us) / 1_000_000 - offset) <= 0.000001

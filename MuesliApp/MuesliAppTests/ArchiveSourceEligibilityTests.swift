@@ -190,6 +190,16 @@ final class ArchiveSourceEligibilityTests: XCTestCase {
         try change(root, "audio/source-recording.json") { $0["losses"] = [["source": "mic", "reason": "initial_source_alignment", "frames": 1]] }
         rejected(root, contains: "alignment requires review")
     }
+    func testRecordedCaptureRecoveryRequiresReviewEvenWithoutAGap() throws {
+        let root = try folder(); try fixture(root)
+        try change(root, "audio/source-recording.json") {
+            $0["recovery_events"] = [["kind": "system_route_silence_restart", "source": "system", "restart_frame": 80]]
+        }
+        rejected(root, contains: "automatic capture recovery requires review")
+        let omitted = try folder(); try fixture(omitted)
+        try change(omitted, "audio/source-recording.json") { $0["recovery_events_omitted"] = 1 }
+        rejected(omitted, contains: "automatic capture recovery requires review")
+    }
     func testEveryLossCounterAndIncompleteManifestRefuseCompletedMetadata() throws {
         for key in ["problem_count", "loss_details_omitted", "last_problem", "losses", "completed", "revision"] {
             let root = try folder(); try fixture(root)
