@@ -114,6 +114,23 @@ final class LocalAudioRecorderGapClassificationTests: XCTestCase {
         XCTAssertEqual(result.streams["system"]?.jitter_events, 3)
     }
 
+    func testPostRestartBaselineIsZeroAndStillCatchesDrift() async throws {
+        let recorder = try Recorder(directory: folder())
+        recorder.record(source: .system, ptsUs: 0, payload: samples(160))
+        recorder.record(source: .system, ptsUs: 159 * 1_000_000 / 16_000 + 1, payload: samples(160)) // balance -1, -> 319
+        recorder.noteRouteSilenceRestart(stream: .system, suspectedSilenceStartUs: nil, restartUs: 318 * 1_000_000 / 16_000)
+        recorder.record(source: .system, ptsUs: 318 * 1_000_000 / 16_000, payload: samples(160))     // stamped -1 -> 478, balance 0
+        recorder.record(source: .system, ptsUs: 477 * 1_000_000 / 16_000 + 1, payload: samples(160)) // -1: balance -1 (tolerated only if reset to 0)
+        let tolerated = recorder.status().error
+        recorder.record(source: .system, ptsUs: 637 * 1_000_000 / 16_000 + 1, payload: samples(160)) // contiguous
+        recorder.record(source: .system, ptsUs: 796 * 1_000_000 / 16_000 + 1, payload: samples(160)) // -1 again: drift
+        let result = try await finish(recorder)
+        XCTAssertNil(tolerated)
+        XCTAssertEqual(result.streams["system"]?.jitter_events, 3)
+        XCTAssertFalse(result.completed, "Same-direction drift after the new baseline is still loss")
+        XCTAssertEqual(result.losses.last?.reason, "overlapping_source_timestamp")
+    }
+
     func testRestartOverlapIsStillAProblem() async throws {
         let recorder = try Recorder(directory: folder())
         recorder.record(source: .system, ptsUs: 0, payload: samples(16_000))
