@@ -40,7 +40,10 @@ final class LocalAudioRecorderGapClassificationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         let live = try Recorder.readManifest(directory: url)
-        XCTAssertEqual(live.recovery_events?.first?.suspected_silence_start_frame, nil)
+        let events = try XCTUnwrap(live.recovery_events, "The event must commit before stop")
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.restart_frame, 320)
+        XCTAssertNil(events.first?.suspected_silence_start_frame)
         XCTAssertEqual(live.problem_count, 0)
         let result = try await finish(recorder)
         XCTAssertTrue(result.completed)
@@ -98,6 +101,19 @@ final class LocalAudioRecorderGapClassificationTests: XCTestCase {
         XCTAssertFalse(result.completed)
     }
 
+    func testRestartPacketIsClassifiedAgainstAFreshJitterBaseline() async throws {
+        let recorder = try Recorder(directory: folder())
+        recorder.record(source: .system, ptsUs: 0, payload: samples(160))                  // -> 160
+        recorder.record(source: .system, ptsUs: 159 * 1_000_000 / 16_000 + 1, payload: samples(160)) // -1: balance -1, -> 319
+        recorder.noteRouteSilenceRestart(stream: .system, suspectedSilenceStartUs: nil, restartUs: 318 * 1_000_000 / 16_000)
+        recorder.record(source: .system, ptsUs: 318 * 1_000_000 / 16_000, payload: samples(160))     // -1 again, new stream
+        recorder.record(source: .system, ptsUs: 479 * 1_000_000 / 16_000 + 1, payload: samples(160)) // +1 on the new grid
+        let result = try await finish(recorder)
+        XCTAssertEqual(result.problem_count, 0)
+        XCTAssertTrue(result.completed)
+        XCTAssertEqual(result.streams["system"]?.jitter_events, 3)
+    }
+
     func testRestartOverlapIsStillAProblem() async throws {
         let recorder = try Recorder(directory: folder())
         recorder.record(source: .system, ptsUs: 0, payload: samples(16_000))
@@ -149,7 +165,7 @@ final class LocalAudioRecorderGapClassificationTests: XCTestCase {
     /// truncation), the forwarder subtracts the meeting epoch, and the
     /// recorder rounds to frames. With an epoch offset whose frame fraction
     /// sits just above .5, odd frame positions round down and even ones up.
-    func testProducerTimestampQuantizationNeverRaisesAProblem() async throws {
+    func testProducerTimestampFormulaQuantizationNeverRaisesAProblem() async throws {
         for offsetUs: Int64 in [0, 31, 94, 1_094, 2_531, 62_594] {
             let recorder = try Recorder(directory: folder())
             var outputFrames: Int64 = 0
@@ -281,7 +297,7 @@ final class LocalAudioRecorderGapClassificationTests: XCTestCase {
         XCTAssertTrue(decoded.completed)
     }
 
-    func testRestartGapManifestFinalizesTheMeetingAsCompleted() async throws {
+    func testRestartGapManifestSatisfiesTheRecorderCompletionCriteria() async throws {
         let recorder = try Recorder(directory: folder())
         recorder.record(source: .system, ptsUs: 0, payload: samples(16_000))
         recorder.noteRouteSilenceRestart(stream: .system, suspectedSilenceStartUs: nil, restartUs: 1_000_000)

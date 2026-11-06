@@ -544,12 +544,17 @@ nonisolated final class LocalAudioRecorder: FrameSending, @unchecked Sendable {
         // Classify on the FULL timestamp displacement; the clamped overlap
         // below is only for slicing and dropped-data accounting.
         let displacement = start - position
+        // A committed restart boundary starts a fresh quantization baseline
+        // BEFORE classification: the old stream's balance says nothing about
+        // the replacement stream's grid.
+        if packet.routeSilenceRestartFrame != nil { jitterBalance[packet.source] = 0 }
         let classification = Self.classifyDisplacement(displacement, position: position, start: start,
             jitterBalance: jitterBalance[packet.source, default: 0],
             routeSilenceRestartFrame: packet.routeSilenceRestartFrame)
         // Contiguous packets keep the balance: an alternating +1/0/+1/0
         // pattern is sustained loss and must accumulate. A real discontinuity
-        // or any restart boundary starts a new quantization baseline.
+        // or a restart boundary starts a new quantization baseline (the
+        // replacement stream's first packet IS that baseline).
         switch classification {
         case .contiguous: break
         case .jitter: jitterBalance[packet.source, default: 0] += displacement
