@@ -382,6 +382,10 @@ def _process_owned_stream_on_whitebox(temp_wav, stream_name, whitebox, language,
         owned_input.verify()
         answer = whitebox.transcribe(temp_wav, stream_name, language=language)
         owned_input.verify()
+        if answer["coverage_warning"]:
+            # The transcript is kept: the service's check cannot tell a dropped
+            # tail from a side of the meeting that simply went quiet.
+            emit_status("coverage_warning", stream_name, reason=answer["coverage_warning"])
         turns = answer["turns"]
         evidence.diarization_segment_count = bounded_count(answer["segments"])
         evidence.turn_count = bounded_count(len(turns))

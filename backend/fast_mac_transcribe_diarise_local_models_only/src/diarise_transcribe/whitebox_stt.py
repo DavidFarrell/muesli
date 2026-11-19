@@ -11,10 +11,17 @@ running Parakeet + Senko on the Mac. The rules this module exists to keep:
   service's own default applies (Whisper, per whitebox-audio#9). With no engine
   named the response has speaker turns in `segments` but no `engine`/`model` keys,
   so those are read from /healthz instead.
-- NEVER A HALF RESULT. Anything unusable (unreachable, HTTP error, `incomplete`,
-  `diarize_error`, an unlabelled turn) raises WhiteboxUnavailable, and the caller
-  redoes the whole meeting locally. A silent track is the one 200-with-`error`
-  that is fine: it is an empty stream.
+- VAD ON. `vad=true` makes Whisper skip non-speech. Without it Whisper writes
+  "Thank you." into long silences (measured 19 Nov on a synthetic track: 8
+  invented turns in 5 minutes), and one side of a meeting is often silent.
+- NEVER A HALF RESULT. Anything unusable (unreachable, HTTP error, `diarize_error`
+  on a track with speech, an unlabelled turn) raises WhiteboxUnavailable, and the
+  caller redoes the whole meeting locally. A track with no speech (the silent
+  refusal, or no words at all) is an empty stream, not a failure.
+- `incomplete` IS A WARNING, NOT A FAILURE. The service's coverage check is a
+  timing heuristic: it flags a transcript that ends more than 90 s before the
+  audio, which a meeting track does whenever that side goes quiet near the end.
+  The transcript is kept and the reason is reported.
 """
 
 from __future__ import annotations
@@ -38,9 +45,10 @@ DEFAULT_URL = "http://whiteboxlinux.tail0d0f20.ts.net:8081"
 URL_ENV = "MUESLI_WHITEBOX_URL"
 TAILNET_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 HEALTH_TIMEOUT_S = 5.0
-# The service drops a job whose caller disconnects, so the read timeout must
-# outlast a long meeting's transcription rather than give up early.
-REQUEST_TIMEOUT_S = 4 * 3600.0
+# The service drops a job whose caller disconnects: the read timeout must outlast
+# a long meeting's transcription, but not hang for hours if the whitebox vanishes,
+# so the read timeout is a base allowance plus the track's own length.
+REQUEST_TIMEOUT_BASE_S = 30 * 60.0
 BUSY_WAIT_LIMIT_S = 30 * 60.0
 UPLOAD_CAP_BYTES = 95 * 1024 * 1024   # the service refuses over 100 MB (STT_MAX_MB)
 SILENT_ERROR_PREFIX = "no speech detected"
@@ -72,6 +80,7 @@ class WhiteboxSTT:
         self.host = parts.hostname
         self.port = parts.port or 80
         self.identity: dict | None = None
+        self.coverage_warnings: list[dict] = []
 
     # -- transport ---------------------------------------------------------
     def _request(self, method: str, path: str, timeout: float, body=None, headers=None):
@@ -115,7 +124,8 @@ class WhiteboxSTT:
         if health.get("diarize_enabled") is False:
             raise WhiteboxUnavailable("whitebox speaker detection is disabled")
         self.identity = {"machine": "whitebox", "engine": engine,
-                         "model": info.get("model") or health.get("model"), "service": self.url}
+                         "model": info.get("model") or health.get("model"), "service": self.url,
+                         "coverage_warnings": self.coverage_warnings}
         return self.identity
 
     # -- transcription -----------------------------------------------------
@@ -123,19 +133,20 @@ class WhiteboxSTT:
         """Diarised turns for one normalised track, in reprocess's turn shape."""
         with tempfile.TemporaryDirectory(prefix="muesli-whitebox-") as temporary:
             upload = _encode_for_upload(wav_path, Path(temporary), stream_name)
-            fields = {"diarize": "true"}
+            fields = {"diarize": "true", "vad": "true"}
             if language:
                 fields["language"] = language
             body_path, content_type = _multipart(Path(temporary), upload, fields)
-            payload = self._post(body_path, content_type)
+            seconds = max(0, Path(wav_path).stat().st_size - 44) / 32000   # 16 kHz mono PCM16
+            payload = self._post(body_path, content_type, REQUEST_TIMEOUT_BASE_S + seconds)
         return self._turns(payload, stream_name)
 
-    def _post(self, body_path: Path, content_type: str) -> dict:
+    def _post(self, body_path: Path, content_type: str, timeout: float) -> dict:
         deadline = time.monotonic() + BUSY_WAIT_LIMIT_S
         while True:
             with body_path.open("rb") as body:
                 status, headers, raw = self._request(
-                    "POST", "/stt", REQUEST_TIMEOUT_S, body=body,
+                    "POST", "/stt", timeout, body=body,
                     headers={"Content-Type": content_type,
                              "Content-Length": str(body_path.stat().st_size)})
             if status == 503:
@@ -153,13 +164,14 @@ class WhiteboxSTT:
 
     def _turns(self, payload: dict, stream_name: str) -> dict:
         error = payload.get("error")
-        if error and str(error).startswith(SILENT_ERROR_PREFIX) and not payload.get("segments"):
-            return {"turns": [], "segments": 0, "silent": True, "payload_engine": payload.get("engine")}
+        speech = any(str(s.get("text") or "").strip() for s in payload.get("segments") or [])
+        if error and str(error).startswith(SILENT_ERROR_PREFIX) and not speech:
+            return {"turns": [], "segments": 0, "coverage_warning": None}
         if error:
             raise WhiteboxUnavailable(f"whitebox error: {error}")
-        if payload.get("incomplete"):
-            reason = (payload.get("coverage") or {}).get("reason")
-            raise WhiteboxUnavailable(f"whitebox transcript incomplete ({reason})")
+        if payload.get("diarize_error") and not speech and not str(payload.get("text") or "").strip():
+            # Noise but no words: nothing to label, so an empty stream.
+            return {"turns": [], "segments": 0, "coverage_warning": None}
         if payload.get("diarize_error"):
             raise WhiteboxUnavailable(f"whitebox speaker detection failed: {payload['diarize_error']}")
         turns = []
@@ -177,7 +189,12 @@ class WhiteboxSTT:
         if payload.get("engine") and self.identity is not None:
             self.identity["engine"] = payload["engine"]
             self.identity["model"] = payload.get("model") or self.identity["model"]
-        return {"turns": turns, "segments": len(payload.get("segments") or []), "silent": False}
+        warning = None
+        if payload.get("incomplete") and turns:
+            warning = (payload.get("coverage") or {}).get("reason") or "flagged incomplete"
+            self.coverage_warnings.append({"stream": stream_name, "reason": warning})
+        return {"turns": turns, "segments": len(payload.get("segments") or []),
+                "coverage_warning": warning}
 
 
 def _retry_after(headers: dict) -> float:

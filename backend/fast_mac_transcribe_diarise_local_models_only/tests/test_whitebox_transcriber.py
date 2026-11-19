@@ -4,6 +4,8 @@ The fake listens on 127.0.0.1; production refuses any address outside the tailne
 so the tests swap in an address check that accepts loopback. Audio is synthetic.
 """
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from diarise_transcribe import reprocess, whitebox_stt
+
+pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg to encode uploads")
 
 HEALTH = {"ok": True, "default_engine": "whisper", "diarize_enabled": True,
           "engines": {"whisper": {"model": "large-v3", "ready": True},
@@ -65,7 +69,7 @@ def loopback_allowed(monkeypatch):
     monkeypatch.setattr(whitebox_stt.time, "sleep", lambda _s: None)
 
 
-def _meeting(tmp_path: Path) -> Path:
+def _meeting(tmp_path: Path, noise: bool = False) -> Path:
     meeting = tmp_path / "meeting"
     (meeting / "audio").mkdir(parents=True)
     for stream, seconds in (("mic", 2), ("system", 3)):
@@ -73,7 +77,7 @@ def _meeting(tmp_path: Path) -> Path:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(16000)
-            wav.writeframes(b"\x10\x00\xf0\xff" * (seconds * 8000))
+            wav.writeframes(os.urandom(seconds * 32000) if noise else b"\x10\x00\xf0\xff" * (seconds * 8000))
     return meeting
 
 
@@ -124,7 +128,7 @@ def test_whitebox_mode_returns_the_usual_turns_and_says_who_transcribed(tmp_path
     ]
     assert result["speakers"] == ["mic:SPEAKER_00", "system:SPEAKER_00", "system:SPEAKER_01"]
     assert result["transcriber"] == {"machine": "whitebox", "engine": "whisper", "model": "large-v3",
-                                     "service": fake.url, "fallback_reason": None}
+                                     "service": fake.url, "coverage_warnings": [], "fallback_reason": None}
 
 
 def test_each_track_goes_up_on_its_own_with_no_engine_named(tmp_path, monkeypatch, loopback_allowed):
@@ -141,6 +145,7 @@ def test_each_track_goes_up_on_its_own_with_no_engine_named(tmp_path, monkeypatc
     for upload in fake.uploads:
         assert not upload["engine_field"]
         assert upload["diarize_true"]
+        assert upload["vad_true"]                  # no "Thank you." invented in the silences
         assert upload["flac"]                      # lossless FLAC, not the raw WAV
         assert upload["host"].startswith("localhost:")
 
@@ -175,7 +180,6 @@ def test_an_address_outside_the_tailnet_is_never_sent_audio(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("bad_system_reply, reason", [
-    ({**diarised(("SPEAKER_00", 0.0, 1.0, "b")), "incomplete": True}, "incomplete"),
     ({**diarised(), "segments": [{"start": 0.0, "end": 1.0, "text": "b"}],
       "diarize_error": "RuntimeError: no speakers detected"}, "no speakers detected"),
     ((500, {"detail": "transcription failed: boom"}), "HTTP 500"),
@@ -199,11 +203,16 @@ def test_an_unusable_answer_mid_run_redoes_the_whole_meeting_on_the_mac(
     assert {t["text"] for t in result["turns"]} == {"local words"}
 
 
-def test_a_silent_track_is_an_empty_stream_not_a_failure(tmp_path, monkeypatch, loopback_allowed):
-    silent = {"text": "", "segments": [], "error": "no speech detected - audio track is effectively silent",
-              "audio_level": {"peak_db": -90.0}, "diarize_error": "RuntimeError: not diarised - no speech detected",
-              "incomplete": False}
-    fake = FakeSTT({"mic": silent, "system": diarised(("SPEAKER_00", 0.0, 1.0, "b"))})
+SILENT = {"text": "", "segments": [], "error": "no speech detected - audio track is effectively silent",
+          "audio_level": {"peak_db": -90.0}, "diarize_error": "RuntimeError: not diarised - no speech detected",
+          "incomplete": True}
+NO_WORDS = {"text": "", "segments": [], "audio_seconds": 3.0, "incomplete": True,
+            "diarize_error": "RuntimeError: whisper returned no word timestamps"}
+
+
+@pytest.mark.parametrize("empty_reply", [SILENT, NO_WORDS], ids=["silent", "noise-without-words"])
+def test_a_track_without_speech_is_an_empty_stream_not_a_failure(tmp_path, monkeypatch, loopback_allowed, empty_reply):
+    fake = FakeSTT({"mic": empty_reply, "system": diarised(("SPEAKER_00", 0.0, 1.0, "b"))})
     local = _local_inference(monkeypatch)
     try:
         code, events = _run(monkeypatch, _meeting(tmp_path), "--transcriber", "whitebox", "--whitebox-url", fake.url)
@@ -215,6 +224,40 @@ def test_a_silent_track_is_an_empty_stream_not_a_failure(tmp_path, monkeypatch, 
     assert [t["speaker_id"] for t in result["turns"]] == ["system:SPEAKER_00"]
     statuses = {e["stream"]: e["status"] for e in result["processing"]["entries"]}
     assert statuses == {"mic": "processed_without_turns", "system": "processed"}
+
+
+def test_a_track_that_goes_quiet_keeps_its_transcript_with_a_warning(tmp_path, monkeypatch, loopback_allowed):
+    quiet_end = {**diarised(("SPEAKER_00", 0.0, 1.0, "b")), "incomplete": True,
+                 "coverage": {"reason": "the transcript ends at 1s of 300s of audio - it looks truncated"}}
+    fake = FakeSTT({"mic": diarised(("SPEAKER_00", 0.0, 1.0, "a")), "system": quiet_end})
+    local = _local_inference(monkeypatch)
+    try:
+        code, events = _run(monkeypatch, _meeting(tmp_path), "--transcriber", "whitebox", "--whitebox-url", fake.url)
+    finally:
+        fake.close()
+
+    assert code == 0 and local == []
+    [warning] = [e for e in events if e.get("stage") == "coverage_warning"]
+    assert warning["stream"] == "system" and "truncated" in warning["reason"]
+    [result] = [e for e in events if e.get("type") == "result"]
+    assert result["transcriber"]["machine"] == "whitebox"
+    assert [w["stream"] for w in result["transcriber"]["coverage_warnings"]] == ["system"]
+    assert {t["text"] for t in result["turns"]} == {"a", "b"}
+
+
+def test_a_track_past_the_upload_cap_goes_up_as_opus(tmp_path, monkeypatch, loopback_allowed):
+    monkeypatch.setattr(whitebox_stt, "UPLOAD_CAP_BYTES", 40_000)   # between Opus and FLAC sizes of 3 s of noise
+    fake = FakeSTT({"mic": diarised(("SPEAKER_00", 0.0, 1.0, "a")),
+                    "system": diarised(("SPEAKER_00", 0.0, 1.0, "b"))})
+    local = _local_inference(monkeypatch)
+    try:
+        code, _ = _run(monkeypatch, _meeting(tmp_path, noise=True), "--transcriber", "whitebox",
+                       "--whitebox-url", fake.url)
+    finally:
+        fake.close()
+
+    assert code == 0 and local == []
+    assert all(u["ogg"] and not u["flac"] for u in fake.uploads)
 
 
 def test_a_busy_service_is_waited_for_not_abandoned(tmp_path, monkeypatch, loopback_allowed):

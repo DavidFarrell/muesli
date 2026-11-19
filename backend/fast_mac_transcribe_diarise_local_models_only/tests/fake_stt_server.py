@@ -39,7 +39,8 @@ class Handler(BaseHTTPRequestHandler):
                 "stream": stream, "host": self.headers["Host"],
                 "engine_field": b'name="engine"' in body,
                 "diarize_true": b'name="diarize"\r\n\r\ntrue' in body,
-                "flac": b"fLaC" in body}) + "\n")
+                "vad_true": b'name="vad"\r\n\r\ntrue' in body,
+                "flac": b"fLaC" in body, "ogg": b"OggS" in body}) + "\n")
         queue = config["replies"][stream]
         reply = queue.pop(0) if len(queue) > 1 else queue[0]
         self._send(reply["status"], reply["body"], reply.get("headers", ()))
