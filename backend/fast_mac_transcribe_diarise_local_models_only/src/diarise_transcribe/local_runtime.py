@@ -6,6 +6,37 @@ denied. Provisioning is a separate explicit command, never a recording fallback.
 """
 import os
 import sys
+import threading
+from contextlib import contextmanager
+
+# A narrow, per-thread exception for the whitebox transcriber (whitebox-audio#10):
+# while held, this thread may resolve one name and connect to one address and
+# port. The whitebox client grants only addresses it has checked are on the
+# owner's tailnet. Nothing else, on any thread, is opened.
+_grant = threading.local()
+
+
+@contextmanager
+def permit_connection(address: str, port: int, name: str | None = None):
+    previous = getattr(_grant, "value", None)
+    _grant.value = (name, address, port)
+    try:
+        yield
+    finally:
+        _grant.value = previous
+
+
+def _granted(event, args) -> bool:
+    grant = getattr(_grant, "value", None)
+    if grant is None or not args:
+        return False
+    name, address, port = grant
+    if event == "socket.getaddrinfo":
+        return args[0] in (name, address) and args[0] is not None
+    if event == "socket.connect":
+        target = args[1] if len(args) > 1 else None
+        return isinstance(target, tuple) and tuple(target[:2]) == (address, port)
+    return False
 
 
 class OfflineNetworkError(RuntimeError):
@@ -21,6 +52,8 @@ def configure() -> None:
     os.environ["DO_NOT_TRACK"] = "1"
 
     def deny_network(event, args):
+        if _granted(event, args):
+            return
         if event in {"socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo"}:
             raise OfflineNetworkError("Network name resolution is disabled during local inference.")
         if event in {"socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg"}:

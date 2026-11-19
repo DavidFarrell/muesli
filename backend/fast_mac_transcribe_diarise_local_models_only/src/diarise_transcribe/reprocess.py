@@ -24,6 +24,7 @@ from .processing_evidence import (
 )
 from .wav_derivation import ProducedWAV, canonical_pcm_header
 from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
+from .whitebox_stt import WhiteboxSTT, WhiteboxUnavailable, default_url as default_whitebox_url
 
 # Model imports can emit diagnostics; reserve stdout for protocol events.
 with redirect_stdout(sys.stderr):
@@ -320,6 +321,7 @@ def reprocess_stream(
     evidence: ProcessingEntry | None = None,
     budget: SnapshotBudget | None = None,
     expected_snapshot_sha256: str | None = None,
+    whitebox: WhiteboxSTT | None = None,
 ) -> dict:
     def log(msg: str) -> None:
         if verbose:
@@ -361,12 +363,33 @@ def reprocess_stream(
                 owned_source.verify()
                 with ModelInput(Path(temp_wav), expected=produced) as owned_input:
                     evidence.model_input = owned_input.payload()
+                    if whitebox is not None:
+                        return _process_owned_stream_on_whitebox(
+                            temp_wav, stream_name, whitebox, language, evidence, owned_input)
                     return _process_owned_stream(temp_wav, stream_name, diar_backend, asr_model,
                                                  language, gap_threshold, speaker_tolerance,
                                                  verbose, recovery, evidence, budget, owned_input)
 
             finally:
                 owned_source.verify()
+
+
+def _process_owned_stream_on_whitebox(temp_wav, stream_name, whitebox, language, evidence, owned_input):
+    """The same owned, normalised track, transcribed and diarised by the shared STT
+    service. Raises WhiteboxUnavailable for anything short of a usable answer."""
+    try:
+        emit_status("transcribing", stream_name, machine="whitebox")
+        owned_input.verify()
+        answer = whitebox.transcribe(temp_wav, stream_name, language=language)
+        owned_input.verify()
+        turns = answer["turns"]
+        evidence.diarization_segment_count = bounded_count(answer["segments"])
+        evidence.turn_count = bounded_count(len(turns))
+        evidence.status = "processed" if turns else "processed_without_turns"
+        return {"turns": turns, "speakers": sorted({t["speaker_id"] for t in turns}),
+                "duration": max((t["t1"] for t in turns), default=0.0), "processing": evidence}
+    finally:
+        owned_input.verify()
 
 
 def _process_owned_stream(temp_wav, stream_name, diar_backend, asr_model, language,
@@ -528,8 +551,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the ASR recovery pass for voiced-but-wordless diar segments",
     )
+    parser.add_argument(
+        "--transcriber",
+        choices=["local", "whitebox"],
+        default=None,
+        help="Where to transcribe: 'local' (Parakeet + Senko on this Mac, the default) or "
+             "'whitebox' (the shared STT service over Tailscale, its default engine; "
+             "falls back to local if it cannot give a usable answer). Naming either adds "
+             "a `transcriber` record to the result; without it the result is unchanged.",
+    )
+    parser.add_argument(
+        "--whitebox-url",
+        default=None,
+        help="Shared STT service URL; must resolve to a Tailscale address "
+             "(default: $MUESLI_WHITEBOX_URL or the whitebox's tailnet name)",
+    )
     add_parser_argument(parser)
     return parser
+
+
+class _WhiteboxFailed(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _fall_back(reason: str) -> None:
+    emit_status("transcriber_fallback", reason=reason, machine="local")
+    print(f"whitebox transcription unavailable, transcribing on this Mac instead: {reason}",
+          file=sys.stderr)
 
 
 def _main() -> int:
@@ -538,6 +588,27 @@ def _main() -> int:
     require_app_admission(args)
 
     streams = ["system", "mic"] if args.stream == "both" else [args.stream]
+    local = {"machine": "local", "engine": "parakeet", "model": args.asr_model,
+             "service": None, "fallback_reason": None}
+    if args.transcriber == "whitebox":
+        try:
+            whitebox = WhiteboxSTT(args.whitebox_url or default_whitebox_url())
+            identity = whitebox.check()
+            emit_status("transcriber", **identity)
+        except WhiteboxUnavailable as error:
+            _fall_back(str(error))
+            return _attempt(args, streams, None, {**local, "fallback_reason": str(error)})
+        try:
+            return _attempt(args, streams, whitebox, {**identity, "fallback_reason": None})
+        except _WhiteboxFailed as failure:
+            # Redo every track locally so the result has one transcriber, not a mix.
+            _fall_back(failure.reason)
+            return _attempt(args, streams, None, {**local, "fallback_reason": failure.reason})
+    return _attempt(args, streams, None, local)
+
+
+def _attempt(args, streams, whitebox: WhiteboxSTT | None, transcriber: dict) -> int:
+    args = argparse.Namespace(**vars(args))   # a fallback rerun starts from the caller's options
     processing = ProcessingEvidence(streams, not args.no_recovery)
     active = None
     try:
@@ -650,7 +721,7 @@ def _main() -> int:
                         asr_model=args.asr_model, language=args.language,
                         gap_threshold=args.gap_threshold, speaker_tolerance=args.speaker_tolerance,
                         verbose=args.verbose, recovery=not args.no_recovery, evidence=entry, budget=budget,
-                        expected_snapshot_sha256=snapshot_hashes[entry.stream])
+                        expected_snapshot_sha256=snapshot_hashes[entry.stream], whitebox=whitebox)
                     for turn in result["turns"]:
                         turn["source_session_id"] = source_identity
                         turn["t0"] += session_offset
@@ -667,10 +738,17 @@ def _main() -> int:
         result_event = {"type": "result", "turns": all_turns, "speakers": sorted(all_speakers),
               "duration": running_offset, "sources": source_inventory,
               "runtime_identity": runtime_identity, "processing": payload}
+        if args.transcriber is not None:
+            result_event["transcriber"] = (dict(whitebox.identity, fallback_reason=None)
+                                           if whitebox else transcriber)
         _encoded_event(result_event)  # Match the native reader before claiming success.
         emit_status("complete")
         emit(result_event)
         return 0
+    except WhiteboxUnavailable as error:
+        if whitebox is None:
+            raise
+        raise _WhiteboxFailed(str(error)) from error
     except Exception as error:
         processing.complete = False
         if active is not None:

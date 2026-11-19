@@ -151,3 +151,31 @@ def test_stale_pinned_selection_does_not_silently_use_another_cached_model(tmp_p
     monkeypatch.setattr(local_assets, "ASSET_SELECTION", selection)
     with pytest.raises(MissingLocalAssets, match="selection is invalid"):
         local_assets.local_asr_directory()
+
+
+def test_a_whitebox_grant_opens_only_the_granted_address_and_only_while_held():
+    code = '''
+import json, socket
+import diarise_transcribe
+from diarise_transcribe.local_runtime import OfflineNetworkError, permit_connection
+
+def outcome(operation):
+    try: operation()
+    except OfflineNetworkError: return "blocked"
+    except OSError: return "allowed"
+    return "allowed"
+
+connect = lambda host: (lambda: socket.create_connection((host, 9), timeout=1))
+results = {}
+with permit_connection("127.0.0.1", 9):
+    results["granted"] = outcome(connect("127.0.0.1"))
+    results["other_port"] = outcome(lambda: socket.socket().connect(("127.0.0.1", 10)))
+    results["other_name"] = outcome(lambda: socket.getaddrinfo("example.invalid", 443))
+results["after"] = outcome(connect("127.0.0.1"))
+print(json.dumps(results))
+'''
+    env = dict(os.environ, MUESLI_ALLOW_MODEL_DOWNLOADS="0")
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"granted": "allowed", "other_port": "blocked",
+                                         "other_name": "blocked", "after": "blocked"}
