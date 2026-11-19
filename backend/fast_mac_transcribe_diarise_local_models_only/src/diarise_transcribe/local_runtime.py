@@ -3,36 +3,59 @@
 This blocks Python networking and Hub requests. It is not an OS sandbox for
 arbitrary native extensions; release qualification also tests with OS networking
 denied. Provisioning is a separate explicit command, never a recording fallback.
+
+ONE DESCRIBED EXCEPTION: the whitebox transcriber (whitebox-audio#10). When the
+owner asks for `reprocess --transcriber whitebox`, the whitebox client opens two
+narrow, per-thread grants, one after the other, and nothing else:
+
+- `permit_lookup(name)`: resolve that one host name. No connection.
+- `permit_connection(address, port)`: connect to that one address and port. The
+  client grants only an address it has checked is on the owner's tailnet.
+
+Every other thread, name, address and port stays blocked, and local-only runs
+open no grant at all. This is a separately described boundary, not a loosening
+of the offline policy: see engineer-notes/production-audit-2026-09-05/
+offline-runtime.md.
 """
 import os
 import sys
 import threading
 from contextlib import contextmanager
 
-# A narrow, per-thread exception for the whitebox transcriber (whitebox-audio#10):
-# while held, this thread may resolve one name and connect to one address and
-# port. The whitebox client grants only addresses it has checked are on the
-# owner's tailnet. Nothing else, on any thread, is opened.
 _grant = threading.local()
 
 
 @contextmanager
-def permit_connection(address: str, port: int, name: str | None = None):
+def _granting(grant: tuple):
     previous = getattr(_grant, "value", None)
-    _grant.value = (name, address, port)
+    _grant.value = grant
     try:
         yield
     finally:
         _grant.value = previous
 
 
+def permit_lookup(name: str):
+    """While held, this thread may resolve `name` and nothing else; it may not
+    connect anywhere."""
+    return _granting(("lookup", name))
+
+
+def permit_connection(address: str, port: int):
+    """While held, this thread may connect to `address`:`port` (and resolve the
+    numeric address itself, which http.client does) and nothing else."""
+    return _granting(("connect", address, port))
+
+
 def _granted(event, args) -> bool:
     grant = getattr(_grant, "value", None)
     if grant is None or not args:
         return False
-    name, address, port = grant
+    if grant[0] == "lookup":
+        return event == "socket.getaddrinfo" and args[0] is not None and args[0] == grant[1]
+    _, address, port = grant
     if event == "socket.getaddrinfo":
-        return args[0] in (name, address) and args[0] is not None
+        return args[0] == address
     if event == "socket.connect":
         target = args[1] if len(args) > 1 else None
         return isinstance(target, tuple) and tuple(target[:2]) == (address, port)

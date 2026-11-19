@@ -179,3 +179,30 @@ print(json.dumps(results))
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"granted": "allowed", "other_port": "blocked",
                                          "other_name": "blocked", "after": "blocked"}
+
+
+def test_a_lookup_grant_resolves_one_name_and_never_connects():
+    code = '''
+import json, socket
+import diarise_transcribe
+from diarise_transcribe.local_runtime import OfflineNetworkError, permit_lookup
+
+def outcome(operation):
+    try: operation()
+    except OfflineNetworkError: return "blocked"
+    except OSError: return "allowed"
+    return "allowed"
+
+results = {}
+with permit_lookup("localhost"):
+    results["lookup"] = outcome(lambda: socket.getaddrinfo("localhost", 9))
+    results["other_name"] = outcome(lambda: socket.getaddrinfo("example.invalid", 443))
+    results["connect"] = outcome(lambda: socket.create_connection(("127.0.0.1", 9), timeout=1))
+results["after"] = outcome(lambda: socket.getaddrinfo("localhost", 9))
+print(json.dumps(results))
+'''
+    env = dict(os.environ, MUESLI_ALLOW_MODEL_DOWNLOADS="0")
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"lookup": "allowed", "other_name": "blocked",
+                                         "connect": "blocked", "after": "blocked"}

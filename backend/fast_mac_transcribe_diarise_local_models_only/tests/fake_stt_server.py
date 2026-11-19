@@ -7,11 +7,19 @@ outside it. Usage: fake_stt_server.py <config.json> <uploads.jsonl>. The config 
 Prints the port it listens on, then serves until killed.
 """
 import json
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-config = json.load(open(sys.argv[1]))
+with open(sys.argv[1]) as config_file:
+    config = json.load(config_file)
 log_path = sys.argv[2]
+
+
+def _field(body: bytes, name: str):
+    """The value of a plain multipart form field, or None when it was not sent."""
+    match = re.search(rb'name="' + name.encode() + rb'"\r\n\r\n([^\r]*)\r\n', body)
+    return match.group(1).decode() if match else None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -37,13 +45,15 @@ class Handler(BaseHTTPRequestHandler):
         with open(log_path, "a") as log:
             log.write(json.dumps({
                 "stream": stream, "host": self.headers["Host"],
-                "engine_field": b'name="engine"' in body,
-                "diarize_true": b'name="diarize"\r\n\r\ntrue' in body,
-                "vad_true": b'name="vad"\r\n\r\ntrue' in body,
+                "engine": _field(body, "engine"),
+                "language": _field(body, "language"),
+                "diarize": _field(body, "diarize"),
+                "vad": _field(body, "vad"),
                 "flac": b"fLaC" in body, "ogg": b"OggS" in body}) + "\n")
         queue = config["replies"][stream]
         reply = queue.pop(0) if len(queue) > 1 else queue[0]
         self._send(reply["status"], reply["body"], reply.get("headers", ()))
+
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 print(server.server_address[1], flush=True)

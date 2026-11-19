@@ -24,6 +24,7 @@ from .processing_evidence import (
 )
 from .wav_derivation import ProducedWAV, canonical_pcm_header
 from .meeting_lease import validate_source_path, add_parser_argument, require_app_admission
+from .transcriber_record import TranscriberRecord
 from .whitebox_stt import WhiteboxSTT, WhiteboxUnavailable, default_url as default_whitebox_url
 
 # Model imports can emit diagnostics; reserve stdout for protocol events.
@@ -365,7 +366,7 @@ def reprocess_stream(
                     evidence.model_input = owned_input.payload()
                     if whitebox is not None:
                         return _process_owned_stream_on_whitebox(
-                            temp_wav, stream_name, whitebox, language, evidence, owned_input)
+                            temp_wav, stream_name, whitebox, gap_threshold, evidence, owned_input)
                     return _process_owned_stream(temp_wav, stream_name, diar_backend, asr_model,
                                                  language, gap_threshold, speaker_tolerance,
                                                  verbose, recovery, evidence, budget, owned_input)
@@ -374,19 +375,22 @@ def reprocess_stream(
                 owned_source.verify()
 
 
-def _process_owned_stream_on_whitebox(temp_wav, stream_name, whitebox, language, evidence, owned_input):
+def _process_owned_stream_on_whitebox(temp_wav, stream_name, whitebox, gap_threshold, evidence, owned_input):
     """The same owned, normalised track, transcribed and diarised by the shared STT
     service. Raises WhiteboxUnavailable for anything short of a usable answer."""
     try:
         emit_status("transcribing", stream_name, machine="whitebox")
         owned_input.verify()
-        answer = whitebox.transcribe(temp_wav, stream_name, language=language)
+        answer = whitebox.transcribe(temp_wav, stream_name, seconds=owned_input.frame_count / 16000,
+                                     gap_threshold=gap_threshold)
         owned_input.verify()
         if answer["coverage_warning"]:
             # The transcript is kept: the service's check cannot tell a dropped
-            # tail from a side of the meeting that simply went quiet.
+            # tail from a side of the meeting that simply went quiet. The track's
+            # record says `incomplete` either way.
             emit_status("coverage_warning", stream_name, reason=answer["coverage_warning"])
         turns = answer["turns"]
+        evidence.asr_word_count = bounded_count(answer["words"])
         evidence.diarization_segment_count = bounded_count(answer["segments"])
         evidence.turn_count = bounded_count(len(turns))
         evidence.status = "processed" if turns else "processed_without_turns"
@@ -574,12 +578,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-class _WhiteboxFailed(Exception):
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
-
-
 def _fall_back(reason: str) -> None:
     emit_status("transcriber_fallback", reason=reason, machine="local")
     print(f"whitebox transcription unavailable, transcribing on this Mac instead: {reason}",
@@ -592,27 +590,26 @@ def _main() -> int:
     require_app_admission(args)
 
     streams = ["system", "mic"] if args.stream == "both" else [args.stream]
-    local = {"machine": "local", "engine": "parakeet", "model": args.asr_model,
-             "service": None, "fallback_reason": None}
     if args.transcriber == "whitebox":
         try:
-            whitebox = WhiteboxSTT(args.whitebox_url or default_whitebox_url())
-            identity = whitebox.check()
-            emit_status("transcriber", **identity)
+            whitebox = WhiteboxSTT(args.whitebox_url or default_whitebox_url(), language=args.language)
+            engine = whitebox.check()
+            emit_status("transcriber", machine="whitebox", service=whitebox.url,
+                        engine_requested=engine)
+            return _attempt(args, streams, whitebox)
         except WhiteboxUnavailable as error:
-            _fall_back(str(error))
-            return _attempt(args, streams, None, {**local, "fallback_reason": str(error)})
-        try:
-            return _attempt(args, streams, whitebox, {**identity, "fallback_reason": None})
-        except _WhiteboxFailed as failure:
             # Redo every track locally so the result has one transcriber, not a mix.
-            _fall_back(failure.reason)
-            return _attempt(args, streams, None, {**local, "fallback_reason": failure.reason})
-    return _attempt(args, streams, None, local)
+            _fall_back(str(error))
+            return _attempt(args, streams, None, fallback_reason=str(error))
+    return _attempt(args, streams, None)
 
 
-def _attempt(args, streams, whitebox: WhiteboxSTT | None, transcriber: dict) -> int:
+def _attempt(args, streams, whitebox: WhiteboxSTT | None, fallback_reason: str | None = None) -> int:
+    """One run on one machine. A whitebox failure is raised for the caller to
+    redo the meeting on this Mac; every other failure is reported here."""
     args = argparse.Namespace(**vars(args))   # a fallback rerun starts from the caller's options
+    transcriber = (whitebox.record if whitebox is not None
+                   else TranscriberRecord.local(args.asr_model, args.language, fallback_reason))
     processing = ProcessingEvidence(streams, not args.no_recovery)
     active = None
     try:
@@ -743,17 +740,14 @@ def _attempt(args, streams, whitebox: WhiteboxSTT | None, transcriber: dict) -> 
               "duration": running_offset, "sources": source_inventory,
               "runtime_identity": runtime_identity, "processing": payload}
         if args.transcriber is not None:
-            result_event["transcriber"] = (dict(whitebox.identity, fallback_reason=None)
-                                           if whitebox else transcriber)
+            result_event["transcriber"] = transcriber.payload()
         _encoded_event(result_event)  # Match the native reader before claiming success.
         emit_status("complete")
         emit(result_event)
         return 0
-    except WhiteboxUnavailable as error:
-        if whitebox is None:
-            raise
-        raise _WhiteboxFailed(str(error)) from error
     except Exception as error:
+        if whitebox is not None and isinstance(error, WhiteboxUnavailable):
+            raise
         processing.complete = False
         if active is not None:
             active.status = "failed"
