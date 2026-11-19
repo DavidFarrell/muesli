@@ -8,7 +8,7 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 - **Diarisation**: [Senko](https://github.com/narcotic-sh/senko) using pyannote + CAM++ (CoreML, runs on Neural Engine)
 - **Output**: Speaker-labelled transcripts in TXT, JSON, SRT, and RTTM formats
 - **Local inference** with model assets prepared before recording
-- **Offline runtime policy**: no automatic model downloads; Python networking and Hub requests are disabled during inference
+- **Offline runtime policy**: no automatic model downloads; Python networking and Hub requests are disabled during local inference. The one exception is opt-in `reprocess --transcriber whitebox`, described below
 
 ## Requirements
 
@@ -174,4 +174,6 @@ Preparing missing ASR assets is a separate online operation requiring an exact u
 .venv/bin/python scripts/prepare-local-models.py --allow-download --revision EXACT_40_CHARACTER_MODEL_COMMIT
 ```
 
-Keep the returned model directory and generated file hashes with a release. The environment must also contain Senko's native libraries and CoreML assets. The default runtime blocks Python DNS/IP sockets and Hub requests; local Unix IPC remains available. These controls do not sandbox arbitrary native extensions. Whole-process network isolation and signed-build qualification remain explicit release gates in `engineer-notes/production-audit-2026-09-05/offline-runtime.md` at the repository root. The external Claude Merge workflow has a separate network and permission boundary.
+Keep the returned model directory and generated file hashes with a release. The environment must also contain Senko's native libraries and CoreML assets. The default runtime blocks Python DNS/IP sockets and Hub requests; local Unix IPC remains available. These controls do not sandbox arbitrary native extensions.
+
+**The whitebox exception (opt-in).** `reprocess --transcriber whitebox` sends each meeting track to the owner's own shared STT service on the whitebox, over Tailscale. It is a separately described boundary, not a loosening of the policy above: the client opens a per-thread grant to resolve that one host name (no connection), then a second grant to connect to the one address it has checked is on the owner's tailnet (100.64.0.0/10 or fd7a:115c:a1e0::/48) and that one port. No other name, address, port or thread is opened, and a run without `--transcriber whitebox` opens no grant. If the whitebox is unreachable, busy for more than 5 minutes in all or gives an unusable answer, the whole meeting is transcribed locally instead. The result's `transcriber` record says which machine, engine and model transcribed it, the language asked for, and per track the upload format (`flac`, or `opus` past the upload cap), the detected language, and the service's `incomplete` flag and coverage. Whole-process network isolation and signed-build qualification remain explicit release gates in `engineer-notes/production-audit-2026-09-05/offline-runtime.md` at the repository root. The external Claude Merge workflow has a separate network and permission boundary.
